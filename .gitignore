@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Project artifacts
+checkpoints/
+checkpoints_jepa/
+logs/
+outputs/
+mlruns/
+*.pt
+*.pth
+*.ckpt
+
+# Data
+*.parquet
+*.csv
+!gold_progression_pairs.csv  # keep only if intentionally tracked
+
+# hi-ml is a separate Microsoft submodule — see README for setup
+tempcxr/modules/hi-ml/
+tempcxr/modules/pretrained/
