@@ -34,13 +34,20 @@ from losses_jepa import jepa_smooth_l1_loss
 # ============================================================
 # PATHS
 # ============================================================
-CHECKPOINT_DIR = "/scratch/m000081/eprakash/temporal/checkpoints_jepa"
-LOG_DIR = "/scratch/m000081/eprakash/temporal/logs"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_DIR = os.environ.get(
+    "JEPA_CHECKPOINT_DIR",
+    os.path.join(_HERE, "checkpoints_jepa"),
+)
+LOG_DIR = os.environ.get(
+    "JEPA_LOG_DIR",
+    os.path.join(_HERE, "logs"),
+)
 
 IMAGE_ROOTS = {
-    "mimic": "/scratch/m000081/yunhe/dataset/MIMIC-CXR/mimic-cxr-jpg/2.0.0/files",
-    "chexpert": "/scratch/m000081/yabin/datasets/chestxpert/CheXpert-v1.0/train",
-    "rexgradient": "/scratch/m000081/chong/data/ReXGradient-160K/deid_png",
+    "mimic": "/home/evaprakash/all_data/mimic",
+    "chexpert": "/home/evaprakash/all_data/chexpert/train",
+    "rexgradient": "/home/evaprakash/all_data/rexgradient/deid_png",
 }
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)

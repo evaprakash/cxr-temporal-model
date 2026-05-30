@@ -38,8 +38,8 @@ cxr-temporal-model/
 ├── dataset_combined_jepa.py    # JEPA dataset (silver corpus, paired)
 ├── losses.py                   # local_contrastive_loss (GLoRIA)
 ├── losses_jepa.py              # JEPA Smooth L1
-├── resume_train_jepa.py        # JEPA DDP training entry
-├── resume_train_jepa.sh        # JEPA slurm launcher
+├── resume_train_jepa.py        # JEPA DDP training entry (invoked via torchrun)
+├── run_jepa.py                 # direct launcher (auto-detects GPUs, no SLURM needed)
 └── tempcxr/
     └── modules/
         ├── image_encoder_jepa.py   # JEPA image encoder (raw outputs)
@@ -102,7 +102,20 @@ identifiers `microsoft/BiomedVLP-CXR-BERT-specialized` and
 dataset name to the filesystem location of its images. Edit it at the
 top of the file to match your filesystem.
 
-## Smoke tests (run before launching SLURM)
+### 5. Checkpoint and log directories
+
+`resume_train_jepa.py` writes checkpoints to `./checkpoints_jepa/` and
+validation metrics to `./logs/val_metrics_jepa.csv` (both relative to
+the script). Override with environment variables:
+
+```bash
+export JEPA_CHECKPOINT_DIR=/data/ckpts
+export JEPA_LOG_DIR=/data/logs
+```
+
+Both directories are excluded from version control via `.gitignore`.
+
+## Smoke tests (run before training)
 
 From the repo root:
 
@@ -125,17 +138,25 @@ python dataset_combined_jepa.py --load-images
 ## Training
 
 ```bash
-sbatch resume_train_jepa.sh
+python run_jepa.py
 ```
 
-Or locally with `torchrun`:
+Auto-detects the number of visible GPUs and spawns torchrun with the
+right `--nproc_per_node`. Equivalent to:
 
 ```bash
-torchrun --nproc_per_node=4 resume_train_jepa.py
+torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") \
+         resume_train_jepa.py
 ```
 
-Optional `--resume <ckpt.pt>`. Without it, the script auto-resumes from
-the latest `epoch_*.pt` in `CHECKPOINT_DIR` if any exist.
+Resume from a checkpoint:
+
+```bash
+python run_jepa.py --resume checkpoints_jepa/epoch_5.pt
+```
+
+Without `--resume`, `resume_train_jepa.py` auto-resumes from the
+latest `epoch_*.pt` in `CHECKPOINT_DIR` if any exist.
 
 ## Key design choices
 

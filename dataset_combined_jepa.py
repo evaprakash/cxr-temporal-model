@@ -272,9 +272,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mimic-root", default="/scratch/m000081/yunhe/dataset/MIMIC-CXR/mimic-cxr-jpg/2.0.0/files")
-    parser.add_argument("--chexpert-root", default="/scratch/m000081/yabin/datasets/chestxpert/CheXpert-v1.0/train")
-    parser.add_argument("--rexgradient-root", default="/scratch/m000081/chong/data/ReXGradient-160K/deid_png")
+    parser.add_argument("--mimic-root", default="/home/evaprakash/all_data/mimic")
+    parser.add_argument("--chexpert-root", default="/home/evaprakash/all_data/chexpert/train")
+    parser.add_argument("--rexgradient-root", default="/home/evaprakash/all_data/rexgradient/deid_png")
     parser.add_argument("--split", default=None)
     parser.add_argument("--load-images", action="store_true")
     args = parser.parse_args()
