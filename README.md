@@ -34,27 +34,24 @@ spend capacity only on the actual change described by `τ_dyn`.
 
 ```
 cxr-temporal-model/
-├── dataset_combined.py         # biovilt dataset + augmentation
+├── dataset_combined.py         # base image transforms + augmentation helpers
 ├── dataset_combined_jepa.py    # JEPA dataset (silver corpus, paired)
-├── losses.py                   # global / local contrastive + MLM
-├── losses_jepa.py              # JEPA Smooth L1 + target LayerNorm
-├── resume_train.py             # biovilt DDP training entry
-├── resume_train.sh             # biovilt slurm launcher
+├── losses.py                   # local_contrastive_loss (GLoRIA)
+├── losses_jepa.py              # JEPA Smooth L1
 ├── resume_train_jepa.py        # JEPA DDP training entry
 ├── resume_train_jepa.sh        # JEPA slurm launcher
 └── tempcxr/
     └── modules/
-        ├── image_encoder.py        # biovilt encoder (L2-normalized outputs)
-        ├── image_encoder_jepa.py   # JEPA encoder (raw outputs)
-        ├── text_encoder.py         # CXR-BERT text encoder (shared)
-        ├── tempcxr_model.py        # biovilt forward orchestration
-        └── jepa.py                 # JEPA forward orchestration + EMA
+        ├── image_encoder_jepa.py   # JEPA image encoder (raw outputs)
+        ├── text_encoder.py         # CXR-BERT text encoder
+        └── jepa.py                 # JEPA forward orchestration + EMA + predictor
 ```
 
-The JEPA pipeline reuses logic from the biovilt pipeline rather than
-duplicating it: `dataset_combined_jepa.py` imports `BASE_TRANSFORM` /
-`sample_augmentation` / `apply_augmentation` from `dataset_combined.py`,
-and the JEPA model imports `local_contrastive_loss` from `losses.py`.
+`dataset_combined.py` is included for the shared image transforms
+(`BASE_TRANSFORM`, `sample_augmentation`, `apply_augmentation`) that
+`dataset_combined_jepa.py` imports. `losses.py` is included for the
+shared `local_contrastive_loss` that the JEPA model and training script
+import.
 
 ## Setup
 
@@ -78,7 +75,7 @@ cd tempcxr/modules
 git clone https://github.com/microsoft/hi-ml.git
 ```
 
-Both `image_encoder.py` and `text_encoder.py` add
+Both `image_encoder_jepa.py` and `text_encoder.py` add
 `tempcxr/modules/hi-ml/hi-ml-multimodal/src` to `sys.path` and import
 `health_multimodal.image.model.MultiImageModel` and
 `health_multimodal.text.model.modelling_cxrbert.CXRBertModel` from
@@ -101,10 +98,9 @@ identifiers `microsoft/BiomedVLP-CXR-BERT-specialized` and
 
 ### 4. Image roots
 
-Both training scripts hardcode an `IMAGE_ROOTS` dict that maps each
-dataset name to the filesystem location of its images. Edit those at
-the top of `resume_train.py` / `resume_train_jepa.py` to match your
-filesystem.
+`resume_train_jepa.py` hardcodes an `IMAGE_ROOTS` dict that maps each
+dataset name to the filesystem location of its images. Edit it at the
+top of the file to match your filesystem.
 
 ## Smoke tests (run before launching SLURM)
 
@@ -128,8 +124,6 @@ python dataset_combined_jepa.py --load-images
 
 ## Training
 
-### JEPA
-
 ```bash
 sbatch resume_train_jepa.sh
 ```
@@ -142,12 +136,6 @@ torchrun --nproc_per_node=4 resume_train_jepa.py
 
 Optional `--resume <ckpt.pt>`. Without it, the script auto-resumes from
 the latest `epoch_*.pt` in `CHECKPOINT_DIR` if any exist.
-
-### biovilt (for reference)
-
-```bash
-sbatch resume_train.sh
-```
 
 ## Key design choices
 

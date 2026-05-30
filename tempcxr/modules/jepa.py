@@ -1,9 +1,8 @@
 """TempCXR-JEPA model: forward orchestration only.
 
-Mirrors the structure of ``tempcxr_model.TempCXR``: the ``forward``
-returns a dict of representations and lets the training script compute
-losses externally (using ``losses.local_contrastive_loss`` and
-``losses_jepa.jepa_smooth_l1_loss``).
+The ``forward`` returns a dict of representations and lets the training
+script compute losses externally (using ``losses.local_contrastive_loss``
+and ``losses_jepa.jepa_smooth_l1_loss``).
 
 Architecture (matches the slide-deck diagram):
 

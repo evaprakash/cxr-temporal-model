@@ -1,20 +1,20 @@
-"""I-JEPA-style image encoder.
+"""I-JEPA-style image encoder for temporal CXR JEPA training.
 
-Differences from `image_encoder.BioViLTImageEncoder`:
+Wraps the BioViL-T ``MultiImageModel`` backbone but returns RAW patch
+and global outputs (no ``F.normalize`` to the unit sphere). I-JEPA's
+recipe avoids L2 normalization on the JEPA path because it discards
+magnitude information that may carry signal; scale stability is
+achieved via LayerNorm-no-params on the target side at loss time
+(see ``jepa.py``).
 
-  * Patch and global outputs are returned RAW (no `F.normalize`).
-    I-JEPA's recipe avoids L2 normalization on the JEPA path because it
-    discards magnitude information that may carry signal. Scale stability
-    is achieved via LayerNorm-no-params on the target side at loss time
-    (see `jepa.py`), not via projecting to the unit sphere.
-  * Loss-side L2 normalization for downstream contrastive heads (e.g.
-    `local_contrastive_loss` in `jepa.py`) is handled by those losses
-    themselves; they re-normalize their inputs internally, so consumers
-    that need unit vectors are unaffected.
+Loss-side L2 normalization for downstream contrastive heads (e.g.
+``local_contrastive_loss``) is handled by those losses themselves —
+they re-normalize their inputs internally, so consumers that need unit
+vectors are unaffected.
 
-Otherwise this is a drop-in replacement for `BioViLTImageEncoder` with
-the same constructor signature, the same `MultiImageModel` backbone,
-and the same `(global, patches)` return contract.
+Constructor signature: ``mode in {"biovil", "biovilt", "biovilt_finetuned"}``,
+optional ``checkpoint_path`` for the finetuned mode. ``forward`` takes
+``(curr_imgs, prev_imgs=None)`` and returns ``(global, patches)``.
 """
 
 import os

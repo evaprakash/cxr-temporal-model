@@ -1,8 +1,6 @@
 # resume_train_jepa.py
 #
 # DDP training entry point for the JEPA-style temporal CXR model.
-# Mirrors the structure of `resume_train.py` (the biovilt training
-# script), adapted for the JEPA setup:
 #
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
 #   - Model:    TempCXRJEPA (online + EMA + predictor)
