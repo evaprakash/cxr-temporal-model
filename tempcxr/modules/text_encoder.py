@@ -26,9 +26,15 @@ from health_multimodal.text.model.modelling_cxrbert import (
     BertProjectionHead,
 )
 
-# HF identifiers
-BIOVIL_TEXT_MODEL = "/scratch/m000081/eprakash/temporal/model/biovilt/tempcxr/modules/pretrained/BiomedVLP-CXR-BERT-specialized"
-BIOVILT_TEXT_MODEL = "/scratch/m000081/eprakash/temporal/model/biovilt/tempcxr/modules/pretrained/BiomedVLP-BioViL-T"
+# Pretrained text models live under tempcxr/modules/pretrained/.
+# Resolved relative to this file so the path is portable across
+# machines (cluster, local, GCP, etc.) — only requirement is that the
+# directory layout matches.
+PRETRAINED_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "pretrained")
+)
+BIOVIL_TEXT_MODEL = os.path.join(PRETRAINED_DIR, "BiomedVLP-CXR-BERT-specialized")
+BIOVILT_TEXT_MODEL = os.path.join(PRETRAINED_DIR, "BiomedVLP-BioViL-T")
 
 
 # ================================================================

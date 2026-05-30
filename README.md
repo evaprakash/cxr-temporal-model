@@ -84,17 +84,22 @@ top of those two files.
 
 ### 3. Pretrained text-encoder weights
 
-`text_encoder.py` points at local paths for the CXR-BERT and BioViL-T
-text models:
+`text_encoder.py` resolves both pretrained text-model paths relative
+to itself:
 
-```python
-BIOVIL_TEXT_MODEL  = "/scratch/.../pretrained/BiomedVLP-CXR-BERT-specialized"
-BIOVILT_TEXT_MODEL = "/scratch/.../pretrained/BiomedVLP-BioViL-T"
+```
+tempcxr/modules/pretrained/BiomedVLP-CXR-BERT-specialized/
+tempcxr/modules/pretrained/BiomedVLP-BioViL-T/
 ```
 
-Update those paths to point at your local copies (or set them to the HF
-identifiers `microsoft/BiomedVLP-CXR-BERT-specialized` and
-`microsoft/BiomedVLP-BioViL-T` to download via `transformers`).
+Drop the local copies of the BiomedVLP and BioViL-T text models into
+those two directories. Alternatively, edit the `BIOVIL_TEXT_MODEL` and
+`BIOVILT_TEXT_MODEL` constants at the top of `text_encoder.py` to
+point elsewhere (or to the HF identifiers
+`microsoft/BiomedVLP-CXR-BERT-specialized` /
+`microsoft/BiomedVLP-BioViL-T` for `transformers` to download).
+
+`tempcxr/modules/pretrained/` is gitignored.
 
 ### 4. Image roots
 
@@ -102,7 +107,19 @@ identifiers `microsoft/BiomedVLP-CXR-BERT-specialized` and
 dataset name to the filesystem location of its images. Edit it at the
 top of the file to match your filesystem.
 
-### 5. Checkpoint and log directories
+### 5. CheXTemporal annotation parquets
+
+`dataset_combined_jepa.py` loads three silver parquets
+(`silver_findings.parquet`, `silver_studies.parquet`,
+`silver_sentences.parquet`). The default location is
+`/home/eprakash/jepa/CheXTemporal/`; override with the
+`CHEXTEMPORAL_DIR` env var:
+
+```bash
+export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
+```
+
+### 6. Checkpoint and log directories
 
 `resume_train_jepa.py` writes checkpoints to `./checkpoints_jepa/` and
 validation metrics to `./logs/val_metrics_jepa.csv` (both relative to

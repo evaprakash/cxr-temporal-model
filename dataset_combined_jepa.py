@@ -22,6 +22,7 @@ The class follows the same constructor + ``__getitem__`` pattern as
 way.
 """
 
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -38,11 +39,18 @@ from dataset_combined import (
 
 
 # ============================================================
-# DEFAULT SILVER DATASET PATHS (HF)
+# DEFAULT SILVER DATASET PATHS
 # ============================================================
-DEFAULT_FINDINGS = "hf://datasets/anonaccount107240/CheXTemporal/silver_findings.parquet"
-DEFAULT_STUDIES = "hf://datasets/anonaccount107240/CheXTemporal/silver_studies.parquet"
-DEFAULT_SENTENCES = "hf://datasets/anonaccount107240/CheXTemporal/silver_sentences.parquet"
+# Local copy of the CheXTemporal silver annotation parquets. Override
+# the parent directory via the ``CHEXTEMPORAL_DIR`` env var or pass
+# explicit paths to ``JEPACombinedDataset(...)``.
+DEFAULT_DATASET_DIR = os.environ.get(
+    "CHEXTEMPORAL_DIR",
+    "/home/eprakash/jepa/CheXTemporal",
+)
+DEFAULT_FINDINGS = os.path.join(DEFAULT_DATASET_DIR, "silver_findings.parquet")
+DEFAULT_STUDIES = os.path.join(DEFAULT_DATASET_DIR, "silver_studies.parquet")
+DEFAULT_SENTENCES = os.path.join(DEFAULT_DATASET_DIR, "silver_sentences.parquet")
 
 
 # ============================================================
