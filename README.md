@@ -40,6 +40,8 @@ cxr-temporal-model/
 ├── losses_jepa.py              # JEPA Smooth L1
 ├── resume_train_jepa.py        # JEPA DDP training entry (invoked via torchrun)
 ├── run_jepa.py                 # direct launcher (auto-detects GPUs, no SLURM needed)
+├── infer_jepa.py               # single-example inference demo
+├── progression_classify.py     # 5-way progression classification on gold pairs
 └── tempcxr/
     └── modules/
         ├── image_encoder_jepa.py   # JEPA image encoder (raw outputs)
@@ -261,6 +263,61 @@ Following I-JEPA's recipe rather than BioViL-T's CLIP-style recipe:
 The JEPA pipeline does not duplicate `local_contrastive_loss`. It is
 defined once in `losses.py` and imported by the JEPA model and training
 script. Only the new JEPA loss lives in `losses_jepa.py`.
+
+## Inference
+
+Two scripts are provided for evaluating a trained checkpoint
+(`checkpoints_jepa/best.pt` by default; override with `--ckpt` or
+`JEPA_CKPT`).
+
+### `infer_jepa.py` — single-example demo
+
+Picks one paired sample from the val split, runs the predictor, and
+prints how close the prediction is to the actual current image's
+encoding:
+
+```bash
+python infer_jepa.py            # random val sample
+python infer_jepa.py --idx 42   # specific val sample
+```
+
+Reports the JEPA Smooth L1, the slide-deck inference score
+`cos(ẑ_cur - z_prior, z_cur - z_prior)`, per-patch cosine similarity,
+and a do-nothing baseline (`ẑ_cur := LN(z_prior)`) for comparison.
+
+### `progression_classify.py` — 5-way progression classification
+
+Loads `gold_progression_pairs.parquet` and, for each (study pair,
+finding) example, builds five candidate progression sentences (one per
+class: `new`, `worse`, `stable`, `improved`, `resolved`). Each
+candidate is fed through the predictor; the class whose predicted
+`ẑ_cur^k` aligns best with the actual `z_cur` (highest
+`cos(Δẑ_k, Δz_true)`) is the predicted progression. Compares with the
+gold label and reports overall, per-class, and per-finding accuracy.
+
+```bash
+# Sanity-check one gold row with full 5-way breakdown
+python progression_classify.py --demo
+
+# Full evaluation
+python progression_classify.py --eval
+
+# First 200 rows only (quick smoke test)
+python progression_classify.py --eval --limit 200
+
+# Custom prompt templates (must contain {finding}; canonical class
+# order is: new worse stable improved resolved)
+python progression_classify.py --eval \
+  --prompts "new {finding}" "worsening {finding}" "stable {finding}" \
+            "improving {finding}" "resolved {finding}"
+```
+
+Both image encoders follow the training-time convention: online
+encoder for the prior (matches what the predictor was trained on) and
+EMA target encoder for the current (matches the JEPA loss target). The
+text encoder runs all five prompts in a single batched call, and the
+image forward pass is run once per (prior, current) pair, so the cost
+scales with `O(N_pairs)` rather than `O(5 × N_pairs)`.
 
 ## Reference
 
