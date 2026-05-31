@@ -125,6 +125,13 @@ W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
 
+# Stratified train/val split when the studies parquet has no 'split'
+# column. Both datasets read/write the same cached splits CSV
+# (DEFAULT_SPLITS_FILE inside dataset_combined_jepa.py), so the val set
+# is identical across train/val DataLoaders and across re-runs.
+VAL_FRACTION = 0.1
+SPLIT_SEED = 42
+
 
 # ============================================================
 # DATASETS
@@ -133,12 +140,16 @@ train_dataset = JEPACombinedDataset(
     image_roots=IMAGE_ROOTS,
     split="train",
     train=True,
+    val_fraction=VAL_FRACTION,
+    split_seed=SPLIT_SEED,
 )
 
 val_dataset = JEPACombinedDataset(
     image_roots=IMAGE_ROOTS,
     split="val",
     train=False,
+    val_fraction=VAL_FRACTION,
+    split_seed=SPLIT_SEED,
 )
 
 train_sampler = DistributedSampler(

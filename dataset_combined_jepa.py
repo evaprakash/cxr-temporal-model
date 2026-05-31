@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -52,6 +53,14 @@ DEFAULT_FINDINGS = os.path.join(DEFAULT_DATASET_DIR, "silver_findings.parquet")
 DEFAULT_STUDIES = os.path.join(DEFAULT_DATASET_DIR, "silver_studies.parquet")
 DEFAULT_SENTENCES = os.path.join(DEFAULT_DATASET_DIR, "silver_sentences.parquet")
 
+# Where the auto-generated train/val split assignments are persisted
+# when the studies parquet does not already have a ``split`` column.
+DEFAULT_SPLITS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "splits_jepa.csv",
+)
+SPLIT_KEY_COLS = ["dataset", "patient_id", "study_id_curr", "study_id_prev"]
+
 
 # ============================================================
 # HELPERS
@@ -74,6 +83,89 @@ def _normalize_ids(df):
         if c in df.columns:
             df[c] = df[c].astype("string")
     return df
+
+
+def _ensure_split_assignments(
+    rows: pd.DataFrame,
+    splits_file: str,
+    val_fraction: float = 0.1,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Add a ``split`` column to ``rows`` (values: ``'train'`` / ``'val'``).
+
+    If ``splits_file`` already exists, load it and merge by
+    ``SPLIT_KEY_COLS``. Otherwise compute a stratified split (per
+    ``dataset``) using a seeded RNG, save to ``splits_file``, and merge.
+
+    The stratified procedure: for each dataset, sort the row indices
+    deterministically, shuffle them with ``np.random.RandomState(seed)``,
+    take the first ``round(n * val_fraction)`` as ``val``, the rest as
+    ``train``. This guarantees that:
+
+      - each dataset is represented in both splits with the requested
+        proportion,
+      - the assignment is reproducible from ``seed`` alone, and
+      - the cached file lets you pin a split across re-runs even if the
+        underlying data changes (delete the file to regenerate).
+    """
+    rows = rows.reset_index(drop=True)
+
+    # ------------------------------------------------------------
+    # Load cached splits if present and consistent
+    # ------------------------------------------------------------
+    if os.path.exists(splits_file):
+        cached = pd.read_csv(
+            splits_file,
+            dtype={
+                "dataset": "string",
+                "patient_id": "string",
+                "study_id_curr": "string",
+                "study_id_prev": "string",
+                "split": "string",
+            },
+        )
+        merged = rows.merge(cached[SPLIT_KEY_COLS + ["split"]], on=SPLIT_KEY_COLS, how="left")
+        n_missing = int(merged["split"].isna().sum())
+        if n_missing == 0:
+            print(f"[JEPA dataset] Loaded cached splits from {splits_file}")
+            return merged
+        print(
+            f"[JEPA dataset] WARNING: {n_missing} rows not in cached splits "
+            f"({splits_file}); regenerating."
+        )
+        os.remove(splits_file)
+
+    # ------------------------------------------------------------
+    # Generate stratified split deterministically
+    # ------------------------------------------------------------
+    rng = np.random.RandomState(seed)
+    rows = rows.copy()
+    rows["split"] = "train"
+
+    for dataset_name, group in rows.groupby("dataset", sort=True):
+        n = len(group)
+        n_val = max(1, int(round(n * val_fraction)))
+        sorted_idx = sorted(group.index.tolist())
+        shuffled = rng.permutation(sorted_idx)
+        val_idx = shuffled[:n_val].tolist()
+        rows.loc[val_idx, "split"] = "val"
+
+    # ------------------------------------------------------------
+    # Persist for transparency / pinning
+    # ------------------------------------------------------------
+    os.makedirs(os.path.dirname(splits_file) or ".", exist_ok=True)
+    rows[SPLIT_KEY_COLS + ["split"]].to_csv(splits_file, index=False)
+
+    val_counts = rows[rows["split"] == "val"].groupby("dataset").size().to_dict()
+    train_counts = rows[rows["split"] == "train"].groupby("dataset").size().to_dict()
+    print(
+        f"[JEPA dataset] Generated stratified split (val_fraction={val_fraction}, "
+        f"seed={seed}); saved to {splits_file}"
+    )
+    print(f"[JEPA dataset]   train per dataset: {train_counts}")
+    print(f"[JEPA dataset]   val   per dataset: {val_counts}")
+
+    return rows
 
 
 def _resolve_image_path(dataset: str, rel_path: str, roots: Dict[str, str]) -> Path:
@@ -118,11 +210,22 @@ class JEPACombinedDataset(Dataset):
         Paths to the silver parquet files. Defaults to the HF locations
         used by ``jepa.py`` smoke tests.
     split
-        Optional. If provided AND the studies parquet has a ``split``
-        column, rows are filtered to that split. Otherwise the parameter
-        is ignored (with a printed warning) and all rows are used.
+        Optional. If ``"train"`` or ``"val"``:
+          - if the studies parquet has a ``split`` column, filter on it
+          - else, fall back to a deterministic stratified split (per
+            ``dataset``) generated from ``split_seed`` and cached to
+            ``splits_file``.
+        ``None`` returns all rows.
     train
         Whether to apply random augmentation. Eval/val should pass False.
+    val_fraction
+        Fraction of rows assigned to ``"val"`` when generating the
+        fallback stratified split. Default 0.1 (10%).
+    split_seed
+        Seed for the fallback stratified split. Same seed → same split.
+    splits_file
+        Where to read/write the cached split assignments. Defaults to
+        ``./splits_jepa.csv`` next to this file.
     """
 
     def __init__(
@@ -133,10 +236,16 @@ class JEPACombinedDataset(Dataset):
         sentences_path: str = DEFAULT_SENTENCES,
         split: Optional[str] = None,
         train: bool = True,
+        val_fraction: float = 0.1,
+        split_seed: int = 42,
+        splits_file: Optional[str] = None,
     ):
         self.image_roots = {k: str(v) for k, v in image_roots.items()}
         self.train = train
         self.split = split
+        self.val_fraction = val_fraction
+        self.split_seed = split_seed
+        self.splits_file = splits_file or DEFAULT_SPLITS_FILE
 
         # ------------------------------------------------------------
         # Load + filter
@@ -145,14 +254,12 @@ class JEPACombinedDataset(Dataset):
         studies = _normalize_ids(pd.read_parquet(studies_path))
         sentences = _normalize_ids(pd.read_parquet(sentences_path))
 
-        if split is not None:
-            if "split" in studies.columns:
-                studies = studies[studies["split"] == split].copy()
-            else:
-                print(
-                    f"[JEPA dataset] WARNING: split={split!r} requested but no "
-                    f"'split' column in studies parquet; using all rows."
-                )
+        # Track whether the studies parquet provides its own split column;
+        # if not, we'll generate a stratified split AFTER all the joining
+        # is done so the cached file describes what's actually used.
+        studies_has_split_col = "split" in studies.columns
+        if split is not None and studies_has_split_col:
+            studies = studies[studies["split"] == split].copy()
 
         # ------------------------------------------------------------
         # Build current/prior report strings (impression + findings)
@@ -213,6 +320,21 @@ class JEPACombinedDataset(Dataset):
         rows = rows[rows["dynamic_report"].apply(_nonempty)].copy()
 
         rows = rows.reset_index(drop=True)
+
+        # ------------------------------------------------------------
+        # Fallback split: studies parquet didn't have a split column,
+        # so generate a deterministic stratified one (per dataset) over
+        # the fully-joined rows and cache to disk.
+        # ------------------------------------------------------------
+        if split is not None and not studies_has_split_col:
+            rows = _ensure_split_assignments(
+                rows,
+                splits_file=self.splits_file,
+                val_fraction=self.val_fraction,
+                seed=self.split_seed,
+            )
+            rows = rows[rows["split"] == split].reset_index(drop=True)
+
         self.df = rows
 
         print(
@@ -284,6 +406,10 @@ if __name__ == "__main__":
     parser.add_argument("--chexpert-root", default="/home/evaprakash/all_data/chexpert/train")
     parser.add_argument("--rexgradient-root", default="/home/evaprakash/all_data/rexgradient/deid_png")
     parser.add_argument("--split", default=None)
+    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument("--splits-file", default=None,
+                        help="Override the cached splits CSV path.")
     parser.add_argument("--load-images", action="store_true")
     args = parser.parse_args()
 
@@ -297,6 +423,9 @@ if __name__ == "__main__":
         image_roots=IMAGE_ROOTS,
         split=args.split,
         train=True,
+        val_fraction=args.val_fraction,
+        split_seed=args.split_seed,
+        splits_file=args.splits_file,
     )
 
     print(f"\nTotal samples: {len(ds)}")

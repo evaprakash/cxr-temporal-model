@@ -119,6 +119,29 @@ top of the file to match your filesystem.
 export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
 ```
 
+### 5a. Train / val split
+
+If the studies parquet has a `split` column, rows are filtered by it.
+Otherwise `JEPACombinedDataset` falls back to a **deterministic
+stratified split** (per dataset) seeded by `split_seed=42` and
+defaulting to a 10% val fraction. The train/val DataLoaders in
+`resume_train_jepa.py` share the same `(val_fraction, split_seed)`,
+so they always agree on which rows are val.
+
+The assignments are cached to `splits_jepa.csv` next to
+`dataset_combined_jepa.py` so you can audit which study pairs are in
+val. The CSV is gitignored. To regenerate (e.g., after updating the
+silver parquets), delete it and re-run any script that constructs a
+`JEPACombinedDataset` with `split="train"` or `split="val"`.
+
+To pick a different fraction or seed, edit the constants at the top
+of `resume_train_jepa.py`:
+
+```python
+VAL_FRACTION = 0.1
+SPLIT_SEED = 42
+```
+
 ### 6. Checkpoint and log directories
 
 `resume_train_jepa.py` writes checkpoints to `./checkpoints_jepa/` and
