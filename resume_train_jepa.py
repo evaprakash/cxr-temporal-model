@@ -120,6 +120,10 @@ BATCH_SIZE = 32
 EPOCHS = 50
 WARMUP_RATIO = 0.03
 
+# Checkpoint schedule: always save epoch 1 + every SAVE_EVERY_N_EPOCHS,
+# plus best.pt whenever val total improves.
+SAVE_EVERY_N_EPOCHS = 5
+
 # Loss weights (matching the smoke-test defaults in the old jepa.py)
 W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
@@ -224,8 +228,17 @@ best_val_loss = float("inf")
 # ============================================================
 # RESUME
 # ============================================================
+def _ckpt_epoch_num(path: str) -> int:
+    """Extract the integer epoch from an ``epoch_N.pt`` filename."""
+    name = os.path.basename(path)
+    return int(name[len("epoch_"):-len(".pt")])
+
+
 if args.resume is None:
-    checkpoints = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "epoch_*.pt")))
+    checkpoints = sorted(
+        glob.glob(os.path.join(CHECKPOINT_DIR, "epoch_*.pt")),
+        key=_ckpt_epoch_num,
+    )
     if checkpoints:
         args.resume = checkpoints[-1]
 
@@ -234,6 +247,8 @@ if args.resume is not None:
     model.module.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
+    if "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
     start_epoch = checkpoint["epoch"] + 1
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))
 
@@ -449,13 +464,20 @@ for epoch in range(start_epoch, EPOCHS + 1):
             "model": model.module.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
             "best_val_loss": best_val_loss,
         }
 
-        torch.save(ckpt, os.path.join(CHECKPOINT_DIR, f"epoch_{epoch}.pt"))
+        # Periodic snapshot: epoch 1 + every SAVE_EVERY_N_EPOCHS thereafter.
+        if epoch == 1 or (epoch % SAVE_EVERY_N_EPOCHS == 0):
+            ckpt_path = os.path.join(CHECKPOINT_DIR, f"epoch_{epoch}.pt")
+            torch.save(ckpt, ckpt_path)
+            print(f"Saved checkpoint: {ckpt_path}")
 
+        # Always overwrite best.pt when val improves (regardless of epoch).
         if val_total < best_val_loss:
             best_val_loss = val_total
+            ckpt["best_val_loss"] = best_val_loss
             torch.save(ckpt, os.path.join(CHECKPOINT_DIR, "best.pt"))
             print("Saved new BEST checkpoint")
 

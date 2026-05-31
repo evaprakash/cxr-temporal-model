@@ -153,6 +153,21 @@ export JEPA_CHECKPOINT_DIR=/data/ckpts
 export JEPA_LOG_DIR=/data/logs
 ```
 
+**Schedule:** epoch 1 is always saved, then every `SAVE_EVERY_N_EPOCHS`
+(default 5), plus `best.pt` whenever the validation total improves.
+So a 50-epoch run produces `epoch_{1,5,10,...,50}.pt` (11 snapshots)
+plus `best.pt`.
+
+**Contents** of each `.pt` (one self-contained dict): full model state
+(online encoder, **EMA target encoder**, text encoder, predictor),
+AdamW state, LR scheduler state, GradScaler state, current epoch,
+and best-val-so-far. The EMA momentum schedule is deterministic from
+the step count and is reconstructed on resume.
+
+**Resume:** automatic from the latest `epoch_*.pt` if you rerun
+`python run_jepa.py` with no flags, or explicit via
+`python run_jepa.py --resume checkpoints_jepa/epoch_25.pt`.
+
 Both directories are excluded from version control via `.gitignore`.
 
 ## Smoke tests (run before training)
