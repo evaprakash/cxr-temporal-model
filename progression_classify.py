@@ -92,6 +92,7 @@ DEFAULT_PROMPTS = [
 DEFAULT_GOLD_PARQUET = os.path.join(
     DEFAULT_DATASET_DIR, "gold_progression_pairs.parquet"
 )
+DATASETS = ["mimic", "chexpert", "rexgradient"]
 
 
 # ============================================================
@@ -104,10 +105,70 @@ def build_prompts(finding: str, templates: List[str]) -> List[str]:
 
 
 # ============================================================
+# GOLD IMAGE ROOT DISCOVERY
+# ============================================================
+def discover_gold_image_roots(parquet_dir: str) -> Dict[str, str]:
+    """Look for ``final_gold_<dataset>_images/`` next to the gold parquet.
+
+    The CheXTemporal HF repo ships gold images in three folders alongside
+    the parquet rather than in the silver ``all_data`` tree, so for the
+    gold eval we want to point at those instead of ``IMAGE_ROOTS``.
+    """
+    roots: Dict[str, str] = {}
+    for d in DATASETS:
+        cand = os.path.join(parquet_dir, f"final_gold_{d}_images")
+        if os.path.isdir(cand):
+            roots[d] = cand
+    return roots
+
+
+# ============================================================
 # IMAGE LOADING (no augmentation, matches val pipeline)
 # ============================================================
-def load_image_tensor(dataset: str, rel_path: str) -> torch.Tensor:
-    img = Image.open(_resolve_image_path(dataset, rel_path, IMAGE_ROOTS)).convert("RGB")
+def _resolve_with_fallbacks(dataset: str, rel_path: str, roots: Dict[str, str]) -> Path:
+    """Resolve ``rel_path`` under ``roots[dataset]`` with three fallbacks.
+
+    1. The same prefix-stripping logic the silver pipeline uses
+       (``_resolve_image_path``). Handles ``mimic/...``, ``chexpert/train/...``,
+       ``rexgradient/deid_png/...`` style paths.
+    2. The raw relative path joined onto the root, in case the gold
+       parquet stores paths without a dataset prefix.
+    3. Just the basename joined onto the root, in case
+       ``final_gold_*_images/`` is a flat directory.
+
+    Raises ``FileNotFoundError`` if none of the three resolutions hit
+    an existing file.
+    """
+    rel_path = str(rel_path).strip()
+    if dataset not in roots:
+        raise FileNotFoundError(f"No image root configured for dataset {dataset!r}")
+
+    tried = []
+    try:
+        p = _resolve_image_path(dataset, rel_path, roots)
+        if p.exists():
+            return p
+        tried.append(str(p))
+    except Exception:
+        pass
+
+    p = Path(roots[dataset]) / rel_path
+    if p.exists():
+        return p
+    tried.append(str(p))
+
+    p = Path(roots[dataset]) / os.path.basename(rel_path)
+    if p.exists():
+        return p
+    tried.append(str(p))
+
+    raise FileNotFoundError(
+        f"Could not resolve gold image for {dataset}:{rel_path}. Tried: " + " | ".join(tried)
+    )
+
+
+def load_image_tensor(dataset: str, rel_path: str, roots: Dict[str, str]) -> torch.Tensor:
+    img = Image.open(_resolve_with_fallbacks(dataset, rel_path, roots)).convert("RGB")
     img = BASE_TRANSFORM(img)
     params = sample_augmentation(train=False)
     return apply_augmentation(img, params)
@@ -291,8 +352,8 @@ def run_demo(args, model, gold_df, device):
     print(f"  finding:       {finding}")
     print(f"  ground-truth:  {gt_label}")
 
-    prior = load_image_tensor(row["dataset"], row["parent_image_prev"])
-    current = load_image_tensor(row["dataset"], row["parent_image_curr"])
+    prior = load_image_tensor(row["dataset"], row["parent_image_prev"], args.image_roots)
+    current = load_image_tensor(row["dataset"], row["parent_image_curr"], args.image_roots)
 
     out = score_one_pair(
         model, prior, current, finding, args.prompts, device,
@@ -336,8 +397,8 @@ def run_eval(args, model, gold_df, device):
         finding = str(row["finding"])
         gt_label = _normalize_label(row["progression"])
         try:
-            prior = load_image_tensor(row["dataset"], row["parent_image_prev"])
-            current = load_image_tensor(row["dataset"], row["parent_image_curr"])
+            prior = load_image_tensor(row["dataset"], row["parent_image_prev"], args.image_roots)
+            current = load_image_tensor(row["dataset"], row["parent_image_curr"], args.image_roots)
         except (FileNotFoundError, OSError) as e:
             skipped += 1
             if skipped <= 5:
@@ -434,6 +495,16 @@ def main():
              "'{finding}'.",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--image-root",
+        action="append",
+        default=[],
+        metavar="DATASET=PATH",
+        help="Override an image root for one dataset. Can repeat. "
+             "Example: --image-root mimic=/data/final_gold_mimic_images. "
+             "By default, uses final_gold_<dataset>_images/ next to the "
+             "gold parquet if present, falling back to IMAGE_ROOTS.",
+    )
 
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--demo", action="store_true",
@@ -457,6 +528,28 @@ def main():
                 f"Prompt {i} ({PROGRESSION_CLASSES[i]!r}) is missing "
                 f"'{{finding}}' placeholder: {t!r}"
             )
+
+    # Resolve image roots: start from silver IMAGE_ROOTS, prefer
+    # final_gold_<dataset>_images/ next to the parquet, then apply
+    # any --image-root overrides last.
+    parquet_dir = os.path.dirname(os.path.abspath(args.gold_parquet))
+    auto_gold_roots = discover_gold_image_roots(parquet_dir)
+    image_roots: Dict[str, str] = {**IMAGE_ROOTS, **auto_gold_roots}
+    if auto_gold_roots:
+        print(f"[gold] auto-detected gold image roots:")
+        for d, p in auto_gold_roots.items():
+            print(f"  {d}: {p}")
+    for spec in args.image_root:
+        if "=" not in spec:
+            raise ValueError(f"--image-root expects DATASET=PATH, got: {spec!r}")
+        d, p = spec.split("=", 1)
+        if d not in DATASETS:
+            raise ValueError(
+                f"--image-root dataset must be one of {DATASETS}, got {d!r}"
+            )
+        image_roots[d] = p
+        print(f"[gold] override: {d} -> {p}")
+    args.image_roots = image_roots
 
     device = torch.device(args.device)
     model = load_jepa_model(args.ckpt, device)
