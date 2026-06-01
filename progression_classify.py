@@ -228,7 +228,7 @@ def load_gold_pairs(
             "Pass --label-col explicitly. Columns: " + str(list(gold.columns))
         )
     finding_col = finding_col or _coalesce_columns(
-        gold, ["finding", "disease", "pathology", "label_name"]
+        gold, ["finding", "disease", "disease_name", "pathology", "label_name"]
     )
     if finding_col is None:
         raise ValueError(
@@ -243,8 +243,28 @@ def load_gold_pairs(
     print(f"[gold]   {len(gold)} rows after restricting to 5 canonical classes")
 
     # ---- Ensure image path columns ----
-    if "parent_image_curr" not in gold.columns or "parent_image_prev" not in gold.columns:
-        print(f"[gold] joining with {findings_parquet} for image paths")
+    img_curr_col = _coalesce_columns(
+        gold,
+        ["parent_image_curr", "img_path_curr", "image_curr", "image_path_curr",
+         "image_curr_path", "current_image_path", "img_curr"],
+    )
+    img_prev_col = _coalesce_columns(
+        gold,
+        ["parent_image_prev", "img_path_prev", "image_prev", "image_path_prev",
+         "image_prev_path", "prior_image_path", "img_prev"],
+    )
+
+    if img_curr_col and img_prev_col:
+        if img_curr_col != "parent_image_curr" or img_prev_col != "parent_image_prev":
+            print(f"[gold]   image cols: {img_prev_col} / {img_curr_col} "
+                  f"(renaming to parent_image_prev / parent_image_curr)")
+            gold = gold.rename(columns={
+                img_prev_col: "parent_image_prev",
+                img_curr_col: "parent_image_curr",
+            })
+    else:
+        print(f"[gold] no image-path columns in gold parquet; "
+              f"joining with {findings_parquet}")
         findings = pd.read_parquet(findings_parquet)
         keep = [
             "dataset", "patient_id", "study_id_curr", "study_id_prev",

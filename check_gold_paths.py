@@ -165,12 +165,12 @@ def main():
 
     img_curr_col = find_col(
         gold,
-        ["parent_image_curr", "image_curr", "image_path_curr",
+        ["parent_image_curr", "img_path_curr", "image_curr", "image_path_curr",
          "image_curr_path", "current_image_path", "img_curr"],
     )
     img_prev_col = find_col(
         gold,
-        ["parent_image_prev", "image_prev", "image_path_prev",
+        ["parent_image_prev", "img_path_prev", "image_prev", "image_path_prev",
          "image_prev_path", "prior_image_path", "img_prev"],
     )
 
