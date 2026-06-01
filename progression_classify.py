@@ -1,55 +1,55 @@
 """5-way progression classification using the JEPA model.
 
 Given a (prior, current) image pair and a target finding (e.g. "pneumonia"),
-construct five candidate sentences — one per progression class
-(new, worse, stable, improved, resolved). For each candidate, run the
-predictor:
+build a CLIP-style prompt bank of multiple phrasings per progression
+class (improving / stable / worsening / new / resolved), feed each
+phrasing through the predictor, and score how well each predicted
+``ẑ_cur^k`` matches the actual ``z_cur``:
 
     ẑ_cur^k = predictor(LN(z_prior), text_encoder(prompt_k))
 
-Score each by
+Two scoring rules are computed in parallel:
 
-    S_k = cos(ẑ_cur^k - LN(z_prior),  LN(z_cur) - LN(z_prior))
+  * **Cosine** — slide-deck inference rule:
+        S_cos = cos(ẑ_cur^k - LN(z_prior),  LN(z_cur) - LN(z_prior))
+    Predicted class = argmax over classes of average cosine across that
+    class's phrases. Direction-only (ignores magnitude).
 
-(the slide-deck inference rule). The class with the highest S_k is the
-predicted progression. Compare to the ground-truth label from
-``gold_progression_pairs.parquet``.
+  * **Smooth L1** — JEPA training-time loss:
+        S_l1 = SmoothL1(ẑ_cur^k, LN(z_cur))
+    Predicted class = argmin over classes of average L1 across that
+    class's phrases. Includes both direction and magnitude.
 
-The prompt bank follows CheXTemporal's zero-shot protocol (Sec. 4.2 of
-the paper): "the {finding} has improved/worsened/resolved", "the
-{finding} is stable/new". You can override the templates with
-``--prompts`` (one template per class, in the canonical order
-``new worse stable improved resolved``).
+The prompt bank lives in ``PROGRESSION_PHRASES`` and the template in
+``PROMPT_TEMPLATE`` ("{} is {}" by default, e.g. "pneumonia is improving").
+
+Ground-truth labels from ``gold_progression_pairs.parquet`` use the
+CheXTemporal taxonomy (improved / worse / stable / new / resolved); the
+script remaps "improved" -> "improving" and "worse" -> "worsening" via
+``GT_TO_CLS`` so they match the present-tense phrasings. The reported
+overall, per-class, and per-finding numbers are directly comparable to
+Tables 4 and 5 of the CheXTemporal paper.
 
 Modes
 -----
 ``--demo``
-    Pick one row from gold and print its full 5-way scoring breakdown.
-    Useful for sanity-checking that the predictor is responding to the
-    text condition.
+    Print the per-class cosine and L1 scores for one gold row, plus
+    both predictions and whether each matches the ground truth.
 
 ``--eval``
     Iterate over the whole gold parquet (or ``--limit`` rows) and
-    report overall + per-class + per-finding accuracy.
+    report TWO independent classification results — one using cosine
+    argmax, one using Smooth L1 argmin — each with overall accuracy,
+    per-class accuracy (= recall), 5x5 confusion matrix, and per-finding
+    accuracy.
 
 Usage
 -----
-    # Demo on a single random gold row
     python progression_classify.py --demo
-
-    # Demo on a specific row, specific finding
     python progression_classify.py --demo --idx 17
-
-    # Full eval
     python progression_classify.py --eval
-
-    # Eval on first 200 rows
     python progression_classify.py --eval --limit 200
-
-    # Custom prompt templates
-    python progression_classify.py --eval \\
-        --prompts "new {finding}" "worsening {finding}" "stable {finding}" \\
-                  "improving {finding}" "resolved {finding}"
+    python progression_classify.py --eval --prompt-template "{} appears {}"
 """
 
 import argparse
@@ -57,7 +57,7 @@ import os
 import random
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -77,17 +77,47 @@ from tempcxr.modules.jepa import TempCXRJEPA
 # ============================================================
 # CONSTANTS
 # ============================================================
-PROGRESSION_CLASSES = ["new", "worse", "stable", "improved", "resolved"]
+# Prompt template uses positional substitution: "{disease} is {phrase}".
+PROMPT_TEMPLATE = "{} is {}"
 
-# Default prompt bank — one template per class in PROGRESSION_CLASSES order.
-# Phrasing mirrors the dynamic-sentence style the model was trained on.
-DEFAULT_PROMPTS = [
-    "new {finding}",
-    "{finding} has worsened",
-    "{finding} is stable",
-    "{finding} has improved",
-    "{finding} has resolved",
-]
+# Multi-phrase prompt bank — each class has multiple phrasings whose
+# scores get averaged (CLIP-style prompt ensembling).
+PROGRESSION_PHRASES = {
+    "improving": [
+        "better", "decreased", "decreasing", "improved",
+        "improving", "reduced", "smaller",
+    ],
+    "stable": [
+        "constant", "stable", "unchanged",
+    ],
+    "worsening": [
+        "bigger", "developing", "enlarged", "enlarging", "greater",
+        "growing", "increased", "increasing", "larger",
+        "progressing", "progressive", "worse", "worsened", "worsening",
+    ],
+    "new": [
+        "new", "newly developed", "newly appeared", "newly seen",
+        "appeared", "emerged",
+    ],
+    "resolved": [
+        "resolved", "resolving", "cleared", "disappeared",
+        "no longer present", "no longer seen", "completely resolved",
+    ],
+}
+
+# Display order for predictions / confusion matrices.
+CLS_ORDER = ["improving", "stable", "worsening", "new", "resolved"]
+
+# Map gold-parquet ground-truth labels (CheXTemporal taxonomy) to our
+# class names. Gold uses past-tense / adjective forms ("improved",
+# "worse"); we use present-tense forms that fit "{disease} is {phrase}".
+GT_TO_CLS = {
+    "improved": "improving",
+    "worse": "worsening",
+    "stable": "stable",
+    "new": "new",
+    "resolved": "resolved",
+}
 
 DEFAULT_GOLD_PARQUET = os.path.join(
     DEFAULT_DATASET_DIR, "gold_progression_pairs.parquet"
@@ -98,10 +128,28 @@ DATASETS = ["mimic", "chexpert", "rexgradient"]
 # ============================================================
 # PROMPT BUILDING
 # ============================================================
-def build_prompts(finding: str, templates: List[str]) -> List[str]:
-    """Format ``templates`` with ``{finding}`` substituted in."""
+def build_class_prompts(
+    finding: str,
+    template: str = PROMPT_TEMPLATE,
+) -> Tuple[List[str], List[int]]:
+    """Build all phrase-level prompts for one finding.
+
+    Returns
+    -------
+    prompts
+        Flat list of all phrase prompts across all classes.
+    class_idx
+        For each prompt, the index in ``CLS_ORDER`` of the class it
+        belongs to.
+    """
     f = finding.strip().lower()
-    return [t.format(finding=f) for t in templates]
+    prompts: List[str] = []
+    class_idx: List[int] = []
+    for c_i, cls in enumerate(CLS_ORDER):
+        for phrase in PROGRESSION_PHRASES[cls]:
+            prompts.append(template.format(f, phrase))
+            class_idx.append(c_i)
+    return prompts, class_idx
 
 
 # ============================================================
@@ -187,8 +235,15 @@ def load_image_tensor(dataset: str, rel_path: str, roots: Dict[str, str]) -> tor
 # GOLD PARQUET LOADING
 # ============================================================
 def _normalize_label(x) -> str:
-    """Lowercase and strip the ground-truth progression label."""
-    return str(x).strip().lower()
+    """Lowercase, strip, and map gold-taxonomy progression label to CLS_ORDER.
+
+    The gold parquet uses ``improved`` / ``worse`` etc.; we re-key those
+    to ``improving`` / ``worsening`` so they line up with CLS_ORDER and
+    PROGRESSION_PHRASES. Anything not in GT_TO_CLS is returned as-is so
+    out-of-vocabulary labels filter themselves out downstream.
+    """
+    s = str(x).strip().lower()
+    return GT_TO_CLS.get(s, s)
 
 
 def _coalesce_columns(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -239,7 +294,7 @@ def load_gold_pairs(
 
     gold = gold.rename(columns={label_col: "progression", finding_col: "finding"})
     gold["progression"] = gold["progression"].apply(_normalize_label)
-    gold = gold[gold["progression"].isin(PROGRESSION_CLASSES)].copy()
+    gold = gold[gold["progression"].isin(CLS_ORDER)].copy()
     print(f"[gold]   {len(gold)} rows after restricting to 5 canonical classes")
 
     # ---- Ensure image path columns ----
@@ -296,66 +351,110 @@ def load_gold_pairs(
 # CORE SCORING
 # ============================================================
 @torch.no_grad()
+def _encode_prompts(
+    model: TempCXRJEPA,
+    finding: str,
+    template: str,
+    device: torch.device,
+    text_cache: Optional[Dict[str, Tuple]] = None,
+):
+    """Encode all phrase prompts for one finding. Cached by (finding, template)."""
+    cache_key = f"{finding}||{template}"
+    if text_cache is not None and cache_key in text_cache:
+        prompts, class_idx, txt_local, token_mask = text_cache[cache_key]
+        return prompts, class_idx, txt_local.to(device), token_mask.to(device)
+
+    prompts, class_idx = build_class_prompts(finding, template)
+    _, txt_local, token_mask = model.text_encoder.forward_contrastive(prompts)
+    if text_cache is not None:
+        text_cache[cache_key] = (
+            prompts, class_idx,
+            txt_local.detach().cpu(), token_mask.detach().cpu(),
+        )
+    return prompts, class_idx, txt_local, token_mask
+
+
+@torch.no_grad()
 def score_one_pair(
     model: TempCXRJEPA,
     prior_img: torch.Tensor,
     current_img: torch.Tensor,
     finding: str,
-    templates: List[str],
+    template: str,
     device: torch.device,
+    text_cache: Optional[Dict[str, Tuple]] = None,
 ) -> Dict:
-    """Run the 5-way progression scoring for ONE (prior, current, finding).
+    """5-way progression scoring for ONE (prior, current, finding).
 
-    Returns:
-        prompts:   list[str]  — the 5 candidate sentences
-        scores:    list[float] — slide-deck cosine score per class
-        smooth_l1: list[float] — JEPA Smooth L1 per class (lower is closer)
-        cos_patch_mean: list[float] — per-patch cos sim per class
-        z_prior, z_cur: tensors for caller introspection
+    Runs each of the per-class phrase prompts through the predictor once
+    (batched across phrases), computes per-phrase ``cos_delta`` and
+    Smooth L1, then averages within each class. Returns both metrics so
+    the caller can compare argmax(cos) vs argmin(L1) predictions.
+
+    Returns
+    -------
+    prompts          : list[str]                — all phrase prompts
+    class_idx        : list[int]                — phrase -> CLS_ORDER idx
+    phrase_cos       : list[float]              — cos_delta per phrase
+    phrase_l1        : list[float]              — Smooth L1 per phrase
+    cos_class_scores : list[float] (len 5)      — mean cos per class
+    l1_class_scores  : list[float] (len 5)      — mean L1 per class
     """
-    prompts = build_prompts(finding, templates)
+    prompts, class_idx, all_txt, all_mask = _encode_prompts(
+        model, finding, template, device, text_cache,
+    )
+    n_phrases = len(prompts)
 
     prior = prior_img.unsqueeze(0).to(device)
     current = current_img.unsqueeze(0).to(device)
 
-    # We only need z_prior + z_cur once — both come from the image
-    # encoders and don't depend on the text condition. So:
-    #   1. Run forward once with prompt[0] just to obtain z_prior, z_cur,
-    #      and the text-encoder outputs for ALL 5 prompts (batched).
-    #   2. Run the predictor 5 times with the 5 different text outputs
-    #      against the SAME z_prior.
-    # That cuts the BioViL-T image forward pass from 5x to 1x.
-    placeholder_pc = [""]  # prior/current text are unused at inference
-
-    # Encode all 5 prompts in one text-encoder call.
-    _, all_txt_local, all_token_mask = model.text_encoder.forward_contrastive(prompts)
-
-    # Encode images once (online for prior, EMA for current — same
-    # convention as training).
+    # Encode images once (online for prior, EMA for current — matches training).
     _, prior_raw = model.image_encoder(prior)
     z_prior = F.layer_norm(prior_raw, (prior_raw.size(-1),))
 
     _, curr_raw = model.target_image_encoder(current)
     z_cur = F.layer_norm(curr_raw, (curr_raw.size(-1),)).detach()
 
-    scores = []
-    smooth_l1s = []
-    cos_patch_means = []
-    for k in range(len(prompts)):
-        txt_k = all_txt_local[k:k + 1]  # (1, T, D)
-        mask_k = all_token_mask[k:k + 1]
-        pred_k = model.predictor(z_prior, txt_k, mask_k)  # (1, N, D)
+    # Batch the predictor across all phrases by expanding prior to match.
+    z_prior_b = z_prior.expand(n_phrases, -1, -1).contiguous()  # (n_phrases, N, D)
+    preds = model.predictor(z_prior_b, all_txt, all_mask)        # (n_phrases, N, D)
 
-        m = jepa_metrics(pred_k, z_cur, z_prior)
-        scores.append(m["cos_delta"])
-        smooth_l1s.append(m["smooth_l1"])
-        cos_patch_means.append(m["cos_patch_mean"])
+    # Per-phrase metrics
+    pred_f = preds.float()
+    target_f = z_cur.float().expand_as(pred_f)
+    prior_f = z_prior.float().expand_as(pred_f)
+
+    smooth_l1 = F.smooth_l1_loss(
+        pred_f, target_f, reduction="none"
+    ).mean(dim=(1, 2))  # (n_phrases,)
+
+    dpred = (pred_f - prior_f).flatten(start_dim=1)
+    dtrue = (target_f - prior_f).flatten(start_dim=1)
+    cos_delta = F.cosine_similarity(dpred, dtrue, dim=1)  # (n_phrases,)
+
+    phrase_cos = cos_delta.cpu().tolist()
+    phrase_l1 = smooth_l1.cpu().tolist()
+
+    # Aggregate per class (mean of phrase scores)
+    n_classes = len(CLS_ORDER)
+    cos_sum = [0.0] * n_classes
+    l1_sum = [0.0] * n_classes
+    counts = [0] * n_classes
+    for k in range(n_phrases):
+        c = class_idx[k]
+        cos_sum[c] += phrase_cos[k]
+        l1_sum[c] += phrase_l1[k]
+        counts[c] += 1
+    cos_class_scores = [cos_sum[c] / max(1, counts[c]) for c in range(n_classes)]
+    l1_class_scores = [l1_sum[c] / max(1, counts[c]) for c in range(n_classes)]
 
     return {
         "prompts": prompts,
-        "scores": scores,
-        "smooth_l1": smooth_l1s,
-        "cos_patch_mean": cos_patch_means,
+        "class_idx": class_idx,
+        "phrase_cos": phrase_cos,
+        "phrase_l1": phrase_l1,
+        "cos_class_scores": cos_class_scores,
+        "l1_class_scores": l1_class_scores,
     }
 
 
@@ -384,43 +483,90 @@ def run_demo(args, model, gold_df, device):
     prior = load_image_tensor(row["dataset"], row["parent_image_prev"], args.image_roots)
     current = load_image_tensor(row["dataset"], row["parent_image_curr"], args.image_roots)
 
-    out = score_one_pair(
-        model, prior, current, finding, args.prompts, device,
-    )
+    out = score_one_pair(model, prior, current, finding, args.prompt_template, device)
 
-    print("\n5-way progression scoring (slide-deck cosine; higher = better):")
-    print(f"  {'class':<10} {'prompt':<40} {'cos_delta':>10} {'smoothL1':>10} {'cos_patch':>10}")
-    best_idx = max(range(5), key=lambda k: out["scores"][k])
-    for k, cls in enumerate(PROGRESSION_CLASSES):
-        marker = "  <-- argmax" if k == best_idx else ""
+    n_phrases_per_class = [len(PROGRESSION_PHRASES[c]) for c in CLS_ORDER]
+    cos_best = max(range(len(CLS_ORDER)), key=lambda k: out["cos_class_scores"][k])
+    l1_best = min(range(len(CLS_ORDER)), key=lambda k: out["l1_class_scores"][k])
+
+    print("\nPer-class scores (averaged across phrases of each class):")
+    print(f"  {'class':<10} {'#phrases':>9} {'cos_score':>11} {'L1_score':>11}")
+    for k, cls in enumerate(CLS_ORDER):
+        cos_marker = "  <-- argmax cos" if k == cos_best else ""
+        l1_marker = "  <-- argmin L1"  if k == l1_best  else ""
         print(
-            f"  {cls:<10} {out['prompts'][k][:38]:<40} "
-            f"{out['scores'][k]:>10.4f} "
-            f"{out['smooth_l1'][k]:>10.4f} "
-            f"{out['cos_patch_mean'][k]:>10.4f}"
-            f"{marker}"
+            f"  {cls:<10} {n_phrases_per_class[k]:>9} "
+            f"{out['cos_class_scores'][k]:>11.4f} "
+            f"{out['l1_class_scores'][k]:>11.4f}"
+            f"{cos_marker}{l1_marker}"
         )
 
-    pred_label = PROGRESSION_CLASSES[best_idx]
-    correct = pred_label == gt_label
-    print(f"\nPredicted: {pred_label}    Ground-truth: {gt_label}    "
-          f"=> {'CORRECT' if correct else 'WRONG'}")
+    cos_pred = CLS_ORDER[cos_best]
+    l1_pred = CLS_ORDER[l1_best]
+    print(f"\n  Cosine prediction:    {cos_pred:<10}  vs gt {gt_label:<10}  "
+          f"=> {'CORRECT' if cos_pred == gt_label else 'WRONG'}")
+    print(f"  Smooth L1 prediction: {l1_pred:<10}  vs gt {gt_label:<10}  "
+          f"=> {'CORRECT' if l1_pred  == gt_label else 'WRONG'}")
 
 
 # ============================================================
 # EVAL MODE
 # ============================================================
+def _print_eval_summary(method_name: str, n_correct: int, n_seen: int,
+                        confusion: Dict, per_finding: Dict):
+    """Pretty-print the overall + per-class + confusion + per-finding block."""
+    print(f"\n{'=' * 60}")
+    print(f"=== Results: {method_name}")
+    print(f"{'=' * 60}")
+    acc = n_correct / max(1, n_seen)
+    print(f"Overall accuracy: {n_correct}/{n_seen} = {acc:.4f}    (chance = 0.2)")
+
+    print("\nPer-class accuracy (= per-class recall = paper's "
+          "label-specific accuracy):")
+    print(f"  {'gt class':<10} {'n':>6} {'acc':>8}")
+    for cls in CLS_ORDER:
+        n = sum(confusion[cls].values())
+        c = confusion[cls].get(cls, 0)
+        a = c / n if n else float("nan")
+        print(f"  {cls:<10} {n:>6} {a:>8.4f}")
+
+    print("\nConfusion matrix (rows=gt, cols=pred):")
+    header = " ".join(f"{c[:9]:>9}" for c in CLS_ORDER)
+    print(f"  {'':<10} {header}")
+    for gt in CLS_ORDER:
+        cells = " ".join(f"{confusion[gt].get(p, 0):>9}" for p in CLS_ORDER)
+        print(f"  {gt:<10} {cells}")
+
+    print("\nPer-finding accuracy:")
+    print(f"  {'finding':<26} {'n':>6} {'acc':>8}")
+    for finding in sorted(per_finding):
+        c, n = per_finding[finding]
+        a = c / n if n else float("nan")
+        print(f"  {finding:<26} {n:>6} {a:>8.4f}")
+
+
 def run_eval(args, model, gold_df, device):
     if args.limit is not None:
         gold_df = gold_df.head(args.limit).reset_index(drop=True)
 
-    n_correct = 0
+    # Two parallel sets of accumulators — one per scoring method.
+    n_correct_cos = 0
+    n_correct_l1 = 0
     n_seen = 0
-    confusion = defaultdict(Counter)        # gt -> Counter(pred -> count)
-    per_finding = defaultdict(lambda: [0, 0])  # finding -> [correct, total]
+    conf_cos = defaultdict(Counter)
+    conf_l1 = defaultdict(Counter)
+    per_finding_cos = defaultdict(lambda: [0, 0])  # [correct, total]
+    per_finding_l1 = defaultdict(lambda: [0, 0])
     skipped = 0
 
+    text_cache: Dict[str, Tuple] = {}
+
     print(f"\n[eval] running 5-way progression classification on {len(gold_df)} rows")
+    print(f"[eval] phrases per class: " + ", ".join(
+        f"{c}={len(PROGRESSION_PHRASES[c])}" for c in CLS_ORDER
+    ))
+    print(f"[eval] reporting BOTH cosine-argmax and Smooth-L1-argmin predictions")
+
     for i in range(len(gold_df)):
         row = gold_df.iloc[i]
         finding = str(row["finding"])
@@ -435,51 +581,45 @@ def run_eval(args, model, gold_df, device):
             continue
 
         out = score_one_pair(
-            model, prior, current, finding, args.prompts, device,
+            model, prior, current, finding, args.prompt_template, device,
+            text_cache=text_cache,
         )
-        best_idx = max(range(5), key=lambda k: out["scores"][k])
-        pred_label = PROGRESSION_CLASSES[best_idx]
+        cos_idx = max(range(len(CLS_ORDER)), key=lambda k: out["cos_class_scores"][k])
+        l1_idx  = min(range(len(CLS_ORDER)), key=lambda k: out["l1_class_scores"][k])
+        cos_pred = CLS_ORDER[cos_idx]
+        l1_pred  = CLS_ORDER[l1_idx]
 
         n_seen += 1
-        n_correct += int(pred_label == gt_label)
-        confusion[gt_label][pred_label] += 1
-        per_finding[finding.lower()][1] += 1
-        per_finding[finding.lower()][0] += int(pred_label == gt_label)
+        finding_lc = finding.lower()
+
+        n_correct_cos += int(cos_pred == gt_label)
+        conf_cos[gt_label][cos_pred] += 1
+        per_finding_cos[finding_lc][1] += 1
+        per_finding_cos[finding_lc][0] += int(cos_pred == gt_label)
+
+        n_correct_l1 += int(l1_pred == gt_label)
+        conf_l1[gt_label][l1_pred] += 1
+        per_finding_l1[finding_lc][1] += 1
+        per_finding_l1[finding_lc][0] += int(l1_pred == gt_label)
 
         if (i + 1) % max(1, len(gold_df) // 20) == 0:
-            running = n_correct / max(1, n_seen)
-            print(f"[eval]   {i + 1}/{len(gold_df)}  acc={running:.4f}  skipped={skipped}")
+            acc_cos = n_correct_cos / max(1, n_seen)
+            acc_l1 = n_correct_l1 / max(1, n_seen)
+            print(f"[eval]   {i + 1}/{len(gold_df)}  "
+                  f"cos_acc={acc_cos:.4f}  l1_acc={acc_l1:.4f}  "
+                  f"skipped={skipped}")
 
-    print("\n=== Overall ===")
     if n_seen == 0:
         print("No samples evaluated.")
         return
-    acc = n_correct / n_seen
-    print(f"Accuracy: {n_correct}/{n_seen} = {acc:.4f}    (chance = 0.2)")
+
     if skipped:
-        print(f"Skipped:  {skipped} rows due to missing images")
+        print(f"\nSkipped {skipped} rows due to missing images")
 
-    print("\n=== Per-class accuracy (recall) ===")
-    print(f"  {'gt class':<10} {'n':>6} {'acc':>8}")
-    for cls in PROGRESSION_CLASSES:
-        n = sum(confusion[cls].values())
-        c = confusion[cls].get(cls, 0)
-        a = c / n if n else float("nan")
-        print(f"  {cls:<10} {n:>6} {a:>8.4f}")
-
-    print("\n=== Confusion matrix (rows=gt, cols=pred) ===")
-    header = "  " + " ".join(f"{c[:8]:>9}" for c in PROGRESSION_CLASSES)
-    print(f"  {'':<10}{header}")
-    for gt in PROGRESSION_CLASSES:
-        cells = " ".join(f"{confusion[gt].get(p, 0):>9}" for p in PROGRESSION_CLASSES)
-        print(f"  {gt:<10}{cells}")
-
-    print("\n=== Per-finding accuracy ===")
-    print(f"  {'finding':<26} {'n':>6} {'acc':>8}")
-    for finding in sorted(per_finding):
-        c, n = per_finding[finding]
-        a = c / n if n else float("nan")
-        print(f"  {finding:<26} {n:>6} {a:>8.4f}")
+    _print_eval_summary("Cosine (argmax slide-deck cos(Δẑ, Δz_true))",
+                        n_correct_cos, n_seen, conf_cos, per_finding_cos)
+    _print_eval_summary("Smooth L1 (argmin ‖ẑ_cur − z_cur‖_smooth_l1)",
+                        n_correct_l1, n_seen, conf_l1, per_finding_l1)
 
 
 # ============================================================
@@ -516,12 +656,12 @@ def main():
              "Auto-detected by default.",
     )
     parser.add_argument(
-        "--prompts",
-        nargs=5,
-        default=DEFAULT_PROMPTS,
-        help="Five prompt templates (one per class) in canonical order: "
-             "new worse stable improved resolved. Each must contain "
-             "'{finding}'.",
+        "--prompt-template",
+        default=PROMPT_TEMPLATE,
+        help="Two-slot positional template: {disease} is filled in first, "
+             "{progression-phrase} second. Default: '{} is {}'. The phrase "
+             "bank itself is hardcoded in PROGRESSION_PHRASES; this only "
+             "controls how (disease, phrase) get joined into a sentence.",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
@@ -550,13 +690,14 @@ def main():
 
     args = parser.parse_args()
 
-    # Sanity: make sure prompt templates contain {finding}.
-    for i, t in enumerate(args.prompts):
-        if "{finding}" not in t:
-            raise ValueError(
-                f"Prompt {i} ({PROGRESSION_CLASSES[i]!r}) is missing "
-                f"'{{finding}}' placeholder: {t!r}"
-            )
+    # Sanity check the prompt template: must accept two positional slots.
+    try:
+        _ = args.prompt_template.format("test_disease", "test_phrase")
+    except (IndexError, KeyError) as e:
+        raise ValueError(
+            f"--prompt-template must accept two positional {{}} slots "
+            f"({{disease}}, {{phrase}}). Got {args.prompt_template!r}: {e}"
+        )
 
     # Resolve image roots: start from silver IMAGE_ROOTS, prefer
     # final_gold_<dataset>_images/ next to the parquet, then apply
