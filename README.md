@@ -43,6 +43,9 @@ cxr-temporal-model/
 ├── infer_jepa.py               # single-example inference demo
 ├── eval_jepa_val.py            # average inference metrics over the full val split
 ├── progression_classify.py     # 5-way progression classification on gold pairs
+├── csv_progression_eval.py     # shared helpers for CSV-based 3-way benchmarks
+├── eval_mscxrt.py              # 3-way progression classification on MS-CXR-T
+├── eval_cig.py                 # 3-way progression classification on Chest ImaGenome
 └── tempcxr/
     └── modules/
         ├── image_encoder_jepa.py   # JEPA image encoder (raw outputs)
@@ -307,39 +310,84 @@ The reported `Smooth L1 (predictor)` should closely match the
 `val_jepa` column in `logs/val_metrics_jepa.csv` at the loaded epoch
 (modulo augmentation — eval runs without).
 
-### `progression_classify.py` — 5-way progression classification
+### `progression_classify.py` — 5-way progression classification (gold)
 
 Loads `gold_progression_pairs.parquet` and, for each (study pair,
-finding) example, builds five candidate progression sentences (one per
-class: `new`, `worse`, `stable`, `improved`, `resolved`). Each
-candidate is fed through the predictor; the class whose predicted
-`ẑ_cur^k` aligns best with the actual `z_cur` (highest
-`cos(Δẑ_k, Δz_true)`) is the predicted progression. Compares with the
-gold label and reports overall, per-class, and per-finding accuracy.
+finding) example, builds a multi-phrase prompt bank for five candidate
+progression classes (`improving`, `stable`, `worsening`, `new`,
+`resolved`). Every phrase is fed through the predictor; per-phrase
+scores are averaged within each class to produce one cosine score and
+one Smooth L1 score per class. The script reports two parallel sets of
+results — one for `argmax cos(Δẑ, Δz_true)` (direction-only, the
+slide-deck rule) and one for `argmin SmoothL1(ẑ_cur, z_cur)`
+(direction + magnitude, the JEPA training loss).
 
 ```bash
-# Sanity-check one gold row with full 5-way breakdown
+# Sanity-check one gold row with the full 5-way breakdown
 python progression_classify.py --demo
 
-# Full evaluation
+# Full evaluation (both cosine and Smooth L1)
 python progression_classify.py --eval
 
 # First 200 rows only (quick smoke test)
 python progression_classify.py --eval --limit 200
 
-# Custom prompt templates (must contain {finding}; canonical class
-# order is: new worse stable improved resolved)
+# Override the disease/phrase template
+python progression_classify.py --eval --prompt-template "{} appears {}"
+
+# Override an image root for a single dataset
 python progression_classify.py --eval \
-  --prompts "new {finding}" "worsening {finding}" "stable {finding}" \
-            "improving {finding}" "resolved {finding}"
+  --image-root mimic=/data/final_gold_mimic_images
 ```
 
 Both image encoders follow the training-time convention: online
 encoder for the prior (matches what the predictor was trained on) and
-EMA target encoder for the current (matches the JEPA loss target). The
-text encoder runs all five prompts in a single batched call, and the
-image forward pass is run once per (prior, current) pair, so the cost
-scales with `O(N_pairs)` rather than `O(5 × N_pairs)`.
+EMA target encoder for the current (matches the JEPA loss target). All
+phrase prompts for one finding are batched through both the text
+encoder and the predictor, and the image forward pass runs once per
+(prior, current) pair, so the cost scales with `O(N_pairs)` rather
+than with the size of the prompt bank.
+
+### `eval_mscxrt.py` and `eval_cig.py` — 3-way progression classification
+
+Same multi-phrase scoring machinery as `progression_classify.py`, but
+applied to two CSV-format external benchmarks where every label is one
+of `{improving, stable, worsening}`:
+
+| Script              | Default CSV                  | Label mapping                                                            |
+|---------------------|------------------------------|--------------------------------------------------------------------------|
+| `eval_mscxrt.py`    | `mscxrt_labels_new.csv`      | `improving / stable / worsening` (also accepts `no change`, `unchanged`) |
+| `eval_cig.py`       | `cig_gold_labels_new.csv`    | `improved → improving`, `worsened → worsening`, `no change → stable`     |
+
+`eval_cig.py` drops every CIG row whose `comparison` is anything other
+than the three accepted labels (so e.g. `new`, `resolved`, and `n/a`
+are excluded). Both scripts restrict the predictor's argmax / argmin
+to the 3-class subset of `CLS_ORDER`, so the model is never penalized
+for predicting `new` or `resolved` on benchmarks that don't have those
+classes.
+
+Both CSVs are expected to contain absolute MIMIC-CXR-JPG image paths
+in `img_path_prev` / `img_path_curr` (we open them directly with no
+prefix-stripping or root remapping). The reported overall accuracy,
+per-class recall, 3×3 confusion matrix, and per-finding accuracy are
+directly comparable to the MS-CXR-T and CIG numbers in the
+CheXTemporal paper.
+
+```bash
+# MS-CXR-T
+python eval_mscxrt.py --demo
+python eval_mscxrt.py --eval
+python eval_mscxrt.py --eval --csv /path/to/mscxrt_labels_new.csv
+
+# Chest ImaGenome
+python eval_cig.py --demo
+python eval_cig.py --eval
+python eval_cig.py --eval --csv /path/to/cig_gold_labels_new.csv
+```
+
+The shared 3-way evaluation logic lives in `csv_progression_eval.py`;
+the two scripts above are thin wrappers that just supply a default
+CSV path and a dataset-specific `comparison`-to-canonical-class map.
 
 ## Reference
 

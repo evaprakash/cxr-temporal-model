@@ -513,28 +513,38 @@ def run_demo(args, model, gold_df, device):
 # EVAL MODE
 # ============================================================
 def _print_eval_summary(method_name: str, n_correct: int, n_seen: int,
-                        confusion: Dict, per_finding: Dict):
-    """Pretty-print the overall + per-class + confusion + per-finding block."""
+                        confusion: Dict, per_finding: Dict,
+                        classes: Optional[List[str]] = None):
+    """Pretty-print the overall + per-class + confusion + per-finding block.
+
+    ``classes`` (default ``CLS_ORDER``) controls which classes show up in
+    the per-class accuracy and confusion-matrix tables. Pass a 3-element
+    subset for benchmarks that only have improving / stable / worsening.
+    """
+    if classes is None:
+        classes = CLS_ORDER
+    chance = 1.0 / max(1, len(classes))
+
     print(f"\n{'=' * 60}")
     print(f"=== Results: {method_name}")
     print(f"{'=' * 60}")
     acc = n_correct / max(1, n_seen)
-    print(f"Overall accuracy: {n_correct}/{n_seen} = {acc:.4f}    (chance = 0.2)")
+    print(f"Overall accuracy: {n_correct}/{n_seen} = {acc:.4f}    (chance = {chance:.3f})")
 
     print("\nPer-class accuracy (= per-class recall = paper's "
           "label-specific accuracy):")
     print(f"  {'gt class':<10} {'n':>6} {'acc':>8}")
-    for cls in CLS_ORDER:
+    for cls in classes:
         n = sum(confusion[cls].values())
         c = confusion[cls].get(cls, 0)
         a = c / n if n else float("nan")
         print(f"  {cls:<10} {n:>6} {a:>8.4f}")
 
     print("\nConfusion matrix (rows=gt, cols=pred):")
-    header = " ".join(f"{c[:9]:>9}" for c in CLS_ORDER)
+    header = " ".join(f"{c[:9]:>9}" for c in classes)
     print(f"  {'':<10} {header}")
-    for gt in CLS_ORDER:
-        cells = " ".join(f"{confusion[gt].get(p, 0):>9}" for p in CLS_ORDER)
+    for gt in classes:
+        cells = " ".join(f"{confusion[gt].get(p, 0):>9}" for p in classes)
         print(f"  {gt:<10} {cells}")
 
     print("\nPer-finding accuracy:")
