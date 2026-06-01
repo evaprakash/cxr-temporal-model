@@ -41,6 +41,7 @@ cxr-temporal-model/
 ├── resume_train_jepa.py        # JEPA DDP training entry (invoked via torchrun)
 ├── run_jepa.py                 # direct launcher (auto-detects GPUs, no SLURM needed)
 ├── infer_jepa.py               # single-example inference demo
+├── eval_jepa_val.py            # average inference metrics over the full val split
 ├── progression_classify.py     # 5-way progression classification on gold pairs
 └── tempcxr/
     └── modules/
@@ -284,6 +285,27 @@ python infer_jepa.py --idx 42   # specific val sample
 Reports the JEPA Smooth L1, the slide-deck inference score
 `cos(ẑ_cur - z_prior, z_cur - z_prior)`, per-patch cosine similarity,
 and a do-nothing baseline (`ẑ_cur := LN(z_prior)`) for comparison.
+
+Single-example numbers can be misleading: most paired CXR studies are
+"stable" so on any given pair the do-nothing baseline is hard to beat.
+Use `eval_jepa_val.py` for the averaged comparison.
+
+### `eval_jepa_val.py` — averaged metrics over the full val split
+
+Same metrics as `infer_jepa.py` but computed once per pair and
+averaged across all val samples. This is the meaningful comparison
+against the do-nothing baseline (cherry-picked stable / change samples
+will systematically favor one or the other).
+
+```bash
+python eval_jepa_val.py                    # full val set
+python eval_jepa_val.py --limit 500        # quick smoke test
+python eval_jepa_val.py --batch-size 32    # if VRAM allows
+```
+
+The reported `Smooth L1 (predictor)` should closely match the
+`val_jepa` column in `logs/val_metrics_jepa.csv` at the loaded epoch
+(modulo augmentation — eval runs without).
 
 ### `progression_classify.py` — 5-way progression classification
 
