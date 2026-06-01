@@ -43,30 +43,41 @@ DATASETS = ["mimic", "chexpert", "rexgradient"]
 # Candidate root discovery
 # ============================================================
 def discover_final_gold_roots(parquet_dir: str) -> Dict[str, str]:
-    """Look for final_gold_<dataset>_images dirs next to the parquet."""
+    """Look for final_gold_<dataset>_images dirs near the parquet.
+
+    Searches both ``parquet_dir`` (gold images co-located with the parquet)
+    and ``parquet_dir``'s parent (gold images sit as siblings of the
+    parquet's containing folder, e.g. ``~/jepa/final_gold_*_images/``).
+    """
     roots: Dict[str, str] = {}
+    parent_dir = os.path.dirname(parquet_dir.rstrip("/"))
+    search_bases = [parquet_dir, parent_dir]
     for d in DATASETS:
-        # Try a few naming variants
-        for name in [
-            f"final_gold_{d}_images",
-            f"gold_{d}_images",
-            f"{d}_gold_images",
-            f"final_{d}_images",
-        ]:
-            cand = os.path.join(parquet_dir, name)
-            if os.path.isdir(cand):
-                roots[d] = cand
+        for base in search_bases:
+            for name in [
+                f"final_gold_{d}_images",
+                f"gold_{d}_images",
+                f"{d}_gold_images",
+                f"final_{d}_images",
+            ]:
+                cand = os.path.join(base, name)
+                if os.path.isdir(cand):
+                    roots[d] = cand
+                    break
+            if d in roots:
                 break
     return roots
 
 
 def list_candidate_dirs(parquet_dir: str) -> List[str]:
-    """Just glob anything that looks like a gold images dir under parquet_dir."""
+    """Glob anything that looks like a gold images dir under parquet_dir or its parent."""
     patterns = ["final_gold_*", "gold_*_images", "*_gold_*"]
+    parent_dir = os.path.dirname(parquet_dir.rstrip("/"))
     found = []
-    for p in patterns:
-        found.extend(sorted(glob.glob(os.path.join(parquet_dir, p))))
-    return [f for f in found if os.path.isdir(f)]
+    for base in [parquet_dir, parent_dir]:
+        for p in patterns:
+            found.extend(sorted(glob.glob(os.path.join(base, p))))
+    return sorted({f for f in found if os.path.isdir(f)})
 
 
 # ============================================================

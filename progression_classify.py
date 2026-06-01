@@ -108,17 +108,26 @@ def build_prompts(finding: str, templates: List[str]) -> List[str]:
 # GOLD IMAGE ROOT DISCOVERY
 # ============================================================
 def discover_gold_image_roots(parquet_dir: str) -> Dict[str, str]:
-    """Look for ``final_gold_<dataset>_images/`` next to the gold parquet.
+    """Look for ``final_gold_<dataset>_images/`` near the gold parquet.
 
-    The CheXTemporal HF repo ships gold images in three folders alongside
-    the parquet rather than in the silver ``all_data`` tree, so for the
-    gold eval we want to point at those instead of ``IMAGE_ROOTS``.
+    Search order (first hit per dataset wins):
+      1. ``parquet_dir`` itself — when the gold images are co-located
+         with the parquet (e.g. inside the CheXTemporal HF clone).
+      2. ``parquet_dir``'s parent — when the gold images are siblings
+         of the parquet's containing folder (e.g. ``~/jepa/`` holds both
+         ``CheXTemporal/`` and ``final_gold_*_images/``).
+
+    Returns a dict mapping ``dataset -> absolute_path``.
     """
     roots: Dict[str, str] = {}
+    parent_dir = os.path.dirname(parquet_dir.rstrip("/"))
+    search_bases = [parquet_dir, parent_dir]
     for d in DATASETS:
-        cand = os.path.join(parquet_dir, f"final_gold_{d}_images")
-        if os.path.isdir(cand):
-            roots[d] = cand
+        for base in search_bases:
+            cand = os.path.join(base, f"final_gold_{d}_images")
+            if os.path.isdir(cand):
+                roots[d] = cand
+                break
     return roots
 
 
