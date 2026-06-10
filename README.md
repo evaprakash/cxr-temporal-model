@@ -122,7 +122,7 @@ top of the file to match your filesystem.
 `dataset_combined_jepa.py` loads three silver parquets
 (`silver_findings.parquet`, `silver_studies.parquet`,
 `silver_sentences.parquet`). The default location is
-`/home/eprakash/jepa/CheXTemporal/`; override with the
+`/home/evaprakash/CheXTemporal/`; override with the
 `CHEXTEMPORAL_DIR` env var:
 
 ```bash

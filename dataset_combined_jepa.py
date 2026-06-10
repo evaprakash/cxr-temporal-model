@@ -67,7 +67,7 @@ CONDITION_MODES = ("dynamic", "templated")
 # explicit paths to ``JEPACombinedDataset(...)``.
 DEFAULT_DATASET_DIR = os.environ.get(
     "CHEXTEMPORAL_DIR",
-    "/home/eprakash/jepa/CheXTemporal",
+    "/home/evaprakash/CheXTemporal",
 )
 DEFAULT_FINDINGS = os.path.join(DEFAULT_DATASET_DIR, "silver_findings.parquet")
 DEFAULT_STUDIES = os.path.join(DEFAULT_DATASET_DIR, "silver_studies.parquet")
