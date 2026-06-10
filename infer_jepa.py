@@ -188,12 +188,13 @@ def main():
     )
     parser.add_argument(
         "--condition-mode",
-        default=os.environ.get("CONDITION_MODE", "dynamic"),
+        default=os.environ.get("CONDITION_MODE", "templated"),
         choices=("dynamic", "templated"),
         help=(
             "Which text condition to feed the predictor. Should match "
             "what the checkpoint was trained with. Defaults to the "
-            "CONDITION_MODE env var, falling back to 'dynamic'."
+            "CONDITION_MODE env var, falling back to 'templated' (the "
+            "current training default)."
         ),
     )
     args = parser.parse_args()

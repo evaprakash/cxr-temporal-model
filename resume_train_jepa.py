@@ -36,17 +36,19 @@ from losses_jepa import jepa_smooth_l1_loss
 # ============================================================
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Which text condition the predictor sees. ``dynamic`` reproduces the
-# original behavior (joined dynamic sentences from
-# ``silver_sentences.parquet``); ``templated`` builds the condition from
-# ``silver_findings.parquet`` as ``"{finding} is {progression}"`` clauses,
-# joined with ". " and shuffled per-sample at train time.
-CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
+# Which text condition the predictor sees. ``templated`` (the current
+# default) builds the condition from ``silver_findings.parquet`` as
+# capitalized ``"{Finding} is {progression}."`` clauses, joined with a
+# space and shuffled per-sample at train time. ``dynamic`` reproduces
+# the older behavior (joined ``label=="dynamic"`` sentences from
+# ``silver_sentences.parquet``) and is still selectable via the env var.
+CONDITION_MODE = os.environ.get("CONDITION_MODE", "templated")
 
 # Namespace checkpoints / logs by condition mode in the default paths
-# so the templated run doesn't clobber the existing dynamic run. The
+# so the two modes never clobber each other's checkpoints. The
 # ``dynamic`` default stays at ``checkpoints_jepa/`` / ``logs/`` for
-# backwards compatibility with prior runs; new modes get their own dirs.
+# backwards compatibility with prior runs; other modes get their own
+# dirs (e.g. ``checkpoints_jepa_templated/`` / ``logs_templated/``).
 _DEFAULT_CKPT_DIR = (
     os.path.join(_HERE, "checkpoints_jepa")
     if CONDITION_MODE == "dynamic"

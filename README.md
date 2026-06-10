@@ -237,39 +237,43 @@ latest `epoch_*.pt` in `CHECKPOINT_DIR` if any exist.
 The predictor's text condition is selected at dataset-construction time
 via `JEPACombinedDataset(condition_mode=...)`. Two modes are supported:
 
-| Mode        | Source                                                          | Per-sample text                                                          |
-|-------------|-----------------------------------------------------------------|--------------------------------------------------------------------------|
-| `dynamic`   | All `label == "dynamic"` sentences for the current study, joined | Free-text MedGemma extraction (original behavior, default)               |
-| `templated` | Per-finding rows of `silver_findings.parquet` for the study pair | `"{finding1} is {prog1}. {finding2} is {prog2}. ..."`                    |
+| Mode        | Source                                                          | Per-sample text                                                              |
+|-------------|-----------------------------------------------------------------|------------------------------------------------------------------------------|
+| `templated` (current default) | Per-finding rows of `silver_findings.parquet` for the study pair | `"{Finding1} is {prog1}. {Finding2} is {prog2}."` (capitalized, period-terminated) |
+| `dynamic`   | All `label == "dynamic"` sentences for the current study, joined | Free-text MedGemma extraction (older behavior, kept for ablation)            |
 
 In `templated` mode every (study pair, finding) row of `silver_findings`
 is grouped under its study pair; the `(finding, progression)` list is
 formatted with the canonical class names from
 `progression_phrases.CLS_ORDER` (`improving` / `stable` / `worsening` /
-`new` / `resolved`) and the order is shuffled at every `__getitem__`
-call when `train=True` so the predictor doesn't learn position-
-dependent shortcuts. For `train=False` the order is sorted
-alphabetically by finding name, which keeps the val Smooth L1 stable
-across epochs.
+`new` / `resolved`), each clause is capitalized and terminated with a
+period, and the order is shuffled at every `__getitem__` call when
+`train=True` so the predictor doesn't learn position-dependent
+shortcuts. For `train=False` the order is sorted alphabetically by
+finding name, which keeps the val Smooth L1 stable across epochs.
 
 The mode is selected via the `CONDITION_MODE` env var on the training
 side and via `--condition-mode` (or `CONDITION_MODE`) on the eval side.
 The two modes write to independent default checkpoint / log dirs
 (`checkpoints_jepa/` + `logs/` for `dynamic`; `checkpoints_jepa_<mode>/`
-+ `logs_<mode>/` otherwise), so the original dynamic checkpoint isn't
-overwritten when you switch.
++ `logs_<mode>/` otherwise), so switching modes never clobbers the
+other mode's checkpoints.
 
 ```bash
-# baseline (existing): dynamic sentences
+# current default: templated finding + progression sentences
 python run_jepa.py
-
-# new: templated finding + progression sentences
-CONDITION_MODE=templated python run_jepa.py
 # → writes to checkpoints_jepa_templated/ and logs_templated/
 
-# evaluate the templated checkpoint with the same condition source
-CONDITION_MODE=templated \
-    JEPA_CKPT=checkpoints_jepa_templated/best.pt \
+# older baseline: dynamic sentences (opt in via the env var)
+CONDITION_MODE=dynamic python run_jepa.py
+# → writes to checkpoints_jepa/ and logs/
+
+# evaluate the templated checkpoint (matches the default)
+JEPA_CKPT=checkpoints_jepa_templated/best.pt python eval_jepa_val.py
+
+# evaluate a dynamic-mode checkpoint
+CONDITION_MODE=dynamic \
+    JEPA_CKPT=checkpoints_jepa/best.pt \
     python eval_jepa_val.py
 ```
 

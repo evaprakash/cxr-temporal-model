@@ -252,13 +252,13 @@ class JEPACombinedDataset(Dataset):
         Where to read/write the cached split assignments. Defaults to
         ``./splits_jepa.csv`` next to this file.
     condition_mode
-        Which text condition to feed the predictor. ``"dynamic"`` (the
-        default, backwards-compatible) returns the joined dynamic
-        sentences. ``"templated"`` returns the per-finding clauses
-        ``"{finding} is {progression_class}"`` built from
-        ``silver_findings.parquet``. Both modes carry the same set of
-        study-pair rows under the hood — only the value of
-        ``condition_text`` differs.
+        Which text condition to feed the predictor. ``"templated"`` (the
+        current default) returns the capitalized per-finding clauses
+        ``"{Finding} is {progression_class}."`` built from
+        ``silver_findings.parquet``. ``"dynamic"`` returns the joined
+        dynamic sentences from ``silver_sentences.parquet`` (the older
+        behavior). Both modes carry the same set of study-pair rows
+        under the hood — only the value of ``condition_text`` differs.
     """
 
     def __init__(
@@ -272,7 +272,7 @@ class JEPACombinedDataset(Dataset):
         val_fraction: float = 0.1,
         split_seed: int = 42,
         splits_file: Optional[str] = None,
-        condition_mode: str = "dynamic",
+        condition_mode: str = "templated",
     ):
         if condition_mode not in CONDITION_MODES:
             raise ValueError(
@@ -429,10 +429,11 @@ class JEPACombinedDataset(Dataset):
         (alphabetical by finding name) otherwise so val Smooth L1 is
         comparable across epochs.
 
-        Each clause is ``"{finding} is {progression_class}"`` with the
-        canonical class name from ``progression_phrases.CLS_ORDER``.
-        Synonym sampling is intentionally not done here — the eval-time
-        prompt ensembling already covers the synonym bank.
+        Each clause is ``"{Finding} is {progression_class}."`` (first
+        letter capitalized, trailing period) with the canonical class
+        name from ``progression_phrases.CLS_ORDER``. Synonym sampling is
+        intentionally not done here — the eval-time prompt ensembling
+        already covers the synonym bank.
         """
         findings = list(row["finding"])
         prog_cls = list(row["progression_cls"])
@@ -441,8 +442,11 @@ class JEPACombinedDataset(Dataset):
             random.shuffle(pairs)
         else:
             pairs.sort(key=lambda fp: fp[0])
-        clauses = [f"{finding} is {cls}" for finding, cls in pairs]
-        return ". ".join(clauses)
+        clauses = [
+            f"{finding[:1].upper()}{finding[1:]} is {cls}."
+            for finding, cls in pairs
+        ]
+        return " ".join(clauses)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
@@ -511,7 +515,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--condition-mode",
         choices=list(CONDITION_MODES),
-        default="dynamic",
+        default="templated",
         help="Which text condition to surface in the smoke test.",
     )
     args = parser.parse_args()
