@@ -1,8 +1,13 @@
 """Single-example inference demo for the JEPA model.
 
 Loads ``best.pt``, picks one paired sample from the val split, and runs
-the full prior + dynamic-text -> predicted-current pipeline. Reports
+the full prior + condition-text -> predicted-current pipeline. Reports
 how close the prediction is to the actual current image's encoding.
+
+The condition text comes from the dataset's ``condition_mode`` (see
+``dataset_combined_jepa.JEPACombinedDataset``); pick the same mode your
+checkpoint was trained with via the ``CONDITION_MODE`` env var (default
+``dynamic``).
 
 Reported metrics
 ----------------
@@ -94,10 +99,10 @@ def encode_pair_with_text(
     model: TempCXRJEPA,
     prior: torch.Tensor,
     current: torch.Tensor,
-    dynamic_text: list,
+    condition_text: list,
     device: torch.device,
 ):
-    """Run the full forward pass for ONE (prior, current, dynamic) sample.
+    """Run the full forward pass for ONE (prior, current, condition) sample.
 
     Uses placeholder text for prior_report / current_report since this
     helper is for inference where we only care about the predictor side.
@@ -113,8 +118,8 @@ def encode_pair_with_text(
     """
     prior = prior.to(device)
     current = current.to(device)
-    placeholder = [""] * len(dynamic_text)
-    return model(prior, current, placeholder, placeholder, dynamic_text)
+    placeholder = [""] * len(condition_text)
+    return model(prior, current, placeholder, placeholder, condition_text)
 
 
 def jepa_metrics(pred: torch.Tensor, target: torch.Tensor, prior: torch.Tensor):
@@ -181,6 +186,16 @@ def main():
         default=42,
         help="Must match training (default 42) so the val split agrees.",
     )
+    parser.add_argument(
+        "--condition-mode",
+        default=os.environ.get("CONDITION_MODE", "dynamic"),
+        choices=("dynamic", "templated"),
+        help=(
+            "Which text condition to feed the predictor. Should match "
+            "what the checkpoint was trained with. Defaults to the "
+            "CONDITION_MODE env var, falling back to 'dynamic'."
+        ),
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -195,6 +210,7 @@ def main():
         train=False,
         val_fraction=args.val_fraction,
         split_seed=args.split_seed,
+        condition_mode=args.condition_mode,
     )
     if len(val_ds) == 0:
         raise RuntimeError("Val split is empty — check IMAGE_ROOTS and CHEXTEMPORAL_DIR.")
@@ -213,15 +229,16 @@ def main():
     print(f"  patient_id:    {row['patient_id']}")
     print(f"  study_id_prev: {row['study_id_prev']}")
     print(f"  study_id_curr: {row['study_id_curr']}")
-    dyn_preview = row["dynamic_report"][:300].replace("\n", " ")
-    print(f"  dynamic_report (first 300 chars):\n    {dyn_preview}")
+    print(f"  condition_mode: {val_ds.condition_mode}")
+    cond_preview = sample["condition_text"][:300].replace("\n", " ")
+    print(f"  condition_text (first 300 chars):\n    {cond_preview}")
 
     # ---- Forward ----
     out = encode_pair_with_text(
         model,
         prior=sample["prior_image"].unsqueeze(0),
         current=sample["current_image"].unsqueeze(0),
-        dynamic_text=[sample["dynamic_report"]],
+        condition_text=[sample["condition_text"]],
         device=device,
     )
     pred = out["pred_current_patches"]

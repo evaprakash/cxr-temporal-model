@@ -71,6 +71,7 @@ from dataset_combined_jepa import (
     _resolve_image_path,
 )
 from infer_jepa import IMAGE_ROOTS, jepa_metrics, load_jepa_model
+from progression_phrases import CLS_ORDER, GT_TO_CLS, PROGRESSION_PHRASES
 from tempcxr.modules.jepa import TempCXRJEPA
 
 
@@ -80,44 +81,9 @@ from tempcxr.modules.jepa import TempCXRJEPA
 # Prompt template uses positional substitution: "{disease} is {phrase}".
 PROMPT_TEMPLATE = "{} is {}"
 
-# Multi-phrase prompt bank — each class has multiple phrasings whose
-# scores get averaged (CLIP-style prompt ensembling).
-PROGRESSION_PHRASES = {
-    "improving": [
-        "better", "decreased", "decreasing", "improved",
-        "improving", "reduced", "smaller",
-    ],
-    "stable": [
-        "constant", "stable", "unchanged",
-    ],
-    "worsening": [
-        "bigger", "developing", "enlarged", "enlarging", "greater",
-        "growing", "increased", "increasing", "larger",
-        "progressing", "progressive", "worse", "worsened", "worsening",
-    ],
-    "new": [
-        "new", "newly developed", "newly appeared", "newly seen",
-        "appeared", "emerged",
-    ],
-    "resolved": [
-        "resolved", "resolving", "cleared", "disappeared",
-        "no longer present", "no longer seen", "completely resolved",
-    ],
-}
-
-# Display order for predictions / confusion matrices.
-CLS_ORDER = ["improving", "stable", "worsening", "new", "resolved"]
-
-# Map gold-parquet ground-truth labels (CheXTemporal taxonomy) to our
-# class names. Gold uses past-tense / adjective forms ("improved",
-# "worse"); we use present-tense forms that fit "{disease} is {phrase}".
-GT_TO_CLS = {
-    "improved": "improving",
-    "worse": "worsening",
-    "stable": "stable",
-    "new": "new",
-    "resolved": "resolved",
-}
+# The phrase bank, class order, and gold-label normalization live in
+# ``progression_phrases.py`` so the dataset module can build templated
+# training conditions from the same vocabulary without circular imports.
 
 DEFAULT_GOLD_PARQUET = os.path.join(
     DEFAULT_DATASET_DIR, "gold_progression_pairs.parquet"

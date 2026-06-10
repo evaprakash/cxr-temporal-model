@@ -77,6 +77,16 @@ def main():
         default=42,
         help="Must match training (default 42) so the val split agrees.",
     )
+    parser.add_argument(
+        "--condition-mode",
+        default=os.environ.get("CONDITION_MODE", "dynamic"),
+        choices=("dynamic", "templated"),
+        help=(
+            "Which text condition to feed the predictor. Should match "
+            "what the checkpoint was trained with. Defaults to the "
+            "CONDITION_MODE env var, falling back to 'dynamic'."
+        ),
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -89,6 +99,7 @@ def main():
         train=False,
         val_fraction=args.val_fraction,
         split_seed=args.split_seed,
+        condition_mode=args.condition_mode,
     )
     if args.limit is not None:
         val_ds.df = val_ds.df.head(args.limit).reset_index(drop=True)
@@ -120,7 +131,7 @@ def main():
             current = batch["current_image"].to(device, non_blocking=True)
             out = model(
                 prior, current,
-                batch["prior_report"], batch["current_report"], batch["dynamic_report"],
+                batch["prior_report"], batch["current_report"], batch["condition_text"],
             )
             pred    = out["pred_current_patches"].float()      # (B, N, D)
             target  = out["current_patches_target"].float()    # (B, N, D)

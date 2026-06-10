@@ -35,14 +35,30 @@ from losses_jepa import jepa_smooth_l1_loss
 # PATHS
 # ============================================================
 _HERE = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_DIR = os.environ.get(
-    "JEPA_CHECKPOINT_DIR",
-    os.path.join(_HERE, "checkpoints_jepa"),
+
+# Which text condition the predictor sees. ``dynamic`` reproduces the
+# original behavior (joined dynamic sentences from
+# ``silver_sentences.parquet``); ``templated`` builds the condition from
+# ``silver_findings.parquet`` as ``"{finding} is {progression}"`` clauses,
+# joined with ". " and shuffled per-sample at train time.
+CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
+
+# Namespace checkpoints / logs by condition mode in the default paths
+# so the templated run doesn't clobber the existing dynamic run. The
+# ``dynamic`` default stays at ``checkpoints_jepa/`` / ``logs/`` for
+# backwards compatibility with prior runs; new modes get their own dirs.
+_DEFAULT_CKPT_DIR = (
+    os.path.join(_HERE, "checkpoints_jepa")
+    if CONDITION_MODE == "dynamic"
+    else os.path.join(_HERE, f"checkpoints_jepa_{CONDITION_MODE}")
 )
-LOG_DIR = os.environ.get(
-    "JEPA_LOG_DIR",
-    os.path.join(_HERE, "logs"),
+_DEFAULT_LOG_DIR = (
+    os.path.join(_HERE, "logs")
+    if CONDITION_MODE == "dynamic"
+    else os.path.join(_HERE, f"logs_{CONDITION_MODE}")
 )
+CHECKPOINT_DIR = os.environ.get("JEPA_CHECKPOINT_DIR", _DEFAULT_CKPT_DIR)
+LOG_DIR = os.environ.get("JEPA_LOG_DIR", _DEFAULT_LOG_DIR)
 
 IMAGE_ROOTS = {
     "mimic": "/home/evaprakash/all_data/mimic",
@@ -146,6 +162,7 @@ train_dataset = JEPACombinedDataset(
     train=True,
     val_fraction=VAL_FRACTION,
     split_seed=SPLIT_SEED,
+    condition_mode=CONDITION_MODE,
 )
 
 val_dataset = JEPACombinedDataset(
@@ -154,7 +171,13 @@ val_dataset = JEPACombinedDataset(
     train=False,
     val_fraction=VAL_FRACTION,
     split_seed=SPLIT_SEED,
+    condition_mode=CONDITION_MODE,
 )
+
+if local_rank == 0:
+    print(f"[train] condition_mode={CONDITION_MODE}")
+    print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
+    print(f"[train] log dir:        {LOG_DIR}")
 
 train_sampler = DistributedSampler(
     train_dataset,
@@ -353,7 +376,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         prior_reports = batch["prior_report"]
         current_reports = batch["current_report"]
-        dynamic_reports = batch["dynamic_report"]
+        condition_texts = batch["condition_text"]
 
         optimizer.zero_grad()
 
@@ -363,7 +386,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 curr,
                 prior_reports,
                 current_reports,
-                dynamic_reports,
+                condition_texts,
             )
 
             loss, jepa_l, prior_l, pred_l = compute_jepa_losses(out, gather=True)
@@ -413,7 +436,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             prior_reports = batch["prior_report"]
             current_reports = batch["current_report"]
-            dynamic_reports = batch["dynamic_report"]
+            condition_texts = batch["condition_text"]
 
             with torch.amp.autocast("cuda"):
                 out = model(
@@ -421,7 +444,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     curr,
                     prior_reports,
                     current_reports,
-                    dynamic_reports,
+                    condition_texts,
                 )
 
                 total, jepa_l, prior_l, pred_l = compute_jepa_losses(

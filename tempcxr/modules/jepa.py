@@ -8,8 +8,14 @@ Architecture (matches the slide-deck diagram):
 
     Prior CXR  ─►  E (online, trained)         ──►  LN(z_prior) ──┐
                                                                    ├──►  Predictor  ──►  ẑ_cur
-    Condition  ─►  text_encoder                ──►  τ_dyn      ──┘
+    Condition  ─►  text_encoder                ──►  τ_cond     ──┘
     Current CXR─►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
+
+The "condition" text is built upstream by the dataset and can be either
+the joined dynamic sentences (``condition_mode="dynamic"``) or the
+per-finding templated string ``"{finding} is {progression}"``
+(``condition_mode="templated"``). The model treats it as an opaque
+string either way.
 
 Both the prior and the target are LayerNorm-normalized over the feature
 dim, so the predictor's delta-prediction starts in the same geometry
@@ -238,15 +244,20 @@ class TempCXRJEPA(nn.Module):
         current_imgs: torch.Tensor,
         prior_reports,
         current_reports,
-        dynamic_reports,
+        condition_texts,
     ):
         """
-        prior_imgs      : (B, 3, H, W)
-        current_imgs    : (B, 3, H, W)
-        prior_reports   : list[str]
-        current_reports : list[str]
-        dynamic_reports : list[str] — change descriptions used as the
-                          predictor's text condition.
+        prior_imgs       : (B, 3, H, W)
+        current_imgs     : (B, 3, H, W)
+        prior_reports    : list[str]
+        current_reports  : list[str]
+        condition_texts  : list[str] — the predictor's text condition.
+                           Source content depends on the dataset's
+                           ``condition_mode``: either the joined dynamic
+                           sentences (``"dynamic"``) or the templated
+                           per-finding ``"{finding} is {progression}"``
+                           string (``"templated"``). The model treats
+                           it as an opaque string either way.
 
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, with grad
@@ -257,8 +268,8 @@ class TempCXRJEPA(nn.Module):
           - prior_token_mask         (B, T)
           - current_txt_local        (B, T, D)
           - current_token_mask       (B, T)
-          - dynamic_txt_local        (B, T, D)
-          - dynamic_token_mask       (B, T)
+          - condition_txt_local      (B, T, D)
+          - condition_token_mask     (B, T)
         """
 
         # ---- Online encoder on prior (gradients flow) ----
@@ -279,16 +290,18 @@ class TempCXRJEPA(nn.Module):
         # split. This costs the same memory as three calls but does only
         # one CXR-BERT forward pass.
         B = prior_imgs.size(0)
-        all_reports = list(prior_reports) + list(current_reports) + list(dynamic_reports)
+        all_reports = (
+            list(prior_reports) + list(current_reports) + list(condition_texts)
+        )
         _, all_txt_local, all_token_mask = (
             self.text_encoder.forward_contrastive(all_reports)
         )
-        prior_txt_local, current_txt_local, dynamic_txt_local = (
+        prior_txt_local, current_txt_local, condition_txt_local = (
             all_txt_local[:B],
             all_txt_local[B:2 * B],
             all_txt_local[2 * B:],
         )
-        prior_token_mask, current_token_mask, dynamic_token_mask = (
+        prior_token_mask, current_token_mask, condition_token_mask = (
             all_token_mask[:B],
             all_token_mask[B:2 * B],
             all_token_mask[2 * B:],
@@ -305,11 +318,11 @@ class TempCXRJEPA(nn.Module):
             )
         current_patches_target = current_patches_target.detach()
 
-        # ---- Predictor: ẑ_cur from prior + dynamic text ----
+        # ---- Predictor: ẑ_cur from prior + condition text ----
         pred_current_patches = self.predictor(
             prior_patches,
-            dynamic_txt_local,
-            dynamic_token_mask,
+            condition_txt_local,
+            condition_token_mask,
         )
 
         return {
@@ -320,8 +333,8 @@ class TempCXRJEPA(nn.Module):
             "prior_token_mask": prior_token_mask,
             "current_txt_local": current_txt_local,
             "current_token_mask": current_token_mask,
-            "dynamic_txt_local": dynamic_txt_local,
-            "dynamic_token_mask": dynamic_token_mask,
+            "condition_txt_local": condition_txt_local,
+            "condition_token_mask": condition_token_mask,
         }
 
     # --------------------------------------------------
@@ -358,7 +371,7 @@ if __name__ == "__main__":
         "Increased right pleural effusion.",
         "Left lower lobe pneumonia is improving.",
     ]
-    dynamic_reports = [
+    condition_texts = [
         "right pleural effusion is new and increased",
         "pneumonia is getting better",
     ]
@@ -368,7 +381,7 @@ if __name__ == "__main__":
         current_imgs,
         prior_reports,
         current_reports,
-        dynamic_reports,
+        condition_texts,
     )
 
     # --------------------------------------------------

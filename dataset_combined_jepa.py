@@ -23,6 +23,7 @@ way.
 """
 
 import os
+import random
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -37,6 +38,25 @@ from dataset_combined import (
     apply_augmentation,
     sample_augmentation,
 )
+from progression_phrases import SILVER_TO_CLS
+
+
+# ============================================================
+# CONDITION MODES
+# ============================================================
+# ``dynamic``   : use the study-level concatenation of all
+#                 ``label == "dynamic"`` sentences from
+#                 ``silver_sentences.parquet`` (the original behavior).
+# ``templated`` : build the condition from the per-finding
+#                 ``(finding, progression)`` rows of
+#                 ``silver_findings.parquet`` joined to the same study
+#                 pair, formatted as
+#                 ``"{finding.lower()} is {progression_class}"`` and
+#                 joined with ". ". Order is shuffled per
+#                 ``__getitem__`` call when ``train=True`` and
+#                 deterministically sorted otherwise, so the val
+#                 condition is stable epoch-to-epoch.
+CONDITION_MODES = ("dynamic", "templated")
 
 
 # ============================================================
@@ -196,9 +216,14 @@ class JEPACombinedDataset(Dataset):
         current_image  (3,H,W) tensor
         prior_report   (str)  prior impression + findings
         current_report (str)  current impression + findings
-        dynamic_report (str)  joined "dynamic" sentences from current study
-                              (the change description used to condition
-                              the JEPA predictor)
+        condition_text (str)  the predictor's textual condition; content
+                              depends on ``condition_mode``:
+                                * ``"dynamic"``: joined ``label=="dynamic"``
+                                  sentences from the current study.
+                                * ``"templated"``: per-finding clauses
+                                  ``"{finding} is {progression}"`` joined
+                                  with ". " (order shuffled per call when
+                                  ``train=True``, sorted otherwise).
         dataset        (str)  one of "mimic", "chexpert", "rexgradient"
 
     Parameters
@@ -226,6 +251,14 @@ class JEPACombinedDataset(Dataset):
     splits_file
         Where to read/write the cached split assignments. Defaults to
         ``./splits_jepa.csv`` next to this file.
+    condition_mode
+        Which text condition to feed the predictor. ``"dynamic"`` (the
+        default, backwards-compatible) returns the joined dynamic
+        sentences. ``"templated"`` returns the per-finding clauses
+        ``"{finding} is {progression_class}"`` built from
+        ``silver_findings.parquet``. Both modes carry the same set of
+        study-pair rows under the hood — only the value of
+        ``condition_text`` differs.
     """
 
     def __init__(
@@ -239,13 +272,20 @@ class JEPACombinedDataset(Dataset):
         val_fraction: float = 0.1,
         split_seed: int = 42,
         splits_file: Optional[str] = None,
+        condition_mode: str = "dynamic",
     ):
+        if condition_mode not in CONDITION_MODES:
+            raise ValueError(
+                f"condition_mode must be one of {CONDITION_MODES!r}; "
+                f"got {condition_mode!r}"
+            )
         self.image_roots = {k: str(v) for k, v in image_roots.items()}
         self.train = train
         self.split = split
         self.val_fraction = val_fraction
         self.split_seed = split_seed
         self.splits_file = splits_file or DEFAULT_SPLITS_FILE
+        self.condition_mode = condition_mode
 
         # ------------------------------------------------------------
         # Load + filter
@@ -293,8 +333,37 @@ class JEPACombinedDataset(Dataset):
             & rows["prior_report"].apply(_nonempty)
         ].copy()
 
-        rows = rows.drop_duplicates(
-            ["dataset", "patient_id", "study_id_curr", "study_id_prev"]
+        # ------------------------------------------------------------
+        # Normalize the per-finding progression labels onto CLS_ORDER.
+        # Anything outside SILVER_TO_CLS (empty / corrupt) becomes
+        # NaN and is dropped before grouping so the templated condition
+        # never contains an unrecognized progression class.
+        # ------------------------------------------------------------
+        rows["progression_cls"] = (
+            rows["progression"].astype(str).str.strip().map(SILVER_TO_CLS)
+        )
+        rows = rows[rows["progression_cls"].notna()].copy()
+        rows = rows[rows["finding"].apply(_nonempty)].copy()
+        rows["finding"] = rows["finding"].astype(str).str.strip().str.lower()
+
+        # ------------------------------------------------------------
+        # Collapse per-finding rows into one row per study pair, keeping
+        # the *list* of (finding, progression_cls) pairs so the dataset
+        # can build a multi-clause condition at __getitem__ time. The
+        # image paths and reports are study-pair-level so we take the
+        # first occurrence under each group.
+        # ------------------------------------------------------------
+        pair_keys = ["dataset", "patient_id", "study_id_curr", "study_id_prev"]
+        rows = (
+            rows.groupby(pair_keys, sort=False, as_index=False)
+            .agg(
+                finding=("finding", list),
+                progression_cls=("progression_cls", list),
+                parent_image_curr=("parent_image_curr", "first"),
+                parent_image_prev=("parent_image_prev", "first"),
+                current_report=("current_report", "first"),
+                prior_report=("prior_report", "first"),
+            )
         )
 
         # ------------------------------------------------------------
@@ -352,6 +421,29 @@ class JEPACombinedDataset(Dataset):
         path = _resolve_image_path(dataset, rel_path, self.image_roots)
         return Image.open(path).convert("RGB")
 
+    def _build_templated_condition(self, row) -> str:
+        """Build the per-finding templated condition for one study pair.
+
+        Order is shuffled per call when ``self.train`` is True so the
+        predictor doesn't learn position-dependent shortcuts; deterministic
+        (alphabetical by finding name) otherwise so val Smooth L1 is
+        comparable across epochs.
+
+        Each clause is ``"{finding} is {progression_class}"`` with the
+        canonical class name from ``progression_phrases.CLS_ORDER``.
+        Synonym sampling is intentionally not done here — the eval-time
+        prompt ensembling already covers the synonym bank.
+        """
+        findings = list(row["finding"])
+        prog_cls = list(row["progression_cls"])
+        pairs = list(zip(findings, prog_cls))
+        if self.train:
+            random.shuffle(pairs)
+        else:
+            pairs.sort(key=lambda fp: fp[0])
+        clauses = [f"{finding} is {cls}" for finding, cls in pairs]
+        return ". ".join(clauses)
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         dataset = row["dataset"]
@@ -367,12 +459,17 @@ class JEPACombinedDataset(Dataset):
         prior_img = apply_augmentation(prior_raw, params)
         curr_img = apply_augmentation(curr_raw, params)
 
+        if self.condition_mode == "dynamic":
+            condition_text = row["dynamic_report"]
+        else:  # "templated" — validated in __init__
+            condition_text = self._build_templated_condition(row)
+
         return {
             "prior_image": prior_img,
             "current_image": curr_img,
             "prior_report": row["prior_report"],
             "current_report": row["current_report"],
-            "dynamic_report": row["dynamic_report"],
+            "condition_text": condition_text,
             "dataset": dataset,
         }
 
@@ -390,7 +487,7 @@ def jepa_collate_fn(batch):
         "current_image": torch.stack([b["current_image"] for b in batch]),
         "prior_report": [b["prior_report"] for b in batch],
         "current_report": [b["current_report"] for b in batch],
-        "dynamic_report": [b["dynamic_report"] for b in batch],
+        "condition_text": [b["condition_text"] for b in batch],
         "dataset": [b["dataset"] for b in batch],
     }
 
@@ -411,6 +508,12 @@ if __name__ == "__main__":
     parser.add_argument("--splits-file", default=None,
                         help="Override the cached splits CSV path.")
     parser.add_argument("--load-images", action="store_true")
+    parser.add_argument(
+        "--condition-mode",
+        choices=list(CONDITION_MODES),
+        default="dynamic",
+        help="Which text condition to surface in the smoke test.",
+    )
     args = parser.parse_args()
 
     IMAGE_ROOTS = {
@@ -426,6 +529,7 @@ if __name__ == "__main__":
         val_fraction=args.val_fraction,
         split_seed=args.split_seed,
         splits_file=args.splits_file,
+        condition_mode=args.condition_mode,
     )
 
     print(f"\nTotal samples: {len(ds)}")
@@ -433,6 +537,13 @@ if __name__ == "__main__":
     for name in ("mimic", "chexpert", "rexgradient"):
         sub = ds.df[ds.df["dataset"] == name]
         print(f"  {name:12s}: {len(sub):>7d} paired samples")
+
+    n_findings = ds.df["finding"].apply(len)
+    print(
+        f"\nFindings per study pair: min={int(n_findings.min())}, "
+        f"max={int(n_findings.max())}, mean={n_findings.mean():.2f}"
+    )
+    print(f"Condition mode: {ds.condition_mode}")
 
     if args.load_images and len(ds) > 0:
         print("\n--- Image loading test ---")
@@ -443,11 +554,12 @@ if __name__ == "__main__":
             idx = indices[0]
             try:
                 sample = ds[idx]
+                preview = sample["condition_text"][:80].replace("\n", " ")
                 print(
                     f"  [{name}] idx={idx}  "
                     f"prior={tuple(sample['prior_image'].shape)}  "
                     f"current={tuple(sample['current_image'].shape)}  "
-                    f"dyn={sample['dynamic_report'][:60]}..."
+                    f"condition={preview}..."
                 )
             except FileNotFoundError as e:
                 print(f"  [{name}] idx={idx}  FileNotFoundError: {e}")

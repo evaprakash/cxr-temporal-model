@@ -2,14 +2,17 @@
 
 I-JEPA-style temporal chest X-ray model. Predicts current-image patch
 features from prior-image patch features conditioned on a textual
-description of the change ("dynamic" sentences).
+description of the change. The text condition can come from one of two
+sources (see "Condition modes" below): the joined "dynamic" sentences
+of the current study, or per-finding templated clauses of the form
+`"{finding} is {progression}"` built from `silver_findings.parquet`.
 
 ## Architecture
 
 ```
 Prior CXR  ──►  E (online, trained)         ──►  LN(z_prior) ──┐
                                                                  ├──►  Predictor  ──►  ẑ_cur = LN(z_prior) + Δz
-Condition  ──►  text_encoder                ──►  τ_dyn       ──┘
+Condition  ──►  text_encoder                ──►  τ_cond      ──┘
 Current CXR──►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
 ```
 
@@ -28,7 +31,7 @@ BioViL-T's CXR-BERT specialized model. The predictor is a small
 transformer that outputs a delta `Δz`, so `ẑ_cur` is reconstructed as
 `LN(z_prior) + Δz` — the "do nothing" baseline (`Δz = 0`) yields
 `ẑ_cur ≈ LN(z_cur)` for unchanged anatomy, leaving the predictor to
-spend capacity only on the actual change described by `τ_dyn`.
+spend capacity only on the actual change described by `τ_cond`.
 
 ## Repository layout
 
@@ -36,6 +39,7 @@ spend capacity only on the actual change described by `τ_dyn`.
 cxr-temporal-model/
 ├── dataset_combined.py         # base image transforms + augmentation helpers
 ├── dataset_combined_jepa.py    # JEPA dataset (silver corpus, paired)
+├── progression_phrases.py      # shared CLS_ORDER / phrase bank / label maps
 ├── losses.py                   # local_contrastive_loss (GLoRIA)
 ├── losses_jepa.py              # JEPA Smooth L1
 ├── resume_train_jepa.py        # JEPA DDP training entry (invoked via torchrun)
@@ -186,12 +190,19 @@ python -m tempcxr.modules.jepa
 
 # Dataset construction + filtering + (optional) image loading
 python dataset_combined_jepa.py --load-images
+
+# Side-by-side check that both condition modes parse the silver
+# parquets correctly and produce the expected condition_text strings
+# (prior/current image paths, per-finding metadata, condition preview).
+python smoke_test_dataset.py
+python smoke_test_dataset.py --num-examples 5 --split val
+python smoke_test_dataset.py --load-images   # also call __getitem__
 ```
 
 `python -m tempcxr.modules.jepa` validates:
 
 - The shared image encoder + EMA target encoder are wired correctly.
-- The text encoder forwards three reports (prior / current / dynamic).
+- The text encoder forwards three reports (prior / current / condition).
 - The predictor produces patch-shape outputs.
 - All three losses are finite and `total.backward()` succeeds.
 - `update_ema(momentum)` runs without error.
@@ -221,13 +232,62 @@ latest `epoch_*.pt` in `CHECKPOINT_DIR` if any exist.
 
 ## Key design choices
 
+### Condition modes
+
+The predictor's text condition is selected at dataset-construction time
+via `JEPACombinedDataset(condition_mode=...)`. Two modes are supported:
+
+| Mode        | Source                                                          | Per-sample text                                                          |
+|-------------|-----------------------------------------------------------------|--------------------------------------------------------------------------|
+| `dynamic`   | All `label == "dynamic"` sentences for the current study, joined | Free-text MedGemma extraction (original behavior, default)               |
+| `templated` | Per-finding rows of `silver_findings.parquet` for the study pair | `"{finding1} is {prog1}. {finding2} is {prog2}. ..."`                    |
+
+In `templated` mode every (study pair, finding) row of `silver_findings`
+is grouped under its study pair; the `(finding, progression)` list is
+formatted with the canonical class names from
+`progression_phrases.CLS_ORDER` (`improving` / `stable` / `worsening` /
+`new` / `resolved`) and the order is shuffled at every `__getitem__`
+call when `train=True` so the predictor doesn't learn position-
+dependent shortcuts. For `train=False` the order is sorted
+alphabetically by finding name, which keeps the val Smooth L1 stable
+across epochs.
+
+The mode is selected via the `CONDITION_MODE` env var on the training
+side and via `--condition-mode` (or `CONDITION_MODE`) on the eval side.
+The two modes write to independent default checkpoint / log dirs
+(`checkpoints_jepa/` + `logs/` for `dynamic`; `checkpoints_jepa_<mode>/`
++ `logs_<mode>/` otherwise), so the original dynamic checkpoint isn't
+overwritten when you switch.
+
+```bash
+# baseline (existing): dynamic sentences
+python run_jepa.py
+
+# new: templated finding + progression sentences
+CONDITION_MODE=templated python run_jepa.py
+# → writes to checkpoints_jepa_templated/ and logs_templated/
+
+# evaluate the templated checkpoint with the same condition source
+CONDITION_MODE=templated \
+    JEPA_CKPT=checkpoints_jepa_templated/best.pt \
+    python eval_jepa_val.py
+```
+
+Important: the `condition_mode` you train with should match the
+`condition_mode` you evaluate with — otherwise the val Smooth L1 and
+the per-pair JEPA metrics aren't directly comparable to the training
+loss curve. The 5-way / 3-way progression-classification scripts
+(`progression_classify.py`, `eval_mscxrt.py`, `eval_cig.py`) are
+independent of the condition mode because they build their own
+single-finding prompts at score time.
+
 ### What gets trained vs. frozen
 
 | Component                    | Gradient? |
 |------------------------------|-----------|
 | online image encoder         | yes (via prior path + report loss) |
 | target image encoder (EMA)   | no — updated via EMA, used under stop-gradient |
-| text encoder                 | yes (via report losses + dynamic-text conditioning) |
+| text encoder                 | yes (via report losses + predictor's condition text) |
 | predictor                    | yes (via JEPA + report-on-pred losses) |
 
 ### EMA target encoder
