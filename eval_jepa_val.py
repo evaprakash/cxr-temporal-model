@@ -9,10 +9,11 @@ JEPA Smooth L1 (predictor)
     ``F.smooth_l1_loss(ẑ_cur, z_cur)`` averaged across val pairs. Should
     closely match the ``val_jepa`` column in ``logs/val_metrics_jepa.csv``
     at the resumed epoch (modulo augmentation differences — eval runs
-    without augmentation).
+    without augmentation). Both ``ẑ_cur`` and ``z_cur`` live in
+    ``proj_jepa`` space (LN'd post-projection).
 
 JEPA Smooth L1 (do-nothing)
-    Same loss but with ``ẑ_cur := LN(z_prior)`` (i.e., Δz = 0). The
+    Same loss but with ``ẑ_cur := prior_jepa`` (i.e., Δz = 0). The
     "trivial" baseline. If the predictor's loss is below this, the
     model genuinely beats "assume nothing changed" on average.
 
@@ -135,8 +136,8 @@ def main():
                 batch["prior_report"], batch["current_report"], batch["condition_text"],
             )
             pred    = out["pred_current_patches"].float()      # (B, N, D)
-            target  = out["current_patches_target"].float()    # (B, N, D)
-            z_prior = out["prior_patches"].float()             # (B, N, D)
+            target  = out["current_target_jepa"].float()       # (B, N, D)
+            z_prior = out["prior_jepa"].float()                # (B, N, D)
             B = pred.size(0)
 
             # Per-sample Smooth L1 (mean over the N*D feature axes so each

@@ -112,9 +112,12 @@ def encode_pair_with_text(
     output.
 
     Returns a dict with at least:
-        prior_patches            (1, 196, D)  LN'd, online encoder
-        current_patches_target   (1, 196, D)  LN'd, EMA encoder, detached
+        prior_jepa               (1, 196, D)  LN(proj_jepa(online_prior))
+        current_target_jepa      (1, 196, D)  LN(target_proj_jepa(target_current))
+                                              — detached
         pred_current_patches     (1, 196, D)  predictor output ẑ_cur
+        prior_clip               (1, 196, D)  proj_clip(online_prior)
+        current_clip             (1, 196, D)  proj_clip(online_current)
     """
     prior = prior.to(device)
     current = current.to(device)
@@ -243,8 +246,8 @@ def main():
         device=device,
     )
     pred = out["pred_current_patches"]
-    target = out["current_patches_target"]
-    z_prior = out["prior_patches"]
+    target = out["current_target_jepa"]
+    z_prior = out["prior_jepa"]
 
     # ---- Metrics: predictor ----
     m_pred = jepa_metrics(pred, target, z_prior)
@@ -254,7 +257,7 @@ def main():
     cos_patches_naive = F.cosine_similarity(z_prior.float(), target.float(), dim=-1)
     naive_patch_mean = cos_patches_naive.mean().item()
 
-    print("\n=== Predictor (LN(z_prior) + Δz) vs target z_cur ===")
+    print("\n=== Predictor (prior_jepa + Δz) vs target current_target_jepa ===")
     print(f"  JEPA Smooth L1:                {m_pred['smooth_l1']:.4f}")
     print(f"  Slide-deck cos(Δẑ, Δz_true):   {m_pred['cos_delta']:.4f}")
     print(f"  Per-patch cos sim mean/min/max: "
@@ -262,7 +265,7 @@ def main():
           f"{m_pred['cos_patch_min']:.4f} / "
           f"{m_pred['cos_patch_max']:.4f}")
 
-    print("\n=== Do-nothing baseline (ẑ_cur := LN(z_prior)) ===")
+    print("\n=== Do-nothing baseline (ẑ_cur := prior_jepa) ===")
     print(f"  JEPA Smooth L1:                {smooth_l1_naive:.4f}")
     print(f"  Per-patch cos sim mean:        {naive_patch_mean:.4f}")
 

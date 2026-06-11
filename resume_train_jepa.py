@@ -142,10 +142,15 @@ WARMUP_RATIO = 0.03
 # plus best.pt whenever val total improves.
 SAVE_EVERY_N_EPOCHS = 5
 
-# Loss weights (matching the smoke-test defaults in the old jepa.py)
+# Loss weights (matching the smoke-test defaults in the old jepa.py).
+# W_CLIP_PRIOR / W_CLIP_CURRENT correspond to the prior- and current-side
+# local contrastive losses, both now reading from ``proj_clip``'s output
+# (prior_clip / current_clip from TempCXRJEPA.forward). The names
+# val_report_prior / val_report_pred are kept in the CSV header below
+# for backwards compatibility with existing log files.
 W_JEPA = 1.0
-W_REPORT_PRIOR = 0.1
-W_REPORT_PRED = 0.1
+W_CLIP_PRIOR = 0.1
+W_CLIP_CURRENT = 0.1
 
 # Stratified train/val split when the studies parquet has no 'split'
 # column. Both datasets read/write the same cached splits CSV
@@ -269,7 +274,13 @@ if args.resume is None:
 
 if args.resume is not None:
     checkpoint = torch.load(args.resume, map_location=DEVICE)
-    model.module.load_state_dict(checkpoint["model"])
+    # strict=False so the architecture change to add proj_clip / proj_jepa
+    # / target_proj_jepa can still warm-start the trunk + predictor from
+    # pre-projection-head checkpoints. Missing proj_* keys will start
+    # randomly initialized; the trainer will report them.
+    missing, unexpected = model.module.load_state_dict(
+        checkpoint["model"], strict=False,
+    )
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     if "scaler" in checkpoint:
@@ -287,6 +298,12 @@ if args.resume is not None:
 
     if local_rank == 0:
         print(f"Resumed from {args.resume}")
+        if missing:
+            print(f"  missing keys (fresh init): {len(missing)} "
+                  f"(first 5: {missing[:5]})")
+        if unexpected:
+            print(f"  unexpected keys (skipped): {len(unexpected)} "
+                  f"(first 5: {unexpected[:5]})")
 
 
 # ============================================================
@@ -307,7 +324,14 @@ def compute_jepa_losses(out, gather: bool):
               for cross-rank negatives (training). If False, use
               local features only (validation).
 
-    Returns: (total, jepa, prior, pred) as scalar tensors.
+    Returns: (total, jepa, clip_prior, clip_current) as scalar tensors.
+
+    The two contrastive losses read from ``proj_clip``'s output
+    (``prior_clip`` / ``current_clip``), and the JEPA Smooth L1 reads
+    from the predictor (which lives downstream of ``proj_jepa``) and the
+    EMA-tracked ``target_proj_jepa`` output. Each loss thus operates in
+    its own projected space and the two losses don't directly contend
+    over a single shared encoder output.
     """
 
     # JEPA loss is per-element MSE-style; cross-rank gathering doesn't
@@ -316,42 +340,46 @@ def compute_jepa_losses(out, gather: bool):
     # bite once both pred and target are in LayerNorm scale.
     jepa = jepa_smooth_l1_loss(
         out["pred_current_patches"].float(),
-        out["current_patches_target"].float(),
+        out["current_target_jepa"].float(),
     )
 
     if gather:
-        prior_patches = gather_with_grad(out["prior_patches"])
+        prior_clip = gather_with_grad(out["prior_clip"])
         prior_txt_local = gather_with_grad(out["prior_txt_local"])
         prior_token_mask = gather_with_grad(
             out["prior_token_mask"].float()
         ).bool()
 
-        pred_patches = gather_with_grad(out["pred_current_patches"])
+        current_clip = gather_with_grad(out["current_clip"])
         current_txt_local = gather_with_grad(out["current_txt_local"])
         current_token_mask = gather_with_grad(
             out["current_token_mask"].float()
         ).bool()
     else:
-        prior_patches = out["prior_patches"]
+        prior_clip = out["prior_clip"]
         prior_txt_local = out["prior_txt_local"]
         prior_token_mask = out["prior_token_mask"]
-        pred_patches = out["pred_current_patches"]
+        current_clip = out["current_clip"]
         current_txt_local = out["current_txt_local"]
         current_token_mask = out["current_token_mask"]
 
-    prior = local_contrastive_loss(
-        prior_patches,
+    clip_prior = local_contrastive_loss(
+        prior_clip,
         prior_txt_local,
         prior_token_mask,
     )
-    pred = local_contrastive_loss(
-        pred_patches,
+    clip_current = local_contrastive_loss(
+        current_clip,
         current_txt_local,
         current_token_mask,
     )
 
-    total = W_JEPA * jepa + W_REPORT_PRIOR * prior + W_REPORT_PRED * pred
-    return total, jepa, prior, pred
+    total = (
+        W_JEPA * jepa
+        + W_CLIP_PRIOR * clip_prior
+        + W_CLIP_CURRENT * clip_current
+    )
+    return total, jepa, clip_prior, clip_current
 
 
 # ============================================================
@@ -391,7 +419,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 condition_texts,
             )
 
-            loss, jepa_l, prior_l, pred_l = compute_jepa_losses(out, gather=True)
+            loss, jepa_l, clip_prior_l, clip_current_l = compute_jepa_losses(
+                out, gather=True,
+            )
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -427,7 +457,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # VALIDATION
     # ============================================================
     model.eval()
-    val_total = val_jepa = val_prior = val_pred = 0.0
+    val_total = val_jepa = val_clip_prior = val_clip_current = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -449,25 +479,25 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     condition_texts,
                 )
 
-                total, jepa_l, prior_l, pred_l = compute_jepa_losses(
-                    out, gather=False
+                total, jepa_l, clip_prior_l, clip_current_l = (
+                    compute_jepa_losses(out, gather=False)
                 )
 
             val_total += total.item()
             val_jepa += jepa_l.item()
-            val_prior += prior_l.item()
-            val_pred += pred_l.item()
+            val_clip_prior += clip_prior_l.item()
+            val_clip_current += clip_current_l.item()
             val_batches += 1
 
     val_total /= max(val_batches, 1)
     val_jepa /= max(val_batches, 1)
-    val_prior /= max(val_batches, 1)
-    val_pred /= max(val_batches, 1)
+    val_clip_prior /= max(val_batches, 1)
+    val_clip_current /= max(val_batches, 1)
 
     val_total = ddp_reduce(val_total)
     val_jepa = ddp_reduce(val_jepa)
-    val_prior = ddp_reduce(val_prior)
-    val_pred = ddp_reduce(val_pred)
+    val_clip_prior = ddp_reduce(val_clip_prior)
+    val_clip_current = ddp_reduce(val_clip_current)
 
     if local_rank == 0:
 
@@ -475,13 +505,18 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"Val Epoch {epoch} | "
             f"Total={val_total:.4f} | "
             f"JEPA={val_jepa:.4f} | "
-            f"PriorReport={val_prior:.4f} | "
-            f"PredReport={val_pred:.4f}"
+            f"ClipPrior={val_clip_prior:.4f} | "
+            f"ClipCurrent={val_clip_current:.4f}"
         )
 
+        # Column names in the CSV header are kept as
+        # ``val_report_prior`` / ``val_report_pred`` for backwards
+        # compatibility with prior-mode logs; the values now correspond
+        # to the prior- and current-side CLIP losses respectively.
         with open(CSV_LOG, "a") as f:
             f.write(
-                f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred}\n"
+                f"{epoch},{val_total},{val_jepa},"
+                f"{val_clip_prior},{val_clip_current}\n"
             )
 
         ckpt = {

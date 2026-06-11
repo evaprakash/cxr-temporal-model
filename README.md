@@ -10,28 +10,46 @@ of the current study, or per-finding templated clauses of the form
 ## Architecture
 
 ```
-Prior CXR  ──►  E (online, trained)         ──►  LN(z_prior) ──┐
-                                                                 ├──►  Predictor  ──►  ẑ_cur = LN(z_prior) + Δz
-Condition  ──►  text_encoder                ──►  τ_cond      ──┘
-Current CXR──►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
+Prior CXR  ──►  E (online)         ─┬─►  proj_clip ──►  prior_clip ──────────────►  CLIP loss (vs prior_text)
+                                    │
+                                    └─►  proj_jepa  ──►  LN  ──►  prior_jepa  ──┐
+Condition  ──►  text_encoder       ───────────────────────►  τ_cond              ├──►  Predictor  ──►  ẑ_cur ──►  JEPA loss
+Current CXR──►  E (online)          ──►  proj_clip ──►  current_clip ──────►  CLIP loss (vs current_text)
+Current CXR──►  E_target (EMA, SG)  ──►  target_proj_jepa  ──►  LN  ──►  current_target_jepa  ──────────►  JEPA loss (target)
 ```
 
 Losses:
 
-- **JEPA Smooth L1** between `ẑ_cur` and stop-gradient
-  LayerNorm-normalized `z_cur` (mirrors the I-JEPA reference loss).
-  Computed in fp32 inside the autocast region.
-- **GLoRIA local contrastive** on `(LN(z_prior), prior_report)`.
-- **GLoRIA local contrastive** on `(ẑ_cur, current_report)`.
+- **JEPA Smooth L1** between `ẑ_cur` and stop-gradient LN'd
+  `current_target_jepa` (mirrors the I-JEPA reference loss). Computed
+  in fp32 inside the autocast region.
+- **GLoRIA local contrastive** on `(prior_clip, prior_report)`.
+- **GLoRIA local contrastive** on `(current_clip, current_report)`.
 
 The image encoder is a shared BioViL-T (ResNet50 + multi-image
-transformer); the prior path receives gradients while the current path
-is encoded by an EMA copy under stop-gradient. The text encoder is
-BioViL-T's CXR-BERT specialized model. The predictor is a small
-transformer that outputs a delta `Δz`, so `ẑ_cur` is reconstructed as
-`LN(z_prior) + Δz` — the "do nothing" baseline (`Δz = 0`) yields
-`ẑ_cur ≈ LN(z_cur)` for unchanged anatomy, leaving the predictor to
-spend capacity only on the actual change described by `τ_cond`.
+transformer); the prior and current online paths receive gradients
+while the JEPA target path is encoded by an EMA copy under
+stop-gradient. The text encoder is BioViL-T's CXR-BERT specialized
+model. The predictor is a small transformer that outputs a delta
+`Δz`, so `ẑ_cur` is reconstructed as `prior_jepa + Δz` — the "do
+nothing" baseline (`Δz = 0`) yields `ẑ_cur ≈ current_target_jepa` for
+unchanged anatomy, leaving the predictor to spend capacity only on the
+actual change described by `τ_cond`.
+
+**Per-loss projection heads.** `proj_clip` and `proj_jepa` are two
+small 2-layer MLPs (`Linear → GELU → Linear`, 128 → 128) sitting between
+the shared image encoder and the per-loss heads. The CLIP local
+contrastive loss only ever reads from `proj_clip`'s output (which it
+L2-normalizes onto the unit sphere); the JEPA Smooth L1 loss only ever
+reads from `proj_jepa`'s output (LayerNorm-normed, on a bounded
+Euclidean shell). This ensures **the two loss types don't interfere
+with each other** in the loss-side representation — the encoder trunk
+still trains from both losses, but each loss only ever sees its own
+projected view, so the gradients of one don't have to compromise the
+geometry the other wants. `target_proj_jepa` is an EMA copy of
+`proj_jepa` so the JEPA target lives in the same projected space as
+the predictor's output (mirrors I-JEPA's EMA-target-encoder recipe
+end-to-end).
 
 ## Repository layout
 
@@ -197,6 +215,14 @@ python dataset_combined_jepa.py --load-images
 python smoke_test_dataset.py
 python smoke_test_dataset.py --num-examples 5 --split val
 python smoke_test_dataset.py --load-images   # also call __getitem__
+
+# Same dataset checks PLUS a forward + backward pass through
+# TempCXRJEPA on dummy tensors. Verifies the proj_clip / proj_jepa /
+# target_proj_jepa heads are registered, that forward emits the new
+# prior_clip / current_clip / prior_jepa / current_target_jepa keys
+# with the expected shapes, and that gradients flow through both
+# online projection heads while target_proj_jepa stays frozen.
+python smoke_test_dataset.py --forward-pass
 ```
 
 `python -m tempcxr.modules.jepa` validates:
@@ -311,20 +337,25 @@ running stats are themselves already running averages).
 
 ### Normalization
 
-Following I-JEPA's recipe rather than BioViL-T's CLIP-style recipe:
+Following I-JEPA's recipe for the JEPA path and CLIP's recipe for the
+contrastive path, with the two paths kept in separate per-loss
+projection spaces (see "Per-loss projection heads" above):
 
 - Image encoder patch + global outputs are returned **raw** (no
   `F.normalize` to the unit sphere) by `image_encoder_jepa.py`.
-- Both the **prior patches** (going into the predictor) and the
-  **target patches** (used as the JEPA loss target) get a feature-dim
-  **LayerNorm with no learnable parameters** applied inside
-  `TempCXRJEPA.forward`. This puts both sides of the JEPA loss on the
-  same scale (≈ √D) so the delta predictor has a meaningful
-  "do-nothing" baseline rather than fighting a 10× scale gap.
-- Predictor output is `LN(prior) + Δz` (raw, no extra normalization).
-- The downstream contrastive losses (`local_contrastive_loss`)
-  re-normalize their inputs internally with `F.normalize`, so they are
-  invariant to whether they receive raw or LayerNorm-normed patches.
+- The JEPA path applies `LN(proj_jepa(z_prior))` and
+  `LN(target_proj_jepa(z_cur))` inside `TempCXRJEPA.forward`. Putting
+  both sides of the JEPA loss through the same projected geometry and
+  a parameter-free feature-dim LayerNorm gives the delta predictor a
+  meaningful "do-nothing" baseline (`Δz = 0` ⇒ `ẑ_cur ≈ z_cur` under
+  no change) rather than letting it fight a √D scale gap.
+- Predictor output is `prior_jepa + Δz` (raw, no extra normalization).
+  Lives in `proj_jepa` space.
+- The CLIP path applies `proj_clip(z_prior)` and
+  `proj_clip(z_current_online)`. No LayerNorm is needed here because
+  `local_contrastive_loss` re-normalizes its inputs internally with
+  `F.normalize`, putting them on the unit sphere for the cosine
+  similarity it computes downstream.
 
 ### Loss reuse
 
