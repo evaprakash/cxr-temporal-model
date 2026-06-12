@@ -117,7 +117,6 @@ def encode_pair_with_text(
                                               — detached
         pred_current_patches     (1, 196, D)  predictor output ẑ_cur
         prior_clip               (1, 196, D)  proj_clip(online_prior)
-        current_clip             (1, 196, D)  proj_clip(online_current)
     """
     prior = prior.to(device)
     current = current.to(device)

@@ -10,9 +10,10 @@ Architecture
     Prior CXR  ──►  E (online)         ─┬──►  proj_clip ──►  prior_clip ──────────►  CLIP loss (vs prior_text)
                                         │
                                         └──►  proj_jepa  ──►  LN  ──►  prior_jepa  ──┐
-    Condition  ──►  text_encoder       ─────────────────────────►  τ_cond           ├──►  Predictor  ──►  ẑ_cur ──►  JEPA loss
-    Current CXR──►  E (online)          ──►  proj_clip ──►  current_clip ──────►  CLIP loss (vs current_text)
-    Current CXR──►  E_target (EMA, SG)  ──►  target_proj_jepa  ──►  LN  ──►  current_target_jepa  ──────►  JEPA loss (target)
+    Condition  ──►  text_encoder       ─────────────────────────►  τ_cond           ├──►  Predictor  ──►  ẑ_cur ──┬──►  JEPA loss
+                                                                                                                  │
+                                                                                                                  └──►  CLIP loss (vs current_text)
+    Current CXR──►  E_target (EMA, SG)  ──►  target_proj_jepa  ──►  LN  ──►  current_target_jepa  ────────────────►  JEPA loss (target)
 
 The "condition" text is built upstream by the dataset and can be either
 the joined dynamic sentences (``condition_mode="dynamic"``) or the
@@ -37,6 +38,15 @@ representation. ``target_proj_jepa`` is an EMA copy of ``proj_jepa`` so
 the JEPA target lives in the same projected space as the predictor's
 output (mirrors I-JEPA's EMA-target-encoder recipe end-to-end).
 
+The predictor's output ``ẑ_cur`` still feeds the current-side CLIP loss
+directly (no extra projection): the local contrastive loss L2-normalizes
+both image and text features internally, so any scale from the
+predictor's output is absorbed by that normalization. This keeps the
+predictor under explicit text-conditional supervision — the only way the
+contrastive loss can match different ``ẑ_cur`` against different
+current-side reports is if ``ẑ_cur`` actually varies with the predictor's
+text condition.
+
 Both the prior-side ``proj_jepa`` output and the target-side
 ``target_proj_jepa`` output get a feature-dim LayerNorm with no learnable
 parameters, so the predictor's delta-prediction starts in the same
@@ -44,8 +54,8 @@ geometry as the JEPA target (no scale gap in the Smooth L1 loss).
 
 Losses (computed by the caller):
     - JEPA Smooth L1: ẑ_cur  ↔ stop-grad LN(target_proj_jepa(z_cur))
-    - GLoRIA local contrastive: prior_clip   ↔ τ_prior
-    - GLoRIA local contrastive: current_clip ↔ τ_current
+    - GLoRIA local contrastive: prior_clip ↔ τ_prior
+    - GLoRIA local contrastive: ẑ_cur     ↔ τ_current
 """
 
 import copy
@@ -239,10 +249,8 @@ class TempCXRJEPA(nn.Module):
       - ``image_encoder``        : online BioViL-T (raw, no L2) — trained.
       - ``target_image_encoder`` : EMA copy of ``image_encoder`` — frozen.
       - ``text_encoder``         : BioViL-T text encoder — trained.
-      - ``proj_clip``            : projection head for the CLIP local
-                                   contrastive loss (one shared head used
-                                   on both prior- and current-side
-                                   patches) — trained.
+      - ``proj_clip``            : projection head feeding the prior-side
+                                   CLIP local contrastive loss — trained.
       - ``proj_jepa``            : projection head for the JEPA Smooth L1
                                    path (feeds the predictor input and
                                    produces the JEPA target after EMA) —
@@ -251,13 +259,19 @@ class TempCXRJEPA(nn.Module):
       - ``predictor``            : IJEPATemporalPredictor — trained.
 
     Separate ``proj_clip`` and ``proj_jepa`` heads decouple the two loss
-    geometries: the contrastive loss reads from ``proj_clip``'s output
-    (which the loss L2-normalizes onto the unit sphere), while the JEPA
-    Smooth L1 loss reads from ``proj_jepa``'s output (which is
+    geometries: the prior-side contrastive loss reads from ``proj_clip``'s
+    output (which the loss L2-normalizes onto the unit sphere), while the
+    JEPA Smooth L1 loss reads from ``proj_jepa``'s output (which is
     LayerNorm-normalized so prior and target sit on the same Euclidean
     scale). This means the two losses don't have to share a single
     representation and their gradients can't directly contend over the
     same patch tensor.
+
+    The current-side CLIP loss reads directly from the predictor's
+    output ``ẑ_cur`` (no extra projection): the contrastive loss
+    L2-normalizes inputs internally, and routing the current-side CLIP
+    loss through ``ẑ_cur`` is what gives the predictor a direct
+    text-conditional supervision signal.
 
     Returns a dict of representations; losses live in ``losses.py`` and
     ``losses_jepa.py``.
@@ -330,15 +344,14 @@ class TempCXRJEPA(nn.Module):
 
         Returns a dict containing:
           - prior_clip               (B, N, D)  proj_clip(online_prior),
-                                                CLIP-loss input for prior
-          - current_clip             (B, N, D)  proj_clip(online_current),
-                                                CLIP-loss input for current
+                                                prior-side CLIP-loss input
           - prior_jepa               (B, N, D)  LN(proj_jepa(online_prior)),
                                                 predictor input
           - current_target_jepa      (B, N, D)  LN(target_proj_jepa(target_current)),
                                                 JEPA-loss target (detached)
           - pred_current_patches     (B, N, D)  predictor output ẑ_cur,
-                                                JEPA-loss prediction
+                                                JEPA-loss prediction +
+                                                current-side CLIP-loss input
           - prior_txt_local          (B, T, D)
           - prior_token_mask         (B, T)
           - current_txt_local        (B, T, D)
@@ -347,21 +360,19 @@ class TempCXRJEPA(nn.Module):
           - condition_token_mask     (B, T)
         """
 
-        # ---- Online encoder on prior + current (gradients flow) ----
-        # Both encoder forwards share the SAME trunk parameters; the two
-        # outputs differ only in their input images. We need the current
-        # online output so the current-side CLIP loss can read from the
-        # same kind of feature as the prior-side one (rather than from
-        # the predictor output, which lives in a different — JEPA —
-        # geometry post the projection-head split).
+        # ---- Online encoder on prior (gradients flow) ----
+        # We only need the online encoder on the prior side: the prior
+        # CLIP loss reads from proj_clip(prior_raw), the predictor reads
+        # from LN(proj_jepa(prior_raw)), and the current-side CLIP loss
+        # reads from the predictor output directly (so no current-side
+        # online encoder call is needed). The current-image branch is
+        # encoded by the EMA target encoder below for the JEPA target.
         _, prior_raw = self.image_encoder(prior_imgs)
-        _, current_raw_online = self.image_encoder(current_imgs)
 
-        # ---- CLIP projection (both sides) ----
+        # ---- CLIP projection on prior ----
         # No LayerNorm here; the local contrastive loss L2-normalizes its
         # inputs internally, so any output scale from proj_clip is fine.
         prior_clip = self.proj_clip(prior_raw)
-        current_clip = self.proj_clip(current_raw_online)
 
         # ---- JEPA projection on prior, then LayerNorm ----
         # Match the LayerNorm scale of the target so the predictor's
@@ -417,7 +428,6 @@ class TempCXRJEPA(nn.Module):
 
         return {
             "prior_clip": prior_clip,
-            "current_clip": current_clip,
             "prior_jepa": prior_jepa,
             "current_target_jepa": current_target_jepa,
             "pred_current_patches": pred_current_patches,
@@ -488,9 +498,11 @@ if __name__ == "__main__":
     )
 
     # --------------------------------------------------
-    # Losses (external) — each loss reads from its own projection
-    # head so the two losses don't directly contend over the shared
-    # encoder output.
+    # Losses (external). The prior-side CLIP loss reads from
+    # proj_clip's output; the JEPA loss reads from proj_jepa /
+    # target_proj_jepa; the current-side CLIP loss reads from the
+    # predictor output ẑ_cur so the predictor stays under direct
+    # text-conditional supervision.
     # --------------------------------------------------
     jepa_loss = jepa_smooth_l1_loss(
         out["pred_current_patches"],
@@ -503,27 +515,26 @@ if __name__ == "__main__":
         out["prior_token_mask"],
     )
 
-    current_loss = local_contrastive_loss(
-        out["current_clip"],
+    pred_loss = local_contrastive_loss(
+        out["pred_current_patches"],
         out["current_txt_local"],
         out["current_token_mask"],
     )
 
-    total = jepa_loss + 0.1 * prior_loss + 0.1 * current_loss
+    total = jepa_loss + 0.1 * prior_loss + 0.1 * pred_loss
 
     # --------------------------------------------------
     # Print
     # --------------------------------------------------
     print("prior_clip:           ", tuple(out["prior_clip"].shape))
-    print("current_clip:         ", tuple(out["current_clip"].shape))
     print("prior_jepa:           ", tuple(out["prior_jepa"].shape))
     print("current_target_jepa:  ", tuple(out["current_target_jepa"].shape))
     print("pred_current_patches: ", tuple(out["pred_current_patches"].shape))
     print()
-    print("JEPA Smooth L1:    ", jepa_loss.item())
-    print("CLIP (prior):      ", prior_loss.item())
-    print("CLIP (current):    ", current_loss.item())
-    print("Total:             ", total.item())
+    print("JEPA Smooth L1:        ", jepa_loss.item())
+    print("CLIP (prior, z_prior): ", prior_loss.item())
+    print("CLIP (current, ẑ_cur): ", pred_loss.item())
+    print("Total:                 ", total.item())
 
     total.backward()
     print("\nBackward pass successful.")

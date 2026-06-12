@@ -13,9 +13,10 @@ of the current study, or per-finding templated clauses of the form
 Prior CXR  ──►  E (online)         ─┬─►  proj_clip ──►  prior_clip ──────────────►  CLIP loss (vs prior_text)
                                     │
                                     └─►  proj_jepa  ──►  LN  ──►  prior_jepa  ──┐
-Condition  ──►  text_encoder       ───────────────────────►  τ_cond              ├──►  Predictor  ──►  ẑ_cur ──►  JEPA loss
-Current CXR──►  E (online)          ──►  proj_clip ──►  current_clip ──────►  CLIP loss (vs current_text)
-Current CXR──►  E_target (EMA, SG)  ──►  target_proj_jepa  ──►  LN  ──►  current_target_jepa  ──────────►  JEPA loss (target)
+Condition  ──►  text_encoder       ───────────────────────►  τ_cond              ├──►  Predictor  ──►  ẑ_cur ──┬──►  JEPA loss
+                                                                                                                │
+                                                                                                                └──►  CLIP loss (vs current_text)
+Current CXR──►  E_target (EMA, SG)  ──►  target_proj_jepa  ──►  LN  ──►  current_target_jepa  ──────────────────►  JEPA loss (target)
 ```
 
 Losses:
@@ -24,7 +25,10 @@ Losses:
   `current_target_jepa` (mirrors the I-JEPA reference loss). Computed
   in fp32 inside the autocast region.
 - **GLoRIA local contrastive** on `(prior_clip, prior_report)`.
-- **GLoRIA local contrastive** on `(current_clip, current_report)`.
+- **GLoRIA local contrastive** on `(ẑ_cur, current_report)` — the
+  predictor output goes directly into the contrastive loss (the
+  contrastive loss L2-normalizes inputs internally), which is what
+  gives the predictor direct text-conditional supervision.
 
 The image encoder is a shared BioViL-T (ResNet50 + multi-image
 transformer); the prior and current online paths receive gradients
@@ -38,18 +42,21 @@ actual change described by `τ_cond`.
 
 **Per-loss projection heads.** `proj_clip` and `proj_jepa` are two
 small 2-layer MLPs (`Linear → GELU → Linear`, 128 → 128) sitting between
-the shared image encoder and the per-loss heads. The CLIP local
-contrastive loss only ever reads from `proj_clip`'s output (which it
-L2-normalizes onto the unit sphere); the JEPA Smooth L1 loss only ever
-reads from `proj_jepa`'s output (LayerNorm-normed, on a bounded
-Euclidean shell). This ensures **the two loss types don't interfere
-with each other** in the loss-side representation — the encoder trunk
-still trains from both losses, but each loss only ever sees its own
-projected view, so the gradients of one don't have to compromise the
-geometry the other wants. `target_proj_jepa` is an EMA copy of
+the shared image encoder and the per-loss heads. The prior-side CLIP
+local contrastive loss reads from `proj_clip`'s output (which it
+L2-normalizes onto the unit sphere); the JEPA Smooth L1 loss reads
+from `proj_jepa`'s output (LayerNorm-normed, on a bounded Euclidean
+shell). This ensures **the two loss types don't interfere with each
+other** in the loss-side representation — the encoder trunk still
+trains from both losses, but each loss sees its own projected view of
+the shared trunk, so the gradients of one don't have to compromise
+the geometry the other wants. `target_proj_jepa` is an EMA copy of
 `proj_jepa` so the JEPA target lives in the same projected space as
 the predictor's output (mirrors I-JEPA's EMA-target-encoder recipe
-end-to-end).
+end-to-end). The current-side CLIP loss reads directly from the
+predictor output `ẑ_cur` (no extra projection — the contrastive loss
+L2-normalizes internally), which keeps the predictor under direct
+text-conditional supervision.
 
 ## Repository layout
 
@@ -218,9 +225,9 @@ python smoke_test_dataset.py --load-images   # also call __getitem__
 
 # Same dataset checks PLUS a forward + backward pass through
 # TempCXRJEPA on dummy tensors. Verifies the proj_clip / proj_jepa /
-# target_proj_jepa heads are registered, that forward emits the new
-# prior_clip / current_clip / prior_jepa / current_target_jepa keys
-# with the expected shapes, and that gradients flow through both
+# target_proj_jepa heads are registered, that forward emits the
+# prior_clip / prior_jepa / current_target_jepa / pred_current_patches
+# keys with the expected shapes, and that gradients flow through both
 # online projection heads while target_proj_jepa stays frozen.
 python smoke_test_dataset.py --forward-pass
 ```
@@ -351,11 +358,15 @@ projection spaces (see "Per-loss projection heads" above):
   no change) rather than letting it fight a √D scale gap.
 - Predictor output is `prior_jepa + Δz` (raw, no extra normalization).
   Lives in `proj_jepa` space.
-- The CLIP path applies `proj_clip(z_prior)` and
-  `proj_clip(z_current_online)`. No LayerNorm is needed here because
-  `local_contrastive_loss` re-normalizes its inputs internally with
-  `F.normalize`, putting them on the unit sphere for the cosine
-  similarity it computes downstream.
+- The prior-side CLIP path applies `proj_clip(z_prior)`. No LayerNorm
+  is needed here because `local_contrastive_loss` re-normalizes its
+  inputs internally with `F.normalize`, putting them on the unit
+  sphere for the cosine similarity it computes downstream. The
+  current-side CLIP path uses the predictor output `ẑ_cur` directly
+  (which already lives in `proj_jepa` space, LN'd) — the loss's
+  internal `F.normalize` handles the scale, and feeding `ẑ_cur` into
+  the contrastive loss is what gives the predictor direct text-
+  conditional supervision.
 
 ### Loss reuse
 

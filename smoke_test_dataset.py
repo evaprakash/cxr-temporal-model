@@ -24,9 +24,9 @@ tensor shapes.
 Pass ``--forward-pass`` to additionally build ``TempCXRJEPA`` and run a
 single forward + backward on dummy tensors. This verifies that the
 ``proj_clip`` / ``proj_jepa`` / ``target_proj_jepa`` projection heads
-are registered, that the forward dict exposes the new
-``prior_clip`` / ``current_clip`` / ``prior_jepa`` /
-``current_target_jepa`` keys, and that gradients flow through both
+are registered, that the forward dict exposes the
+``prior_clip`` / ``prior_jepa`` / ``current_target_jepa`` /
+``pred_current_patches`` keys, and that gradients flow through both
 online projection heads while ``target_proj_jepa`` stays frozen (EMA
 only). Useful as a fast architecture-wiring check after refactors.
 
@@ -202,10 +202,9 @@ def _check_forward_pass() -> None:
     Verifies:
       1. ``proj_clip`` / ``proj_jepa`` / ``target_proj_jepa`` are
          registered submodules of ``TempCXRJEPA``.
-      2. ``forward`` returns the new
-         ``prior_clip`` / ``current_clip`` / ``prior_jepa`` /
-         ``current_target_jepa`` / ``pred_current_patches`` keys with
-         the expected shapes.
+      2. ``forward`` returns the
+         ``prior_clip`` / ``prior_jepa`` / ``current_target_jepa`` /
+         ``pred_current_patches`` keys with the expected shapes.
       3. Backward through the JEPA Smooth L1 + both local contrastive
          losses produces non-zero gradients on ``proj_clip`` and
          ``proj_jepa`` (the projections actually participate in the
@@ -268,7 +267,7 @@ def _check_forward_pass() -> None:
                 prior_reports, current_reports, condition_texts)
 
     expected_keys = {
-        "prior_clip", "current_clip",
+        "prior_clip",
         "prior_jepa", "current_target_jepa",
         "pred_current_patches",
         "prior_txt_local", "prior_token_mask",
@@ -282,7 +281,7 @@ def _check_forward_pass() -> None:
 
     print("[smoke] forward output shapes:")
     for k in (
-        "prior_clip", "current_clip",
+        "prior_clip",
         "prior_jepa", "current_target_jepa",
         "pred_current_patches",
     ):
@@ -309,15 +308,15 @@ def _check_forward_pass() -> None:
     jepa_loss = jepa_smooth_l1_loss(
         out["pred_current_patches"], out["current_target_jepa"],
     )
-    clip_prior_loss = local_contrastive_loss(
+    prior_loss = local_contrastive_loss(
         out["prior_clip"], out["prior_txt_local"], out["prior_token_mask"],
     )
-    clip_current_loss = local_contrastive_loss(
-        out["current_clip"],
+    pred_loss = local_contrastive_loss(
+        out["pred_current_patches"],
         out["current_txt_local"],
         out["current_token_mask"],
     )
-    total = jepa_loss + 0.1 * clip_prior_loss + 0.1 * clip_current_loss
+    total = jepa_loss + 0.1 * prior_loss + 0.1 * pred_loss
     total.backward()
 
     def _grad_norm(module):
@@ -332,10 +331,10 @@ def _check_forward_pass() -> None:
     target_grad = _grad_norm(model.target_proj_jepa)
 
     print(f"[smoke] losses:")
-    print(f"          jepa         : {jepa_loss.item():.4f}")
-    print(f"          clip_prior   : {clip_prior_loss.item():.4f}")
-    print(f"          clip_current : {clip_current_loss.item():.4f}")
-    print(f"          total        : {total.item():.4f}")
+    print(f"          jepa                  : {jepa_loss.item():.4f}")
+    print(f"          report_prior (z_prior): {prior_loss.item():.4f}")
+    print(f"          report_pred  (ẑ_cur)  : {pred_loss.item():.4f}")
+    print(f"          total                 : {total.item():.4f}")
     print(f"[smoke] grad norms:")
     print(f"          proj_clip        : {clip_grad:.4f}  (>0 expected)")
     print(f"          proj_jepa        : {jepa_grad:.4f}  (>0 expected)")

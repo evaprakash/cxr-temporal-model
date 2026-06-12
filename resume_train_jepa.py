@@ -143,14 +143,14 @@ WARMUP_RATIO = 0.03
 SAVE_EVERY_N_EPOCHS = 5
 
 # Loss weights (matching the smoke-test defaults in the old jepa.py).
-# W_CLIP_PRIOR / W_CLIP_CURRENT correspond to the prior- and current-side
-# local contrastive losses, both now reading from ``proj_clip``'s output
-# (prior_clip / current_clip from TempCXRJEPA.forward). The names
-# val_report_prior / val_report_pred are kept in the CSV header below
-# for backwards compatibility with existing log files.
+# W_REPORT_PRIOR is the prior-side contrastive loss on ``prior_clip``
+# (proj_clip(online_prior) vs prior_text). W_REPORT_PRED is the
+# current-side contrastive loss on ``pred_current_patches`` (ẑ_cur vs
+# current_text) — feeding the predictor output into the contrastive
+# loss is what gives the predictor direct text-conditional supervision.
 W_JEPA = 1.0
-W_CLIP_PRIOR = 0.1
-W_CLIP_CURRENT = 0.1
+W_REPORT_PRIOR = 0.1
+W_REPORT_PRED = 0.1
 
 # Stratified train/val split when the studies parquet has no 'split'
 # column. Both datasets read/write the same cached splits CSV
@@ -324,14 +324,17 @@ def compute_jepa_losses(out, gather: bool):
               for cross-rank negatives (training). If False, use
               local features only (validation).
 
-    Returns: (total, jepa, clip_prior, clip_current) as scalar tensors.
+    Returns: (total, jepa, prior, pred) as scalar tensors.
 
-    The two contrastive losses read from ``proj_clip``'s output
-    (``prior_clip`` / ``current_clip``), and the JEPA Smooth L1 reads
-    from the predictor (which lives downstream of ``proj_jepa``) and the
-    EMA-tracked ``target_proj_jepa`` output. Each loss thus operates in
-    its own projected space and the two losses don't directly contend
-    over a single shared encoder output.
+    The prior-side contrastive loss reads from ``proj_clip``'s output
+    (``prior_clip``); the JEPA Smooth L1 reads from the predictor (which
+    lives downstream of ``proj_jepa``) and the EMA-tracked
+    ``target_proj_jepa`` output; the current-side contrastive loss reads
+    directly from the predictor's output ``pred_current_patches``, so
+    the predictor stays under direct text-conditional supervision (the
+    contrastive loss has to make different ``ẑ_cur`` align with
+    different current-side reports across the batch, which it can only
+    do if ``ẑ_cur`` actually varies with the predictor's text input).
     """
 
     # JEPA loss is per-element MSE-style; cross-rank gathering doesn't
@@ -344,42 +347,42 @@ def compute_jepa_losses(out, gather: bool):
     )
 
     if gather:
-        prior_clip = gather_with_grad(out["prior_clip"])
+        prior_patches = gather_with_grad(out["prior_clip"])
         prior_txt_local = gather_with_grad(out["prior_txt_local"])
         prior_token_mask = gather_with_grad(
             out["prior_token_mask"].float()
         ).bool()
 
-        current_clip = gather_with_grad(out["current_clip"])
+        pred_patches = gather_with_grad(out["pred_current_patches"])
         current_txt_local = gather_with_grad(out["current_txt_local"])
         current_token_mask = gather_with_grad(
             out["current_token_mask"].float()
         ).bool()
     else:
-        prior_clip = out["prior_clip"]
+        prior_patches = out["prior_clip"]
         prior_txt_local = out["prior_txt_local"]
         prior_token_mask = out["prior_token_mask"]
-        current_clip = out["current_clip"]
+        pred_patches = out["pred_current_patches"]
         current_txt_local = out["current_txt_local"]
         current_token_mask = out["current_token_mask"]
 
-    clip_prior = local_contrastive_loss(
-        prior_clip,
+    prior = local_contrastive_loss(
+        prior_patches,
         prior_txt_local,
         prior_token_mask,
     )
-    clip_current = local_contrastive_loss(
-        current_clip,
+    pred = local_contrastive_loss(
+        pred_patches,
         current_txt_local,
         current_token_mask,
     )
 
     total = (
         W_JEPA * jepa
-        + W_CLIP_PRIOR * clip_prior
-        + W_CLIP_CURRENT * clip_current
+        + W_REPORT_PRIOR * prior
+        + W_REPORT_PRED * pred
     )
-    return total, jepa, clip_prior, clip_current
+    return total, jepa, prior, pred
 
 
 # ============================================================
@@ -419,7 +422,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 condition_texts,
             )
 
-            loss, jepa_l, clip_prior_l, clip_current_l = compute_jepa_losses(
+            loss, jepa_l, prior_l, pred_l = compute_jepa_losses(
                 out, gather=True,
             )
 
@@ -457,7 +460,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # VALIDATION
     # ============================================================
     model.eval()
-    val_total = val_jepa = val_clip_prior = val_clip_current = 0.0
+    val_total = val_jepa = val_report_prior = val_report_pred = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -479,25 +482,25 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     condition_texts,
                 )
 
-                total, jepa_l, clip_prior_l, clip_current_l = (
+                total, jepa_l, prior_l, pred_l = (
                     compute_jepa_losses(out, gather=False)
                 )
 
             val_total += total.item()
             val_jepa += jepa_l.item()
-            val_clip_prior += clip_prior_l.item()
-            val_clip_current += clip_current_l.item()
+            val_report_prior += prior_l.item()
+            val_report_pred += pred_l.item()
             val_batches += 1
 
     val_total /= max(val_batches, 1)
     val_jepa /= max(val_batches, 1)
-    val_clip_prior /= max(val_batches, 1)
-    val_clip_current /= max(val_batches, 1)
+    val_report_prior /= max(val_batches, 1)
+    val_report_pred /= max(val_batches, 1)
 
     val_total = ddp_reduce(val_total)
     val_jepa = ddp_reduce(val_jepa)
-    val_clip_prior = ddp_reduce(val_clip_prior)
-    val_clip_current = ddp_reduce(val_clip_current)
+    val_report_prior = ddp_reduce(val_report_prior)
+    val_report_pred = ddp_reduce(val_report_pred)
 
     if local_rank == 0:
 
@@ -505,18 +508,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"Val Epoch {epoch} | "
             f"Total={val_total:.4f} | "
             f"JEPA={val_jepa:.4f} | "
-            f"ClipPrior={val_clip_prior:.4f} | "
-            f"ClipCurrent={val_clip_current:.4f}"
+            f"ReportPrior={val_report_prior:.4f} | "
+            f"ReportPred={val_report_pred:.4f}"
         )
 
-        # Column names in the CSV header are kept as
-        # ``val_report_prior`` / ``val_report_pred`` for backwards
-        # compatibility with prior-mode logs; the values now correspond
-        # to the prior- and current-side CLIP losses respectively.
         with open(CSV_LOG, "a") as f:
             f.write(
                 f"{epoch},{val_total},{val_jepa},"
-                f"{val_clip_prior},{val_clip_current}\n"
+                f"{val_report_prior},{val_report_pred}\n"
             )
 
         ckpt = {
