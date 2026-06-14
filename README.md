@@ -10,13 +10,13 @@ of the current study, or per-finding templated clauses of the form
 ## Architecture
 
 ```
-Prior CXR  ──►  E (online)         ─┬─►  proj_clip ──►  prior_clip ──────────────►  CLIP loss (vs prior_text)
+Prior CXR  ──►  E (online)         ─┬─►  proj_clip ──►  prior_clip ──────────────────►  CLIP loss (vs prior_text)
                                     │
                                     └─►  proj_jepa  ──►  LN  ──►  prior_jepa  ──┐
 Condition  ──►  text_encoder       ───────────────────────►  τ_cond              ├──►  Predictor  ──►  ẑ_cur ──┬──►  JEPA loss
                                                                                                                 │
                                                                                                                 └──►  CLIP loss (vs current_text)
-Current CXR──►  E_target (EMA, SG)  ──►  target_proj_jepa  ──►  LN  ──►  current_target_jepa  ──────────────────►  JEPA loss (target)
+Current CXR──►  E_target (EMA, SG)  ──►  proj_jepa (shared, SG)  ──►  LN  ──►  current_target_jepa  ─────────►  JEPA loss (target)
 ```
 
 Losses:
@@ -50,13 +50,19 @@ shell). This ensures **the two loss types don't interfere with each
 other** in the loss-side representation — the encoder trunk still
 trains from both losses, but each loss sees its own projected view of
 the shared trunk, so the gradients of one don't have to compromise
-the geometry the other wants. `target_proj_jepa` is an EMA copy of
-`proj_jepa` so the JEPA target lives in the same projected space as
-the predictor's output (mirrors I-JEPA's EMA-target-encoder recipe
-end-to-end). The current-side CLIP loss reads directly from the
-predictor output `ẑ_cur` (no extra projection — the contrastive loss
-L2-normalizes internally), which keeps the predictor under direct
-text-conditional supervision.
+the geometry the other wants. **`proj_jepa` is shared between the
+prior side (with gradient) and the target side (under `torch.no_grad`)**
+rather than having a separate EMA-tracked copy. This is the
+BYOL/SimSiam-style shared-projector + stop-grad recipe: the EMA target
+image encoder still provides the asymmetry needed to prevent
+representation collapse, and applying the same projection head on both
+sides preserves the predictor's "do-nothing" prior — for stable pairs
+where `proj_jepa(z_prior) ≈ proj_jepa(z_cur)`, `Δz = 0` is
+approximately the right answer, which restores the magnitude
+calibration the Smooth L1 metric depends on. The current-side CLIP
+loss reads directly from the predictor output `ẑ_cur` (no extra
+projection — the contrastive loss L2-normalizes internally), which
+keeps the predictor under direct text-conditional supervision.
 
 ## Repository layout
 
@@ -224,11 +230,12 @@ python smoke_test_dataset.py --num-examples 5 --split val
 python smoke_test_dataset.py --load-images   # also call __getitem__
 
 # Same dataset checks PLUS a forward + backward pass through
-# TempCXRJEPA on dummy tensors. Verifies the proj_clip / proj_jepa /
-# target_proj_jepa heads are registered, that forward emits the
+# TempCXRJEPA on dummy tensors. Verifies the proj_clip / proj_jepa
+# heads are registered (proj_jepa is shared between prior and target
+# sides — no separate target_proj_jepa), that forward emits the
 # prior_clip / prior_jepa / current_target_jepa / pred_current_patches
 # keys with the expected shapes, and that gradients flow through both
-# online projection heads while target_proj_jepa stays frozen.
+# online projection heads.
 python smoke_test_dataset.py --forward-pass
 ```
 
@@ -351,11 +358,14 @@ projection spaces (see "Per-loss projection heads" above):
 - Image encoder patch + global outputs are returned **raw** (no
   `F.normalize` to the unit sphere) by `image_encoder_jepa.py`.
 - The JEPA path applies `LN(proj_jepa(z_prior))` and
-  `LN(target_proj_jepa(z_cur))` inside `TempCXRJEPA.forward`. Putting
-  both sides of the JEPA loss through the same projected geometry and
-  a parameter-free feature-dim LayerNorm gives the delta predictor a
-  meaningful "do-nothing" baseline (`Δz = 0` ⇒ `ẑ_cur ≈ z_cur` under
-  no change) rather than letting it fight a √D scale gap.
+  `LN(proj_jepa(z_cur))` inside `TempCXRJEPA.forward` — the same
+  `proj_jepa` is applied on both sides, with `torch.no_grad` on the
+  target path (BYOL/SimSiam-style shared projector + stop-grad).
+  Putting both sides of the JEPA loss through the same projected
+  geometry and a parameter-free feature-dim LayerNorm gives the delta
+  predictor a meaningful "do-nothing" baseline (`Δz = 0` ⇒
+  `ẑ_cur ≈ z_cur` under no change) rather than letting it fight a √D
+  scale gap or a projection-head EMA gap.
 - Predictor output is `prior_jepa + Δz` (raw, no extra normalization).
   Lives in `proj_jepa` space.
 - The prior-side CLIP path applies `proj_clip(z_prior)`. No LayerNorm

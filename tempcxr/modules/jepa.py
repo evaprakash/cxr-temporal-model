@@ -13,7 +13,7 @@ Architecture
     Condition  ──►  text_encoder       ─────────────────────────►  τ_cond           ├──►  Predictor  ──►  ẑ_cur ──┬──►  JEPA loss
                                                                                                                   │
                                                                                                                   └──►  CLIP loss (vs current_text)
-    Current CXR──►  E_target (EMA, SG)  ──►  target_proj_jepa  ──►  LN  ──►  current_target_jepa  ────────────────►  JEPA loss (target)
+    Current CXR──►  E_target (EMA, SG)  ──►  proj_jepa (shared, SG)  ──►  LN  ──►  current_target_jepa  ─────────►  JEPA loss (target)
 
 The "condition" text is built upstream by the dataset and can be either
 the joined dynamic sentences (``condition_mode="dynamic"``) or the
@@ -34,9 +34,19 @@ two losses would directly contend over a single shared representation.
 projection of the (shared) trunk features. The trunk still trains from
 both losses, but each loss only ever sees its own projected view, so the
 two loss types don't interfere with each other in the loss-side
-representation. ``target_proj_jepa`` is an EMA copy of ``proj_jepa`` so
-the JEPA target lives in the same projected space as the predictor's
-output (mirrors I-JEPA's EMA-target-encoder recipe end-to-end).
+representation.
+
+The JEPA target reuses the SAME ``proj_jepa`` (under stop-gradient) as
+the prior side, rather than going through a separate EMA-tracked copy.
+This is the BYOL/SimSiam-style "shared projector + stop-grad on the
+target" recipe: it removes the projection-head EMA drift that was
+breaking the predictor's "do-nothing" prior, while the EMA target image
+encoder still provides the collapse-prevention asymmetry between the
+two sides.  Concretely: for a stable pair where the prior and current
+images encode to similar features, applying the same ``proj_jepa`` to
+both sides yields ``proj_jepa(z_prior) ≈ proj_jepa(z_cur)``, so the
+predictor's identity output ``Δz = 0`` is approximately the right
+answer (its magnitude calibration on stable cases comes back for free).
 
 The predictor's output ``ẑ_cur`` still feeds the current-side CLIP loss
 directly (no extra projection): the local contrastive loss L2-normalizes
@@ -47,13 +57,13 @@ contrastive loss can match different ``ẑ_cur`` against different
 current-side reports is if ``ẑ_cur`` actually varies with the predictor's
 text condition.
 
-Both the prior-side ``proj_jepa`` output and the target-side
-``target_proj_jepa`` output get a feature-dim LayerNorm with no learnable
-parameters, so the predictor's delta-prediction starts in the same
-geometry as the JEPA target (no scale gap in the Smooth L1 loss).
+Both sides of the JEPA path apply a feature-dim LayerNorm (no learnable
+parameters) on top of ``proj_jepa``'s output, so the predictor's
+delta-prediction starts in the same geometry as the JEPA target (no
+scale gap in the Smooth L1 loss).
 
 Losses (computed by the caller):
-    - JEPA Smooth L1: ẑ_cur  ↔ stop-grad LN(target_proj_jepa(z_cur))
+    - JEPA Smooth L1: ẑ_cur  ↔ stop-grad LN(proj_jepa(z_cur))
     - GLoRIA local contrastive: prior_clip ↔ τ_prior
     - GLoRIA local contrastive: ẑ_cur     ↔ τ_current
 """
@@ -252,10 +262,9 @@ class TempCXRJEPA(nn.Module):
       - ``proj_clip``            : projection head feeding the prior-side
                                    CLIP local contrastive loss — trained.
       - ``proj_jepa``            : projection head for the JEPA Smooth L1
-                                   path (feeds the predictor input and
-                                   produces the JEPA target after EMA) —
-                                   trained.
-      - ``target_proj_jepa``     : EMA copy of ``proj_jepa`` — frozen.
+                                   path. Applied to BOTH the prior side
+                                   (with gradient) and the target side
+                                   (under stop-gradient) — trained.
       - ``predictor``            : IJEPATemporalPredictor — trained.
 
     Separate ``proj_clip`` and ``proj_jepa`` heads decouple the two loss
@@ -266,6 +275,15 @@ class TempCXRJEPA(nn.Module):
     scale). This means the two losses don't have to share a single
     representation and their gradients can't directly contend over the
     same patch tensor.
+
+    The JEPA target uses the SAME ``proj_jepa`` (under
+    ``torch.no_grad``) as the prior side rather than a separate
+    EMA-tracked ``target_proj_jepa``. The EMA target image encoder still
+    provides the asymmetry needed to prevent representation collapse,
+    but applying the same projection head on both sides preserves the
+    predictor's "do-nothing" prior — ``Δz = 0`` lands close to the
+    target for stable pairs, so the magnitude calibration that the
+    Smooth L1 metric depends on survives.
 
     The current-side CLIP loss reads directly from the predictor's
     output ``ẑ_cur`` (no extra projection): the contrastive loss
@@ -309,7 +327,6 @@ class TempCXRJEPA(nn.Module):
         d_enc = self.image_encoder.embed_dim
         self.proj_clip = _make_projection_head(d_enc, d_model)
         self.proj_jepa = _make_projection_head(d_enc, d_model)
-        self.target_proj_jepa = _build_target_encoder(self.proj_jepa)
 
         self.predictor = IJEPATemporalPredictor(
             num_patches=num_patches,
@@ -347,8 +364,9 @@ class TempCXRJEPA(nn.Module):
                                                 prior-side CLIP-loss input
           - prior_jepa               (B, N, D)  LN(proj_jepa(online_prior)),
                                                 predictor input
-          - current_target_jepa      (B, N, D)  LN(target_proj_jepa(target_current)),
-                                                JEPA-loss target (detached)
+          - current_target_jepa      (B, N, D)  LN(proj_jepa(target_current)),
+                                                under torch.no_grad +
+                                                detach — JEPA-loss target
           - pred_current_patches     (B, N, D)  predictor output ẑ_cur,
                                                 JEPA-loss prediction +
                                                 current-side CLIP-loss input
@@ -405,14 +423,19 @@ class TempCXRJEPA(nn.Module):
             all_token_mask[2 * B:],
         )
 
-        # ---- Target encoder + target JEPA projection on current image ----
-        # Stop-gradient on both the target image encoder and the target
-        # projection (both are EMA copies of their online counterparts).
-        # I-JEPA's recipe: feature-dim LayerNorm on the target stabilizes
-        # the target distribution as the EMA encoder + projection drift.
+        # ---- Target encoder + shared JEPA projection on current image ----
+        # The EMA target image encoder is the only EMA-coupled module on
+        # the target path: the JEPA projection head ``proj_jepa`` is
+        # shared with the prior side and run here under ``torch.no_grad``
+        # (BYOL/SimSiam-style stop-grad). Sharing the projection head
+        # preserves the predictor's "do-nothing" prior — for stable pairs,
+        # ``proj_jepa(prior) ≈ proj_jepa(current)`` so ``Δz = 0`` is
+        # approximately correct. I-JEPA's feature-dim LayerNorm on the
+        # target still stabilizes the target distribution as the EMA
+        # encoder drifts.
         with torch.no_grad():
             _, current_raw_target = self.target_image_encoder(current_imgs)
-            current_target_jepa = self.target_proj_jepa(current_raw_target)
+            current_target_jepa = self.proj_jepa(current_raw_target)
             current_target_jepa = F.layer_norm(
                 current_target_jepa,
                 (current_target_jepa.size(-1),),
@@ -444,18 +467,17 @@ class TempCXRJEPA(nn.Module):
     # --------------------------------------------------
     @torch.no_grad()
     def update_ema(self, momentum: float):
-        """EMA both the image encoder AND the JEPA projection head.
+        """EMA the image encoder only.
 
-        The JEPA loss compares the predictor's output (which lives
-        downstream of the online ``proj_jepa``) against
-        ``LN(target_proj_jepa(target_image_encoder(current)))``. For
-        the target to live in the SAME projected space as the online
-        side, ``target_proj_jepa`` must EMA-track ``proj_jepa`` in
-        lockstep with the image-encoder EMA — otherwise the target
-        distribution would drift in a way the predictor can't track.
+        ``proj_jepa`` is shared between the prior side (with gradient)
+        and the target side (under ``torch.no_grad``); there is no
+        separate EMA copy of the projection head. This is the
+        BYOL/SimSiam-style shared-projector recipe — the EMA target
+        image encoder provides the asymmetry needed to prevent
+        representation collapse, and the shared projection preserves
+        the predictor's "do-nothing" prior on stable pairs.
         """
         _update_ema(self.image_encoder, self.target_image_encoder, momentum)
-        _update_ema(self.proj_jepa, self.target_proj_jepa, momentum)
 
 
 # =========================================================
@@ -499,10 +521,10 @@ if __name__ == "__main__":
 
     # --------------------------------------------------
     # Losses (external). The prior-side CLIP loss reads from
-    # proj_clip's output; the JEPA loss reads from proj_jepa /
-    # target_proj_jepa; the current-side CLIP loss reads from the
-    # predictor output ẑ_cur so the predictor stays under direct
-    # text-conditional supervision.
+    # proj_clip's output; the JEPA loss reads from proj_jepa (shared
+    # between prior and target sides, target under stop-grad); the
+    # current-side CLIP loss reads from the predictor output ẑ_cur so
+    # the predictor stays under direct text-conditional supervision.
     # --------------------------------------------------
     jepa_loss = jepa_smooth_l1_loss(
         out["pred_current_patches"],

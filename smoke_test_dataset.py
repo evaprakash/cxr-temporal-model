@@ -23,12 +23,14 @@ tensor shapes.
 
 Pass ``--forward-pass`` to additionally build ``TempCXRJEPA`` and run a
 single forward + backward on dummy tensors. This verifies that the
-``proj_clip`` / ``proj_jepa`` / ``target_proj_jepa`` projection heads
-are registered, that the forward dict exposes the
+``proj_clip`` / ``proj_jepa`` projection heads are registered, that the
+forward dict exposes the
 ``prior_clip`` / ``prior_jepa`` / ``current_target_jepa`` /
 ``pred_current_patches`` keys, and that gradients flow through both
-online projection heads while ``target_proj_jepa`` stays frozen (EMA
-only). Useful as a fast architecture-wiring check after refactors.
+online projection heads. ``proj_jepa`` is shared between the prior side
+(with gradient) and the target side (under ``torch.no_grad``); the
+target image encoder is the only EMA-coupled module. Useful as a fast
+architecture-wiring check after refactors.
 
 Usage
 -----
@@ -200,16 +202,17 @@ def _check_forward_pass() -> None:
     """Build ``TempCXRJEPA`` and exercise the projection heads end-to-end.
 
     Verifies:
-      1. ``proj_clip`` / ``proj_jepa`` / ``target_proj_jepa`` are
-         registered submodules of ``TempCXRJEPA``.
+      1. ``proj_clip`` and ``proj_jepa`` are registered submodules of
+         ``TempCXRJEPA`` (no separate ``target_proj_jepa`` — the JEPA
+         projection is shared between prior and target sides).
       2. ``forward`` returns the
          ``prior_clip`` / ``prior_jepa`` / ``current_target_jepa`` /
          ``pred_current_patches`` keys with the expected shapes.
       3. Backward through the JEPA Smooth L1 + both local contrastive
          losses produces non-zero gradients on ``proj_clip`` and
          ``proj_jepa`` (the projections actually participate in the
-         loss), while ``target_proj_jepa`` stays frozen (EMA only).
-      4. ``update_ema`` runs without error.
+         loss).
+      4. ``update_ema`` runs without error (EMA only the image encoder).
 
     Uses random dummy tensors so this works without any silver / gold
     images on disk. The model is instantiated with the default
@@ -235,25 +238,20 @@ def _check_forward_pass() -> None:
     model = TempCXRJEPA().to(device)
     model.train()
 
-    for name in ("proj_clip", "proj_jepa", "target_proj_jepa"):
+    for name in ("proj_clip", "proj_jepa"):
         assert hasattr(model, name), (
             f"TempCXRJEPA is missing expected submodule {name!r}"
         )
+    assert not hasattr(model, "target_proj_jepa"), (
+        "TempCXRJEPA still has target_proj_jepa — projection head should "
+        "be shared between prior and target sides, not EMA-tracked"
+    )
 
     n_clip = sum(p.numel() for p in model.proj_clip.parameters())
-    n_jepa_online = sum(p.numel() for p in model.proj_jepa.parameters())
-    n_jepa_target = sum(p.numel() for p in model.target_proj_jepa.parameters())
+    n_jepa = sum(p.numel() for p in model.proj_jepa.parameters())
     print(f"[smoke] projection-head params:")
     print(f"          proj_clip        : {n_clip:>8d}  (trained)")
-    print(f"          proj_jepa        : {n_jepa_online:>8d}  (trained)")
-    print(f"          target_proj_jepa : {n_jepa_target:>8d}  (EMA, frozen)")
-
-    target_requires_grad = any(
-        p.requires_grad for p in model.target_proj_jepa.parameters()
-    )
-    assert not target_requires_grad, (
-        "target_proj_jepa parameters should be frozen (EMA-only)"
-    )
+    print(f"          proj_jepa        : {n_jepa:>8d}  (trained, shared online/target)")
 
     B = 2
     prior_imgs = torch.randn(B, 3, 448, 448, device=device)
@@ -328,7 +326,6 @@ def _check_forward_pass() -> None:
 
     clip_grad = _grad_norm(model.proj_clip)
     jepa_grad = _grad_norm(model.proj_jepa)
-    target_grad = _grad_norm(model.target_proj_jepa)
 
     print(f"[smoke] losses:")
     print(f"          jepa                  : {jepa_loss.item():.4f}")
@@ -336,16 +333,11 @@ def _check_forward_pass() -> None:
     print(f"          report_pred  (ẑ_cur)  : {pred_loss.item():.4f}")
     print(f"          total                 : {total.item():.4f}")
     print(f"[smoke] grad norms:")
-    print(f"          proj_clip        : {clip_grad:.4f}  (>0 expected)")
-    print(f"          proj_jepa        : {jepa_grad:.4f}  (>0 expected)")
-    print(f"          target_proj_jepa : {target_grad:.4f}  (0 expected — frozen)")
+    print(f"          proj_clip : {clip_grad:.4f}  (>0 expected)")
+    print(f"          proj_jepa : {jepa_grad:.4f}  (>0 expected, prior-side only)")
 
     assert clip_grad > 0.0, "proj_clip received no gradient"
     assert jepa_grad > 0.0, "proj_jepa received no gradient"
-    assert target_grad == 0.0, (
-        "target_proj_jepa received gradient — it should be frozen / "
-        "EMA-only"
-    )
 
     print("[smoke] running EMA update step…")
     sched = make_momentum_scheduler(EMA_START, EMA_END, total_iters=1)
@@ -440,9 +432,9 @@ def main() -> int:
         "--forward-pass",
         action="store_true",
         help="Also build TempCXRJEPA and exercise the proj_clip / "
-             "proj_jepa / target_proj_jepa projection heads with a "
-             "forward + backward on dummy tensors. Requires the BioViL-T "
-             "backbone to be loadable. Off by default so the script "
+             "proj_jepa projection heads with a forward + backward on "
+             "dummy tensors. Requires the BioViL-T backbone to be "
+             "loadable. Off by default so the script "
              "works without torch and without the BioViL-T weights.",
     )
     args = parser.parse_args()

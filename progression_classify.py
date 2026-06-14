@@ -375,16 +375,16 @@ def score_one_pair(
     current = current_img.unsqueeze(0).to(device)
 
     # Encode images once (online for prior, EMA for current — matches training).
-    # Project through the JEPA head and LayerNorm so the prior and target
-    # live in the same projected geometry as during training; this mirrors
-    # ``TempCXRJEPA.forward`` exactly so inference-time L1 distances are
-    # in the same space as the training-time JEPA loss.
+    # Project through the SHARED proj_jepa head and LayerNorm so the prior
+    # and target live in the same projected geometry as during training;
+    # this mirrors ``TempCXRJEPA.forward`` exactly so inference-time L1
+    # distances are in the same space as the training-time JEPA loss.
     _, prior_raw = model.image_encoder(prior)
     z_prior = model.proj_jepa(prior_raw)
     z_prior = F.layer_norm(z_prior, (z_prior.size(-1),))
 
     _, curr_raw = model.target_image_encoder(current)
-    z_cur = model.target_proj_jepa(curr_raw)
+    z_cur = model.proj_jepa(curr_raw)
     z_cur = F.layer_norm(z_cur, (z_cur.size(-1),)).detach()
 
     # Batch the predictor across all phrases by expanding prior to match.

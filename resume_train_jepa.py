@@ -274,10 +274,12 @@ if args.resume is None:
 
 if args.resume is not None:
     checkpoint = torch.load(args.resume, map_location=DEVICE)
-    # strict=False so the architecture change to add proj_clip / proj_jepa
-    # / target_proj_jepa can still warm-start the trunk + predictor from
-    # pre-projection-head checkpoints. Missing proj_* keys will start
-    # randomly initialized; the trainer will report them.
+    # strict=False so we can warm-start the trunk + predictor across
+    # architecture changes (pre-projhead checkpoints lack proj_clip /
+    # proj_jepa keys; older two-projhead checkpoints have extra
+    # target_proj_jepa keys that are now obsolete). Missing keys are
+    # randomly initialized; unexpected keys are silently dropped. The
+    # trainer prints both lists below.
     missing, unexpected = model.module.load_state_dict(
         checkpoint["model"], strict=False,
     )
@@ -328,13 +330,15 @@ def compute_jepa_losses(out, gather: bool):
 
     The prior-side contrastive loss reads from ``proj_clip``'s output
     (``prior_clip``); the JEPA Smooth L1 reads from the predictor (which
-    lives downstream of ``proj_jepa``) and the EMA-tracked
-    ``target_proj_jepa`` output; the current-side contrastive loss reads
-    directly from the predictor's output ``pred_current_patches``, so
-    the predictor stays under direct text-conditional supervision (the
-    contrastive loss has to make different ``ẑ_cur`` align with
-    different current-side reports across the batch, which it can only
-    do if ``ẑ_cur`` actually varies with the predictor's text input).
+    lives downstream of the online ``proj_jepa``) and from the SAME
+    ``proj_jepa`` applied to the EMA-encoded current image under
+    stop-gradient (``current_target_jepa``); the current-side contrastive
+    loss reads directly from the predictor's output
+    ``pred_current_patches``, so the predictor stays under direct
+    text-conditional supervision (the contrastive loss has to make
+    different ``ẑ_cur`` align with different current-side reports across
+    the batch, which it can only do if ``ẑ_cur`` actually varies with
+    the predictor's text input).
     """
 
     # JEPA loss is per-element MSE-style; cross-rank gathering doesn't

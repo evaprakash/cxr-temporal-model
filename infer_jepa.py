@@ -113,8 +113,11 @@ def encode_pair_with_text(
 
     Returns a dict with at least:
         prior_jepa               (1, 196, D)  LN(proj_jepa(online_prior))
-        current_target_jepa      (1, 196, D)  LN(target_proj_jepa(target_current))
-                                              — detached
+        current_target_jepa      (1, 196, D)  LN(proj_jepa(target_current))
+                                              — under torch.no_grad +
+                                              detached (proj_jepa is
+                                              shared between prior and
+                                              target sides)
         pred_current_patches     (1, 196, D)  predictor output ẑ_cur
         prior_clip               (1, 196, D)  proj_clip(online_prior)
     """
