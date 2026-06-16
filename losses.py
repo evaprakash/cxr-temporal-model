@@ -125,6 +125,114 @@ def local_contrastive_loss(
     return (loss_i2t + loss_t2i) / 2
 
 # =========================================================
+# PROGRESSION CLASSIFICATION LOSS (4th JEPA loss)
+# =========================================================
+def progression_classification_loss(
+    pred_patches: torch.Tensor,         # (B, N, D)
+    class_prompts_local: torch.Tensor,  # (P, T, D)
+    class_prompts_mask: torch.Tensor,   # (P, T)  True for valid tokens
+    pair_idx_per_finding: torch.Tensor, # (F_total,)  int64
+    silver_per_finding: torch.Tensor,   # (F_total,)  int64, in [0, n_classes)
+    batch_size: int,
+    n_classes: int = 5,
+    temperature: float = 0.1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Per-finding 5-way softmax cross-entropy on prompt alignment.
+
+    For each finding ``j`` in pair ``i`` (silver class ``c_{i,j}^*``):
+
+      1. Build five templated prompts (one per class) — *not* done here;
+         the caller passes their encoded tokens via ``class_prompts_local``
+         in a flat, finding-major order::
+
+             [pair_0_finding_0_cls_0, …, pair_0_finding_0_cls_{n-1},
+              pair_0_finding_1_cls_0, …, pair_i_finding_j_cls_k, …]
+
+         so ``class_prompts_local`` has shape ``(F_total * n_classes, T, D)``.
+      2. Mean-pool ``pred_patches[i]`` over patches and the prompt tokens
+         over their valid tokens. Take cosine similarity. This is a single
+         scalar per (pair, finding, class) triple.
+      3. Reshape to ``(F_total, n_classes)`` and softmax-CE against
+         ``silver_per_finding``.
+      4. Average CE across findings within each pair (so multi-finding
+         pairs don't outweigh single-finding pairs), then average across
+         pairs in the batch.
+
+    Returns a scalar tensor on the same device as ``pred_patches``.
+    Returns 0 if the batch carries no findings (e.g. degenerate batch).
+
+    Notes
+    -----
+    Scoring is mean-pooled cosine rather than the GLoRIA soft-aligned
+    score used by ``local_contrastive_loss``. Cosine in ``[-1, 1]`` is
+    well-behaved for a 5-way softmax: temperature ``τ=0.1`` gives a
+    logit range of ``[-10, 10]`` which is peaky but not pathological,
+    and avoids the wide-dynamic-range issues you'd get from the
+    log-sum-exp scoring (which is calibrated for batch-contrastive
+    InfoNCE, not per-pair classification).
+    """
+    if class_prompts_local.numel() == 0:
+        return pred_patches.new_zeros(())
+
+    F_total = pair_idx_per_finding.size(0)
+    if F_total == 0:
+        return pred_patches.new_zeros(())
+
+    P = class_prompts_local.size(0)
+    assert P == F_total * n_classes, (
+        f"Expected {F_total * n_classes} prompts (={F_total} findings x "
+        f"{n_classes} classes), got {P}"
+    )
+
+    # 1. Mean-pool the predicted current patches per pair -> (B, D).
+    img_pool = pred_patches.mean(dim=1)
+
+    # 2. Mask-aware mean-pool of text tokens per prompt -> (P, D).
+    mask = class_prompts_mask.float()
+    mask_sum = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+    text_pool = (
+        class_prompts_local * mask.unsqueeze(-1)
+    ).sum(dim=1) / mask_sum
+
+    # 3. Cosine similarity per prompt against its pair's pooled patch
+    #    embedding. Normalize both, then dot.
+    img_norm = F.normalize(img_pool, dim=-1, eps=eps)    # (B, D)
+    text_norm = F.normalize(text_pool, dim=-1, eps=eps)  # (P, D)
+
+    pair_idx_per_prompt = pair_idx_per_finding.repeat_interleave(n_classes)
+    img_per_prompt = img_norm[pair_idx_per_prompt]       # (P, D)
+    cos_per_prompt = (img_per_prompt * text_norm).sum(dim=-1)  # (P,)
+
+    # 4. Reshape to (F_total, n_classes) and per-finding softmax-CE.
+    logits = cos_per_prompt.view(F_total, n_classes) / temperature
+    ce_per_finding = F.cross_entropy(
+        logits, silver_per_finding, reduction="none"
+    )  # (F_total,)
+
+    # 5. Aggregate: mean across findings within a pair, then mean across
+    #    pairs. The per-pair mean is the key step that prevents a pair
+    #    with N findings from contributing N times the gradient of a pair
+    #    with 1 finding.
+    per_pair_sum = torch.zeros(
+        batch_size, device=pred_patches.device, dtype=ce_per_finding.dtype
+    )
+    per_pair_count = torch.zeros(
+        batch_size, device=pred_patches.device, dtype=ce_per_finding.dtype
+    )
+    per_pair_sum.scatter_add_(0, pair_idx_per_finding, ce_per_finding)
+    per_pair_count.scatter_add_(
+        0, pair_idx_per_finding, torch.ones_like(ce_per_finding)
+    )
+
+    valid = per_pair_count > 0
+    if not valid.any():
+        return pred_patches.new_zeros(())
+    per_pair_mean = per_pair_sum[valid] / per_pair_count[valid]
+    return per_pair_mean.mean()
+
+
+# =========================================================
 # MLM LOSS (CROSS ENTROPY)
 # =========================================================
 def mlm_loss(

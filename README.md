@@ -4,8 +4,11 @@ I-JEPA-style temporal chest X-ray model. Predicts current-image patch
 features from prior-image patch features conditioned on a textual
 description of the change. The text condition can come from one of two
 sources (see "Condition modes" below): the joined "dynamic" sentences
-of the current study, or per-finding templated clauses of the form
-`"{finding} is {progression}"` built from `silver_findings.parquet`.
+of the current study (the default), or per-finding templated clauses
+of the form `"{finding} is {progression}"` built from
+`silver_findings.parquet`. A 4th progression-classification loss
+supervises `ẑ_cur` to be 5-way discriminable per finding regardless of
+which condition mode is used.
 
 ## Architecture
 
@@ -14,6 +17,10 @@ Prior CXR  ──►  E (online, trained)         ──►  LN(z_prior) ──�
                                                                  ├──►  Predictor  ──►  ẑ_cur = LN(z_prior) + Δz
 Condition  ──►  text_encoder                ──►  τ_cond      ──┘
 Current CXR──►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
+
+   [progression loss only — no extra forward pass through the predictor]
+   "{finding} is {cls}." prompts ──► text_encoder ──► τ_{f,c}
+   pooled(ẑ_cur) · pooled(τ_{f,c})   ──► 5-way softmax-CE per finding
 ```
 
 Losses:
@@ -23,6 +30,14 @@ Losses:
   Computed in fp32 inside the autocast region.
 - **GLoRIA local contrastive** on `(LN(z_prior), prior_report)`.
 - **GLoRIA local contrastive** on `(ẑ_cur, current_report)`.
+- **Progression classification CE** — for every (pair, finding) row of
+  `silver_findings.parquet`, encode the 5 templated prompts
+  `"{Finding} is {cls}."` (one per `CLS_ORDER` class), mean-pool both
+  `ẑ_cur` and the prompt tokens, take cosine, softmax-CE on the silver
+  class. The per-finding losses are **averaged per pair** before the
+  batch mean, so a pair with 4 findings doesn't contribute 4× the
+  gradient of a pair with 1 finding. See
+  `losses.progression_classification_loss`.
 
 The image encoder is a shared BioViL-T (ResNet50 + multi-image
 transformer); the prior path receives gradients while the current path
@@ -40,7 +55,7 @@ cxr-temporal-model/
 ├── dataset_combined.py         # base image transforms + augmentation helpers
 ├── dataset_combined_jepa.py    # JEPA dataset (silver corpus, paired)
 ├── progression_phrases.py      # shared CLS_ORDER / phrase bank / label maps
-├── losses.py                   # local_contrastive_loss (GLoRIA)
+├── losses.py                   # local_contrastive_loss (GLoRIA) + progression_classification_loss
 ├── losses_jepa.py              # JEPA Smooth L1
 ├── resume_train_jepa.py        # JEPA DDP training entry (invoked via torchrun)
 ├── run_jepa.py                 # direct launcher (auto-detects GPUs, no SLURM needed)
@@ -202,9 +217,12 @@ python smoke_test_dataset.py --load-images   # also call __getitem__
 `python -m tempcxr.modules.jepa` validates:
 
 - The shared image encoder + EMA target encoder are wired correctly.
-- The text encoder forwards three reports (prior / current / condition).
+- The text encoder forwards three reports (prior / current / condition)
+  plus the flat list of progression-loss class prompts.
 - The predictor produces patch-shape outputs.
-- All three losses are finite and `total.backward()` succeeds.
+- All four losses (JEPA Smooth L1, prior contrastive, current
+  contrastive, progression CE) are finite and `total.backward()`
+  succeeds.
 - `update_ema(momentum)` runs without error.
 
 ## Training
@@ -239,18 +257,17 @@ via `JEPACombinedDataset(condition_mode=...)`. Two modes are supported:
 
 | Mode        | Source                                                          | Per-sample text                                                              |
 |-------------|-----------------------------------------------------------------|------------------------------------------------------------------------------|
-| `templated` (current default) | Per-finding rows of `silver_findings.parquet` for the study pair | `"{Finding1} is {prog1}. {Finding2} is {prog2}."` (capitalized, period-terminated) |
-| `dynamic`   | All `label == "dynamic"` sentences for the current study, joined | Free-text MedGemma extraction (older behavior, kept for ablation)            |
+| `dynamic` (default) | All `label == "dynamic"` sentences for the current study, joined | Free-text change description ("Right pleural effusion has increased…") |
+| `templated`         | Per-finding rows of `silver_findings.parquet` for the study pair | `"{Finding1} is {prog1}. {Finding2} is {prog2}."` (capitalized, period-terminated, shuffled per-call at train time) |
 
-In `templated` mode every (study pair, finding) row of `silver_findings`
-is grouped under its study pair; the `(finding, progression)` list is
-formatted with the canonical class names from
-`progression_phrases.CLS_ORDER` (`improving` / `stable` / `worsening` /
-`new` / `resolved`), each clause is capitalized and terminated with a
-period, and the order is shuffled at every `__getitem__` call when
-`train=True` so the predictor doesn't learn position-dependent
-shortcuts. For `train=False` the order is sorted alphabetically by
-finding name, which keeps the val Smooth L1 stable across epochs.
+Regardless of `condition_mode`, every dataset row also exposes
+`findings: list[str]` and `progression_cls_idx: list[int]` (indices
+into `CLS_ORDER`), which are what the **4th progression loss**
+consumes — that loss builds its own per-finding class prompts
+`"{Finding} is {cls}."` independently of the predictor's text
+condition. In other words, the predictor sees one text condition per
+pair; the progression-loss head sees a `(finding × class)`-grid of
+prompts on top.
 
 The mode is selected via the `CONDITION_MODE` env var on the training
 side and via `--condition-mode` (or `CONDITION_MODE`) on the eval side.
@@ -260,20 +277,20 @@ The two modes write to independent default checkpoint / log dirs
 other mode's checkpoints.
 
 ```bash
-# current default: templated finding + progression sentences
+# current default: dynamic sentences as the predictor's text condition
 python run_jepa.py
-# → writes to checkpoints_jepa_templated/ and logs_templated/
-
-# older baseline: dynamic sentences (opt in via the env var)
-CONDITION_MODE=dynamic python run_jepa.py
 # → writes to checkpoints_jepa/ and logs/
 
-# evaluate the templated checkpoint (matches the default)
-JEPA_CKPT=checkpoints_jepa_templated/best.pt python eval_jepa_val.py
+# templated finding + progression sentences (opt in via the env var)
+CONDITION_MODE=templated python run_jepa.py
+# → writes to checkpoints_jepa_templated/ and logs_templated/
 
-# evaluate a dynamic-mode checkpoint
-CONDITION_MODE=dynamic \
-    JEPA_CKPT=checkpoints_jepa/best.pt \
+# evaluate the dynamic-mode checkpoint (matches the default)
+JEPA_CKPT=checkpoints_jepa/best.pt python eval_jepa_val.py
+
+# evaluate a templated-mode checkpoint
+CONDITION_MODE=templated \
+    JEPA_CKPT=checkpoints_jepa_templated/best.pt \
     python eval_jepa_val.py
 ```
 
@@ -289,10 +306,10 @@ single-finding prompts at score time.
 
 | Component                    | Gradient? |
 |------------------------------|-----------|
-| online image encoder         | yes (via prior path + report loss) |
+| online image encoder         | yes (via prior path + report loss + progression loss) |
 | target image encoder (EMA)   | no — updated via EMA, used under stop-gradient |
-| text encoder                 | yes (via report losses + predictor's condition text) |
-| predictor                    | yes (via JEPA + report-on-pred losses) |
+| text encoder                 | yes (via report losses + predictor's condition text + progression class prompts) |
+| predictor                    | yes (via JEPA + report-on-pred + progression losses) |
 
 ### EMA target encoder
 
@@ -329,8 +346,44 @@ Following I-JEPA's recipe rather than BioViL-T's CLIP-style recipe:
 ### Loss reuse
 
 The JEPA pipeline does not duplicate `local_contrastive_loss`. It is
-defined once in `losses.py` and imported by the JEPA model and training
-script. Only the new JEPA loss lives in `losses_jepa.py`.
+defined once in `losses.py` alongside `progression_classification_loss`
+and imported by the JEPA model and training script. Only the JEPA
+Smooth L1 loss lives in `losses_jepa.py`.
+
+### Progression loss in more detail
+
+The 4th loss is built to mirror — at training time — the per-finding
+inference rule that `progression_classify.py` uses to score gold pairs.
+The key design choices:
+
+- **One predictor forward per pair.** The predictor sees only the
+  pair's `condition_text` (dynamic report or templated string,
+  depending on mode). The 5 class prompts are encoded by the text
+  encoder *separately* and never fed to the predictor. This keeps the
+  per-pair compute essentially the same as before; the only extra
+  work is one text-encoder pass on the flat prompt list per batch.
+- **Per-finding, not per-pair.** For each (pair, finding) row in the
+  silver findings table, the 5-way softmax is computed independently.
+  This matches the silver supervision signal (per-finding class
+  labels) and matches the eval rule (per-finding argmax).
+- **Mean over findings per pair → mean over batch.** A pair with 4
+  findings does *not* contribute 4× the gradient of a pair with 1
+  finding. The within-pair mean of per-finding CEs is what enters the
+  batch mean, so each pair contributes equally regardless of how many
+  findings it mentions.
+- **Mean-pooled cosine, not GLoRIA log-sum-exp.** The scoring is a
+  simple mean-pooled cosine between `ẑ_cur` and each class prompt.
+  Cosine in `[-1, 1]` is well-behaved for a 5-way softmax under a
+  fixed temperature (default `τ = 0.1`). The GLoRIA log-sum-exp
+  scoring used by the contrastive losses is calibrated for batch-
+  contrastive InfoNCE and has an awkwardly wide dynamic range when
+  reused as a 5-class softmax logit.
+- **Single canonical phrase per class, no synonyms.** The prompts use
+  `CLS_ORDER` class names directly (`"Pneumonia is improving."`,
+  `"Pneumonia is stable."`, …). The legacy multi-phrase synonym bank
+  in `progression_phrases.PROGRESSION_PHRASES` is left untouched but
+  unused by this loss; it still drives eval-time prompt ensembling in
+  the existing inference scripts.
 
 ## Inference
 

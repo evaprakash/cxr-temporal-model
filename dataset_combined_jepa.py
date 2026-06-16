@@ -38,7 +38,9 @@ from dataset_combined import (
     apply_augmentation,
     sample_augmentation,
 )
-from progression_phrases import SILVER_TO_CLS
+from progression_phrases import CLS_ORDER, SILVER_TO_CLS
+
+CLS_TO_IDX = {cls: i for i, cls in enumerate(CLS_ORDER)}
 
 
 # ============================================================
@@ -252,13 +254,17 @@ class JEPACombinedDataset(Dataset):
         Where to read/write the cached split assignments. Defaults to
         ``./splits_jepa.csv`` next to this file.
     condition_mode
-        Which text condition to feed the predictor. ``"templated"`` (the
-        current default) returns the capitalized per-finding clauses
+        Which text condition to feed the predictor. ``"dynamic"`` (the
+        default) returns the joined ``label=="dynamic"`` sentences from
+        ``silver_sentences.parquet``. ``"templated"`` returns the
+        capitalized per-finding clauses
         ``"{Finding} is {progression_class}."`` built from
-        ``silver_findings.parquet``. ``"dynamic"`` returns the joined
-        dynamic sentences from ``silver_sentences.parquet`` (the older
-        behavior). Both modes carry the same set of study-pair rows
-        under the hood — only the value of ``condition_text`` differs.
+        ``silver_findings.parquet``. Both modes carry the same set of
+        study-pair rows under the hood — only the value of
+        ``condition_text`` differs. Regardless of mode, every sample
+        also exposes the per-pair ``findings`` and
+        ``progression_cls_idx`` lists, which the 4th progression-loss
+        head consumes during training.
     """
 
     def __init__(
@@ -272,7 +278,7 @@ class JEPACombinedDataset(Dataset):
         val_fraction: float = 0.1,
         split_seed: int = 42,
         splits_file: Optional[str] = None,
-        condition_mode: str = "templated",
+        condition_mode: str = "dynamic",
     ):
         if condition_mode not in CONDITION_MODES:
             raise ValueError(
@@ -468,6 +474,16 @@ class JEPACombinedDataset(Dataset):
         else:  # "templated" — validated in __init__
             condition_text = self._build_templated_condition(row)
 
+        # The per-pair finding list and matching silver progression class
+        # are surfaced unconditionally so the 4th progression-loss head
+        # can score ẑ_cur per finding regardless of condition_mode.
+        # ``progression_cls_idx`` is the integer index into CLS_ORDER (0–4)
+        # so the training loop never has to re-map class names to ints.
+        findings = [str(f) for f in row["finding"]]
+        progression_cls_idx = [
+            CLS_TO_IDX[str(c)] for c in row["progression_cls"]
+        ]
+
         return {
             "prior_image": prior_img,
             "current_image": curr_img,
@@ -475,6 +491,8 @@ class JEPACombinedDataset(Dataset):
             "current_report": row["current_report"],
             "condition_text": condition_text,
             "dataset": dataset,
+            "findings": findings,
+            "progression_cls_idx": progression_cls_idx,
         }
 
 
@@ -484,7 +502,12 @@ class JEPACombinedDataset(Dataset):
 def jepa_collate_fn(batch):
     """
     Stack paired images; keep texts as lists of strings (the BioViL-T
-    text encoder tokenizes inside `forward_contrastive`).
+    text encoder tokenizes inside `forward_contrastive`). The ragged
+    per-pair ``findings`` and ``progression_cls_idx`` lists are kept as
+    nested Python lists rather than padded into a tensor — the trainer
+    flattens them when building the prompt batch for the progression
+    loss, so a tensor of variable shape per pair would just add a
+    pad/unpad step.
     """
     return {
         "prior_image": torch.stack([b["prior_image"] for b in batch]),
@@ -493,6 +516,8 @@ def jepa_collate_fn(batch):
         "current_report": [b["current_report"] for b in batch],
         "condition_text": [b["condition_text"] for b in batch],
         "dataset": [b["dataset"] for b in batch],
+        "findings": [b["findings"] for b in batch],
+        "progression_cls_idx": [b["progression_cls_idx"] for b in batch],
     }
 
 
@@ -515,7 +540,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--condition-mode",
         choices=list(CONDITION_MODES),
-        default="templated",
+        default="dynamic",
         help="Which text condition to surface in the smoke test.",
     )
     args = parser.parse_args()
