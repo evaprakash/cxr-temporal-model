@@ -13,8 +13,18 @@ Architecture (matches the slide-deck diagram):
     Current CXR─►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
 
     [progression loss only]
-    "{finding} is {cls}." prompts ──► text_encoder ──► τ_class
+    "{finding} is {cls}." prompts ──► text_encoder (stop-grad) ──► τ_class
     ẑ_cur  ↔  τ_class            ── per-finding 5-way softmax-CE
+
+The class prompts are encoded under ``torch.no_grad()`` and detached
+before leaving ``forward``. The progression loss therefore only updates
+the *image side* (predictor + online image encoder); the text encoder
+itself learns word semantics from the report contrastive losses, exactly
+how a CLIP zero-shot classification head treats its class prompts.
+Structurally this mirrors the EMA target encoder's stop-grad on
+``z_cur``: the thing being scored against is fixed at each step so the
+prediction side has to do real work (and the loss can't collapse by
+co-adapting the prompt embeddings to whatever the predictor outputs).
 
 The "condition" text is built upstream by the dataset and can be either
 the joined dynamic sentences (``condition_mode="dynamic"``, the default)
@@ -273,11 +283,14 @@ class TempCXRJEPA(nn.Module):
                            progression-classification loss, in finding-
                            major order (see
                            ``losses.progression_classification_loss``).
-                           When provided, the text encoder runs once on
-                           the prompts inside this forward so DDP can
-                           see the gradient path. Pass ``None`` (or an
-                           empty list) to skip — the prog-loss caller
-                           is expected to short-circuit in that case.
+                           When provided, the text encoder runs on the
+                           prompts inside this forward under
+                           ``torch.no_grad()`` and the outputs are
+                           detached — gradients do NOT flow back to the
+                           text encoder through this path. Pass ``None``
+                           (or an empty list) to skip — the prog-loss
+                           caller is expected to short-circuit in that
+                           case.
 
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, with grad
@@ -290,8 +303,8 @@ class TempCXRJEPA(nn.Module):
           - current_token_mask       (B, T)
           - condition_txt_local      (B, T, D)
           - condition_token_mask     (B, T)
-          - class_prompts_local      (P, T_p, D) or None
-          - class_prompts_mask       (P, T_p)     or None
+          - class_prompts_local      (P, T_p, D) or None — detached
+          - class_prompts_mask       (P, T_p)     or None — detached
         """
 
         # ---- Online encoder on prior (gradients flow) ----
@@ -330,15 +343,29 @@ class TempCXRJEPA(nn.Module):
         )
 
         # ---- Optional class-prompt encoding (progression loss) ----
-        # Kept as a separate text-encoder call rather than concatenated
-        # with the reports above so the report batch padding stays
-        # short. Class prompts are ~5 tokens each; reports are 100s.
-        # Concatenating would pad every report to the report length and
-        # blow up memory.
+        # Class prompts are eval-time templates used to score ẑ_cur
+        # against the 5 progression classes. We encode them under
+        # torch.no_grad() and detach before returning so the prog loss
+        # only updates the image side (predictor + online image
+        # encoder); the text encoder learns word semantics from the
+        # report contrastive losses, never from the progression loss.
+        # Structurally this is the stop-grad analog of the EMA target
+        # ``z_cur`` above — the target/template side of each loss is
+        # fixed-at-this-step so the prediction side has to do real
+        # work and can't collapse by co-adapting both sides.
+        #
+        # The class-prompt forward is also kept separate from the
+        # reports concat above so the report batch padding stays short
+        # (~5 tokens vs ~100s).
         if class_prompts is not None and len(class_prompts) > 0:
-            _, class_prompts_local, class_prompts_mask = (
-                self.text_encoder.forward_contrastive(list(class_prompts))
-            )
+            with torch.no_grad():
+                _, class_prompts_local, class_prompts_mask = (
+                    self.text_encoder.forward_contrastive(
+                        list(class_prompts)
+                    )
+                )
+            class_prompts_local = class_prompts_local.detach()
+            class_prompts_mask = class_prompts_mask.detach()
         else:
             class_prompts_local = None
             class_prompts_mask = None

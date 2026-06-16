@@ -19,7 +19,7 @@ Condition  ──►  text_encoder                ──►  τ_cond      ──
 Current CXR──►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
 
    [progression loss only — no extra forward pass through the predictor]
-   "{finding} is {cls}." prompts ──► text_encoder ──► τ_{f,c}
+   "{finding} is {cls}." prompts ──► text_encoder (stop-grad) ──► τ_{f,c}
    pooled(ẑ_cur) · pooled(τ_{f,c})   ──► 5-way softmax-CE per finding
 ```
 
@@ -32,12 +32,15 @@ Losses:
 - **GLoRIA local contrastive** on `(ẑ_cur, current_report)`.
 - **Progression classification CE** — for every (pair, finding) row of
   `silver_findings.parquet`, encode the 5 templated prompts
-  `"{Finding} is {cls}."` (one per `CLS_ORDER` class), mean-pool both
-  `ẑ_cur` and the prompt tokens, take cosine, softmax-CE on the silver
-  class. The per-finding losses are **averaged per pair** before the
-  batch mean, so a pair with 4 findings doesn't contribute 4× the
-  gradient of a pair with 1 finding. See
-  `losses.progression_classification_loss`.
+  `"{Finding} is {cls}."` (one per `CLS_ORDER` class) **under
+  stop-gradient**, mean-pool both `ẑ_cur` and the prompt tokens, take
+  cosine, softmax-CE on the silver class. The per-finding losses are
+  **averaged per pair** before the batch mean, so a pair with 4
+  findings doesn't contribute 4× the gradient of a pair with 1 finding.
+  Gradients flow only into the predictor + online image encoder — the
+  text encoder's class-prompt embeddings are *fixed at each step*
+  (CLIP-zero-shot style), structurally mirroring the EMA stop-grad on
+  `z_cur`. See `losses.progression_classification_loss`.
 
 The image encoder is a shared BioViL-T (ResNet50 + multi-image
 transformer); the prior path receives gradients while the current path
@@ -308,7 +311,7 @@ single-finding prompts at score time.
 |------------------------------|-----------|
 | online image encoder         | yes (via prior path + report loss + progression loss) |
 | target image encoder (EMA)   | no — updated via EMA, used under stop-gradient |
-| text encoder                 | yes (via report losses + predictor's condition text + progression class prompts) |
+| text encoder                 | yes (via report losses + predictor's condition text) — **no** gradient from the progression loss; class prompts are encoded under stop-gradient |
 | predictor                    | yes (via JEPA + report-on-pred + progression losses) |
 
 ### EMA target encoder
@@ -362,6 +365,18 @@ The key design choices:
   encoder *separately* and never fed to the predictor. This keeps the
   per-pair compute essentially the same as before; the only extra
   work is one text-encoder pass on the flat prompt list per batch.
+- **Stop-gradient on the class prompts.** The class-prompt text
+  encoding runs under `torch.no_grad()` and the outputs are detached
+  before reaching the loss. The progression loss therefore updates
+  only the image side (predictor + online image encoder); the text
+  encoder learns progression-word semantics from the report
+  contrastive losses, never from the progression head. This is the
+  CLIP-zero-shot pattern — fixed class prototypes at score time —
+  and the structural mirror of the EMA stop-grad on `z_cur`. It also
+  cuts the dominant activation cost of the new loss path (BERT
+  layer activations no longer need to be kept for backward through
+  the class-prompt forward), so the existing batch size fits without
+  changes.
 - **Per-finding, not per-pair.** For each (pair, finding) row in the
   silver findings table, the 5-way softmax is computed independently.
   This matches the silver supervision signal (per-finding class
