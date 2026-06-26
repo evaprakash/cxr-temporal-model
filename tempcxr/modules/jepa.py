@@ -1,9 +1,8 @@
 """TempCXR-JEPA model: forward orchestration only.
 
 The ``forward`` returns a dict of representations and lets the training
-script compute losses externally (using ``losses.local_contrastive_loss``,
-``losses.progression_classification_loss``, and
-``losses_jepa.jepa_cosine_loss``).
+script compute losses externally (using ``losses.local_contrastive_loss``
+and ``losses_jepa.jepa_cosine_loss``).
 
 Architecture (unit-sphere variant):
 
@@ -11,10 +10,6 @@ Architecture (unit-sphere variant):
                                                                   ├──►  Predictor  ──►  ẑ_cur (L2-norm)
     Condition  ─►  text_encoder (L2-norm)        ──►  τ_cond  ──┘
     Current CXR─►  E_target (EMA, stop-grad, L2) ──►  z_cur
-
-    [progression loss only]
-    "{finding} is {cls}." prompts ──► text_encoder (stop-grad) ──► τ_class
-    ẑ_cur  ↔  τ_class            ── per-finding 5-way softmax-CE
 
 Every encoder output lives on the unit sphere (L2-norm along the feature
 dim is applied inside the image and text encoders). The predictor takes
@@ -28,16 +23,6 @@ That keeps "do nothing" (Δz = 0) as the free default — a near-zero delta
 gives ẑ_cur ≈ prior on the sphere — while letting every loss read the
 same unit-norm features without further scaling.
 
-The class prompts are encoded under ``torch.no_grad()`` and detached
-before leaving ``forward``. The progression loss therefore only updates
-the *image side* (predictor + online image encoder); the text encoder
-itself learns word semantics from the report contrastive losses, exactly
-how a CLIP zero-shot classification head treats its class prompts.
-Structurally this mirrors the EMA target encoder's stop-grad on
-``z_cur``: the thing being scored against is fixed at each step so the
-prediction side has to do real work (and the loss can't collapse by
-co-adapting the prompt embeddings to whatever the predictor outputs).
-
 The "condition" text is built upstream by the dataset and can be either
 the joined dynamic sentences (``condition_mode="dynamic"``, the default)
 or the per-finding templated string ``"{finding} is {progression}"``
@@ -48,10 +33,6 @@ Losses (computed by the caller):
     - JEPA cosine                   : 1 − cos(ẑ_cur, stop-grad z_cur)
     - GLoRIA local contrastive      : z_prior ↔ τ_prior
     - GLoRIA local contrastive      : ẑ_cur ↔ τ_current
-    - Progression classification    : per-finding 5-way softmax-CE on
-                                      cos(ẑ_cur, τ_{finding-is-class})
-                                      using silver progression labels
-                                      (see ``losses.progression_classification_loss``).
 """
 
 import copy
@@ -73,7 +54,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from .image_encoder_jepa import BioViLTImageEncoderJEPA
 from .text_encoder import BioViLTTextEncoder
 
-from losses import local_contrastive_loss, progression_classification_loss
+from losses import local_contrastive_loss
 from losses_jepa import jepa_cosine_loss
 
 
@@ -279,7 +260,6 @@ class TempCXRJEPA(nn.Module):
         prior_reports,
         current_reports,
         condition_texts,
-        class_prompts=None,
     ):
         """
         prior_imgs       : (B, 3, H, W)
@@ -293,19 +273,6 @@ class TempCXRJEPA(nn.Module):
                            per-finding ``"{finding} is {progression}"``
                            string (``"templated"``). The model treats
                            it as an opaque string either way.
-        class_prompts    : Optional[list[str]] — flat list of templated
-                           ``"{Finding} is {class}."`` prompts for the
-                           progression-classification loss, in finding-
-                           major order (see
-                           ``losses.progression_classification_loss``).
-                           When provided, the text encoder runs on the
-                           prompts inside this forward under
-                           ``torch.no_grad()`` and the outputs are
-                           detached — gradients do NOT flow back to the
-                           text encoder through this path. Pass ``None``
-                           (or an empty list) to skip — the prog-loss
-                           caller is expected to short-circuit in that
-                           case.
 
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, unit-norm,
@@ -321,9 +288,6 @@ class TempCXRJEPA(nn.Module):
           - current_token_mask       (B, T)
           - condition_txt_local      (B, T, D)  unit-norm
           - condition_token_mask     (B, T)
-          - class_prompts_local      (P, T_p, D) or None — unit-norm,
-                                                            detached
-          - class_prompts_mask       (P, T_p)     or None — detached
         """
 
         # ---- Online encoder on prior (gradients flow) ----
@@ -353,34 +317,6 @@ class TempCXRJEPA(nn.Module):
             all_token_mask[2 * B:],
         )
 
-        # ---- Optional class-prompt encoding (progression loss) ----
-        # Class prompts are eval-time templates used to score ẑ_cur
-        # against the 5 progression classes. We encode them under
-        # torch.no_grad() and detach before returning so the prog loss
-        # only updates the image side (predictor + online image
-        # encoder); the text encoder learns word semantics from the
-        # report contrastive losses, never from the progression loss.
-        # Structurally this is the stop-grad analog of the EMA target
-        # ``z_cur`` above — the target/template side of each loss is
-        # fixed-at-this-step so the prediction side has to do real
-        # work and can't collapse by co-adapting both sides.
-        #
-        # The class-prompt forward is also kept separate from the
-        # reports concat above so the report batch padding stays short
-        # (~5 tokens vs ~100s).
-        if class_prompts is not None and len(class_prompts) > 0:
-            with torch.no_grad():
-                _, class_prompts_local, class_prompts_mask = (
-                    self.text_encoder.forward_contrastive(
-                        list(class_prompts)
-                    )
-                )
-            class_prompts_local = class_prompts_local.detach()
-            class_prompts_mask = class_prompts_mask.detach()
-        else:
-            class_prompts_local = None
-            class_prompts_mask = None
-
         # ---- Target encoder on current image: stop-gradient ----
         # The target encoder is a frozen EMA copy of the online encoder
         # and inherits the same L2-norm at its output, so the target
@@ -407,8 +343,6 @@ class TempCXRJEPA(nn.Module):
             "current_token_mask": current_token_mask,
             "condition_txt_local": condition_txt_local,
             "condition_token_mask": condition_token_mask,
-            "class_prompts_local": class_prompts_local,
-            "class_prompts_mask": class_prompts_mask,
         }
 
     # --------------------------------------------------
@@ -450,38 +384,12 @@ if __name__ == "__main__":
         "pneumonia is getting better",
     ]
 
-    # Per-pair (finding, silver-class) lists for the progression loss.
-    pair_findings = [
-        ["pleural effusion"],
-        ["pneumonia", "atelectasis"],
-    ]
-    pair_silver_cls = [
-        [2],         # pleural effusion → worsening (CLS_ORDER idx 2)
-        [0, 1],      # pneumonia → improving (0); atelectasis → stable (1)
-    ]
-
-    # Flatten into the finding-major prompt order the loss expects.
-    n_classes = 5
-    cls_names = ["improving", "stable", "worsening", "new", "resolved"]
-    class_prompts = []
-    pair_idx_per_finding = []
-    silver_per_finding = []
-    for pair_i, (fs, scs) in enumerate(zip(pair_findings, pair_silver_cls)):
-        for finding, silver in zip(fs, scs):
-            for cls in cls_names:
-                class_prompts.append(
-                    f"{finding[:1].upper()}{finding[1:]} is {cls}."
-                )
-            pair_idx_per_finding.append(pair_i)
-            silver_per_finding.append(silver)
-
     out = model(
         prior_imgs,
         current_imgs,
         prior_reports,
         current_reports,
         condition_texts,
-        class_prompts=class_prompts,
     )
 
     # --------------------------------------------------
@@ -504,21 +412,7 @@ if __name__ == "__main__":
         out["current_token_mask"],
     )
 
-    prog_loss = progression_classification_loss(
-        pred_patches=out["pred_current_patches"],
-        class_prompts_local=out["class_prompts_local"],
-        class_prompts_mask=out["class_prompts_mask"],
-        pair_idx_per_finding=torch.tensor(
-            pair_idx_per_finding, device=device, dtype=torch.long
-        ),
-        silver_per_finding=torch.tensor(
-            silver_per_finding, device=device, dtype=torch.long
-        ),
-        batch_size=B,
-        n_classes=n_classes,
-    )
-
-    total = jepa_loss + 0.1 * prior_loss + 0.1 * pred_loss + 0.1 * prog_loss
+    total = jepa_loss + 0.1 * prior_loss + 0.1 * pred_loss
 
     # --------------------------------------------------
     # Print
@@ -526,12 +420,10 @@ if __name__ == "__main__":
     print("prior_patches:", tuple(out["prior_patches"].shape))
     print("pred_current_patches:", tuple(out["pred_current_patches"].shape))
     print("current_patches_target:", tuple(out["current_patches_target"].shape))
-    print("class_prompts_local:", tuple(out["class_prompts_local"].shape))
     print()
     print("JEPA cosine:", jepa_loss.item())
     print("Report (z_prior):", prior_loss.item())
     print("Report (ẑ_cur):", pred_loss.item())
-    print("Progression CE:", prog_loss.item())
     print("Total:", total.item())
 
     total.backward()

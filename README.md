@@ -6,9 +6,7 @@ description of the change. The text condition can come from one of two
 sources (see "Condition modes" below): the joined "dynamic" sentences
 of the current study (the default), or per-finding templated clauses
 of the form `"{finding} is {progression}"` built from
-`silver_findings.parquet`. A 4th progression-classification loss
-supervises `ẑ_cur` to be 5-way discriminable per finding regardless of
-which condition mode is used.
+`silver_findings.parquet`.
 
 ## Architecture
 
@@ -23,10 +21,6 @@ Prior CXR  ──►  E (online, trained, L2-norm)  ──►  z_prior ──┐
                                                               ├──►  Predictor  ──►  ẑ_cur = normalize(z_prior + Δz)
 Condition  ──►  text_encoder (L2-norm)        ──►  τ_cond  ──┘
 Current CXR──►  E_target (EMA, stop-grad, L2) ──►  z_cur
-
-   [progression loss only — no extra forward pass through the predictor]
-   "{finding} is {cls}." prompts ──► text_encoder (stop-grad) ──► τ_{f,c}
-   pooled(ẑ_cur) · pooled(τ_{f,c})   ──► 5-way softmax-CE per finding
 ```
 
 Losses:
@@ -37,17 +31,6 @@ Losses:
   Computed in fp32 inside the autocast region.
 - **GLoRIA local contrastive** on `(z_prior, prior_report)`.
 - **GLoRIA local contrastive** on `(ẑ_cur, current_report)`.
-- **Progression classification CE** — for every (pair, finding) row of
-  `silver_findings.parquet`, encode the 5 templated prompts
-  `"{Finding} is {cls}."` (one per `CLS_ORDER` class) **under
-  stop-gradient**, mean-pool both `ẑ_cur` and the prompt tokens, take
-  cosine, softmax-CE on the silver class. The per-finding losses are
-  **averaged per pair** before the batch mean, so a pair with 4
-  findings doesn't contribute 4× the gradient of a pair with 1 finding.
-  Gradients flow only into the predictor + online image encoder — the
-  text encoder's class-prompt embeddings are *fixed at each step*
-  (CLIP-zero-shot style), structurally mirroring the EMA stop-grad on
-  `z_cur`. See `losses.progression_classification_loss`.
 
 The image encoder is a shared BioViL-T (ResNet50 + multi-image
 transformer) whose built-in `joint_feature_size=128` head projects to
@@ -72,7 +55,7 @@ cxr-temporal-model/
 ├── dataset_combined.py         # base image transforms + augmentation helpers
 ├── dataset_combined_jepa.py    # JEPA dataset (silver corpus, paired)
 ├── progression_phrases.py      # shared CLS_ORDER / phrase bank / label maps
-├── losses.py                   # local_contrastive_loss (GLoRIA) + progression_classification_loss
+├── losses.py                   # local_contrastive_loss (GLoRIA)
 ├── losses_jepa.py              # JEPA cosine loss
 ├── resume_train_jepa.py        # JEPA DDP training entry (invoked via torchrun)
 ├── run_jepa.py                 # direct launcher (auto-detects GPUs, no SLURM needed)
@@ -235,11 +218,9 @@ python smoke_test_dataset.py --load-images   # also call __getitem__
 
 - The shared image encoder + EMA target encoder are wired correctly.
 - The text encoder forwards three reports (prior / current / condition)
-  plus the flat list of progression-loss class prompts.
 - The predictor produces patch-shape outputs.
-- All four losses (JEPA cosine, prior contrastive, current
-  contrastive, progression CE) are finite and `total.backward()`
-  succeeds.
+- All three losses (JEPA cosine, prior contrastive, current
+  contrastive) are finite and `total.backward()` succeeds.
 - `update_ema(momentum)` runs without error.
 
 ## Training
@@ -279,12 +260,12 @@ via `JEPACombinedDataset(condition_mode=...)`. Two modes are supported:
 
 Regardless of `condition_mode`, every dataset row also exposes
 `findings: list[str]` and `progression_cls_idx: list[int]` (indices
-into `CLS_ORDER`), which are what the **4th progression loss**
-consumes — that loss builds its own per-finding class prompts
-`"{Finding} is {cls}."` independently of the predictor's text
-condition. In other words, the predictor sees one text condition per
-pair; the progression-loss head sees a `(finding × class)`-grid of
-prompts on top.
+into `CLS_ORDER`) — these are not consumed by the training loop on
+`main` but are kept on the dataset so the eval-time progression
+classifiers (`progression_classify.py`, `eval_mscxrt.py`, `eval_cig.py`)
+and the templated condition mode have access to them. Per-finding
+progression supervision as a training loss lives on the
+`progression-loss` branch.
 
 The mode is selected via the `CONDITION_MODE` env var on the training
 side and via `--condition-mode` (or `CONDITION_MODE`) on the eval side.
@@ -323,10 +304,10 @@ single-finding prompts at score time.
 
 | Component                    | Gradient? |
 |------------------------------|-----------|
-| online image encoder         | yes (via prior path + report loss + progression loss) |
+| online image encoder         | yes (via prior path + report losses) |
 | target image encoder (EMA)   | no — updated via EMA, used under stop-gradient |
-| text encoder                 | yes (via report losses + predictor's condition text) — **no** gradient from the progression loss; class prompts are encoded under stop-gradient |
-| predictor                    | yes (via JEPA + report-on-pred + progression losses) |
+| text encoder                 | yes (via report losses + predictor's condition text) |
+| predictor                    | yes (via JEPA cosine + report-on-pred losses) |
 
 ### EMA target encoder
 
@@ -358,10 +339,10 @@ Everything in the JEPA path lives on the unit sphere:
   normalize(prior + Δz)`.
 - The JEPA loss is `1 - cos(ẑ_cur, z_cur)`, a directional loss
   consistent with the geometry.
-- The downstream contrastive losses (`local_contrastive_loss`) and the
-  progression loss re-L2-normalize their inputs defensively — that's a
-  no-op on already-unit-norm inputs but keeps the losses correct if
-  used standalone.
+- The downstream contrastive losses (`local_contrastive_loss`)
+  re-L2-normalize their inputs defensively — that's a no-op on
+  already-unit-norm inputs but keeps the loss correct if used
+  standalone.
 
 There are no extra `proj_clip` / `proj_jepa` / `target_proj_jepa`
 heads on top of either encoder. The image encoder's built-in
@@ -372,56 +353,18 @@ features into the joint 128-d space.
 ### Loss reuse
 
 The JEPA pipeline does not duplicate `local_contrastive_loss`. It is
-defined once in `losses.py` alongside `progression_classification_loss`
-and imported by the JEPA model and training script. Only the JEPA
-cosine loss lives in `losses_jepa.py`.
+defined once in `losses.py` and imported by the JEPA model and
+training script. Only the JEPA cosine loss lives in `losses_jepa.py`.
 
-### Progression loss in more detail
+### Branches
 
-The 4th loss is built to mirror — at training time — the per-finding
-inference rule that `progression_classify.py` uses to score gold pairs.
-The key design choices:
-
-- **One predictor forward per pair.** The predictor sees only the
-  pair's `condition_text` (dynamic report or templated string,
-  depending on mode). The 5 class prompts are encoded by the text
-  encoder *separately* and never fed to the predictor. This keeps the
-  per-pair compute essentially the same as before; the only extra
-  work is one text-encoder pass on the flat prompt list per batch.
-- **Stop-gradient on the class prompts.** The class-prompt text
-  encoding runs under `torch.no_grad()` and the outputs are detached
-  before reaching the loss. The progression loss therefore updates
-  only the image side (predictor + online image encoder); the text
-  encoder learns progression-word semantics from the report
-  contrastive losses, never from the progression head. This is the
-  CLIP-zero-shot pattern — fixed class prototypes at score time —
-  and the structural mirror of the EMA stop-grad on `z_cur`. It also
-  cuts the dominant activation cost of the new loss path (BERT
-  layer activations no longer need to be kept for backward through
-  the class-prompt forward), so the existing batch size fits without
-  changes.
-- **Per-finding, not per-pair.** For each (pair, finding) row in the
-  silver findings table, the 5-way softmax is computed independently.
-  This matches the silver supervision signal (per-finding class
-  labels) and matches the eval rule (per-finding argmax).
-- **Mean over findings per pair → mean over batch.** A pair with 4
-  findings does *not* contribute 4× the gradient of a pair with 1
-  finding. The within-pair mean of per-finding CEs is what enters the
-  batch mean, so each pair contributes equally regardless of how many
-  findings it mentions.
-- **Mean-pooled cosine, not GLoRIA log-sum-exp.** The scoring is a
-  simple mean-pooled cosine between `ẑ_cur` and each class prompt.
-  Cosine in `[-1, 1]` is well-behaved for a 5-way softmax under a
-  fixed temperature (default `τ = 0.1`). The GLoRIA log-sum-exp
-  scoring used by the contrastive losses is calibrated for batch-
-  contrastive InfoNCE and has an awkwardly wide dynamic range when
-  reused as a 5-class softmax logit.
-- **Single canonical phrase per class, no synonyms.** The prompts use
-  `CLS_ORDER` class names directly (`"Pneumonia is improving."`,
-  `"Pneumonia is stable."`, …). The legacy multi-phrase synonym bank
-  in `progression_phrases.PROGRESSION_PHRASES` is left untouched but
-  unused by this loss; it still drives eval-time prompt ensembling in
-  the existing inference scripts.
+- `main` (this branch): three-loss model — JEPA cosine + two GLoRIA
+  local contrastive losses — on the dynamic sentence condition by
+  default.
+- `progression-loss`: adds a 4th per-finding 5-way progression
+  classification loss on top of `main` (see that branch's README for
+  details). Kept around as a separate experiment; not the current
+  canonical training setup.
 
 ## Inference
 
