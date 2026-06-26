@@ -3,8 +3,8 @@
 # DDP training entry point for the JEPA-style temporal CXR model.
 #
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
-#   - Model:    TempCXRJEPA (online + EMA + predictor)
-#   - Losses:   JEPA Smooth L1
+#   - Model:    TempCXRJEPA (online + EMA + predictor) — unit-sphere
+#   - Losses:   JEPA cosine (1 - cos(ẑ_cur, z_cur))
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + per-finding 5-way progression CE on ẑ_cur ↔ class prompts
@@ -32,7 +32,7 @@ from tempcxr.modules.jepa import (
     EMA_END,
 )
 from losses import local_contrastive_loss, progression_classification_loss
-from losses_jepa import jepa_smooth_l1_loss
+from losses_jepa import jepa_cosine_loss
 
 
 # ============================================================
@@ -375,11 +375,11 @@ def compute_jepa_losses(out, gather: bool, prog_inputs):
     Returns: (total, jepa, prior, pred, prog) as scalar tensors.
     """
 
-    # JEPA loss is per-element MSE-style; cross-rank gathering doesn't
-    # add useful negatives, so we always compute it on local features.
-    # Cast to fp32 so bf16's low precision on small residuals doesn't
-    # bite once both pred and target are in LayerNorm scale.
-    jepa = jepa_smooth_l1_loss(
+    # JEPA loss is per-patch cosine; cross-rank gathering doesn't add
+    # useful negatives, so we always compute it on local features. Cast
+    # to fp32 so bf16's low precision on small (1 - cos) residuals doesn't
+    # round to zero late in training.
+    jepa = jepa_cosine_loss(
         out["pred_current_patches"].float(),
         out["current_patches_target"].float(),
     )

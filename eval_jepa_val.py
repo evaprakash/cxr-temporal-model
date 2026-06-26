@@ -5,16 +5,21 @@ averaged across the val set rather than reported for a single sample.
 
 What gets averaged
 ------------------
-JEPA Smooth L1 (predictor)
-    ``F.smooth_l1_loss(ẑ_cur, z_cur)`` averaged across val pairs. Should
-    closely match the ``val_jepa`` column in ``logs/val_metrics_jepa.csv``
-    at the resumed epoch (modulo augmentation differences — eval runs
-    without augmentation).
+JEPA cosine distance (predictor)
+    ``1 - cos(ẑ_cur, z_cur)`` averaged across patches and val pairs.
+    This is the unit-sphere training loss, so it should closely match
+    the ``val_jepa`` column in ``logs/val_metrics_jepa.csv`` at the
+    resumed epoch (modulo augmentation differences — eval runs without
+    augmentation).
 
-JEPA Smooth L1 (do-nothing)
-    Same loss but with ``ẑ_cur := LN(z_prior)`` (i.e., Δz = 0). The
-    "trivial" baseline. If the predictor's loss is below this, the
+JEPA cosine distance (do-nothing)
+    Same metric but with ``ẑ_cur := z_prior`` (i.e., Δz = 0). The
+    "trivial" baseline. If the predictor's distance is below this, the
     model genuinely beats "assume nothing changed" on average.
+
+JEPA Smooth L1 (diagnostic)
+    Kept for historical comparison with pre-unit-sphere runs. Monotone
+    in cosine distance on unit-norm vectors.
 
 Slide-deck cos(Δẑ, Δz_true)
     Per-sample cosine between predicted change and actual change,
@@ -118,6 +123,8 @@ def main():
     # Per-sample sums; divide by n at the end so each pair contributes equally
     # regardless of batch composition.
     sums = {
+        "cosine_dist_pred": 0.0,
+        "cosine_dist_naive": 0.0,
         "smooth_l1_pred": 0.0,
         "smooth_l1_naive": 0.0,
         "cos_delta": 0.0,
@@ -139,8 +146,16 @@ def main():
             z_prior = out["prior_patches"].float()             # (B, N, D)
             B = pred.size(0)
 
-            # Per-sample Smooth L1 (mean over the N*D feature axes so each
-            # sample contributes one number).
+            # Per-patch cosine, averaged over the 196 patches per sample.
+            cos_p = F.cosine_similarity(pred,    target, dim=-1).mean(dim=1)  # (B,)
+            cos_n = F.cosine_similarity(z_prior, target, dim=-1).mean(dim=1)  # (B,)
+
+            # Per-sample cosine distance (1 - cos), the training-time loss.
+            cos_dist_pred  = 1.0 - cos_p
+            cos_dist_naive = 1.0 - cos_n
+
+            # Smooth L1 kept as a diagnostic (monotone in cos distance on
+            # unit-norm vectors).
             l1_pred  = F.smooth_l1_loss(pred,    target, reduction="none").mean(dim=(1, 2))
             l1_naive = F.smooth_l1_loss(z_prior, target, reduction="none").mean(dim=(1, 2))
 
@@ -150,15 +165,13 @@ def main():
             dtrue = (target - z_prior).flatten(start_dim=1)
             cos_delta = F.cosine_similarity(dpred, dtrue, dim=1)  # (B,)
 
-            # Per-patch cosine, averaged over the 196 patches per sample.
-            cos_p = F.cosine_similarity(pred,    target, dim=-1).mean(dim=1)
-            cos_n = F.cosine_similarity(z_prior, target, dim=-1).mean(dim=1)
-
-            sums["smooth_l1_pred"]  += l1_pred.sum().item()
-            sums["smooth_l1_naive"] += l1_naive.sum().item()
-            sums["cos_delta"]       += cos_delta.sum().item()
-            sums["cos_patch_pred"]  += cos_p.sum().item()
-            sums["cos_patch_naive"] += cos_n.sum().item()
+            sums["cosine_dist_pred"]  += cos_dist_pred.sum().item()
+            sums["cosine_dist_naive"] += cos_dist_naive.sum().item()
+            sums["smooth_l1_pred"]    += l1_pred.sum().item()
+            sums["smooth_l1_naive"]   += l1_naive.sum().item()
+            sums["cos_delta"]         += cos_delta.sum().item()
+            sums["cos_patch_pred"]    += cos_p.sum().item()
+            sums["cos_patch_naive"]   += cos_n.sum().item()
             n += B
 
     if n == 0:
@@ -167,19 +180,21 @@ def main():
     means = {k: v / n for k, v in sums.items()}
 
     print(f"\n=== Averaged over {n} val pairs ===")
-    print(f"  Smooth L1 (predictor):       {means['smooth_l1_pred']:.4f}")
-    print(f"  Smooth L1 (do-nothing):      {means['smooth_l1_naive']:.4f}")
-    print(f"  Slide-deck cos(Δẑ, Δz_true): {means['cos_delta']:.4f}")
-    print(f"  Per-patch cos (predictor):   {means['cos_patch_pred']:.4f}")
-    print(f"  Per-patch cos (do-nothing):  {means['cos_patch_naive']:.4f}")
+    print(f"  Cosine distance (predictor):  {means['cosine_dist_pred']:.4f}")
+    print(f"  Cosine distance (do-nothing): {means['cosine_dist_naive']:.4f}")
+    print(f"  Smooth L1 (predictor):        {means['smooth_l1_pred']:.4f}")
+    print(f"  Smooth L1 (do-nothing):       {means['smooth_l1_naive']:.4f}")
+    print(f"  Slide-deck cos(Δẑ, Δz_true):  {means['cos_delta']:.4f}")
+    print(f"  Per-patch cos (predictor):    {means['cos_patch_pred']:.4f}")
+    print(f"  Per-patch cos (do-nothing):   {means['cos_patch_naive']:.4f}")
 
-    if means["smooth_l1_naive"] > 0:
+    if means["cosine_dist_naive"] > 0:
         delta = (
-            (means["smooth_l1_naive"] - means["smooth_l1_pred"])
-            / means["smooth_l1_naive"]
+            (means["cosine_dist_naive"] - means["cosine_dist_pred"])
+            / means["cosine_dist_naive"]
             * 100.0
         )
-        print(f"\n  Smooth L1 improvement of predictor over do-nothing: {delta:+.1f}%")
+        print(f"\n  Cosine distance improvement of predictor over do-nothing: {delta:+.1f}%")
 
     print(
         "\nInterpretation:\n"

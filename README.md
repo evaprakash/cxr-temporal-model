@@ -12,11 +12,17 @@ which condition mode is used.
 
 ## Architecture
 
+Everything lives on the unit sphere — both encoders L2-normalize their
+outputs along the feature dim, and the predictor renormalizes its
+``z_prior + Δz`` sum so ``ẑ_cur`` is unit-norm too. There are no
+LayerNorms anywhere in the JEPA path (and no extra projection heads on
+top of each encoder's built-in 128-d projection).
+
 ```
-Prior CXR  ──►  E (online, trained)         ──►  LN(z_prior) ──┐
-                                                                 ├──►  Predictor  ──►  ẑ_cur = LN(z_prior) + Δz
-Condition  ──►  text_encoder                ──►  τ_cond      ──┘
-Current CXR──►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
+Prior CXR  ──►  E (online, trained, L2-norm)  ──►  z_prior ──┐
+                                                              ├──►  Predictor  ──►  ẑ_cur = normalize(z_prior + Δz)
+Condition  ──►  text_encoder (L2-norm)        ──►  τ_cond  ──┘
+Current CXR──►  E_target (EMA, stop-grad, L2) ──►  z_cur
 
    [progression loss only — no extra forward pass through the predictor]
    "{finding} is {cls}." prompts ──► text_encoder (stop-grad) ──► τ_{f,c}
@@ -25,10 +31,11 @@ Current CXR──►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
 
 Losses:
 
-- **JEPA Smooth L1** between `ẑ_cur` and stop-gradient
-  LayerNorm-normalized `z_cur` (mirrors the I-JEPA reference loss).
+- **JEPA cosine** between `ẑ_cur` and stop-gradient `z_cur`:
+  ``1 - cos(ẑ_cur, z_cur)`` averaged over patches. Both inputs are
+  already unit-norm, so this is a directional loss by construction.
   Computed in fp32 inside the autocast region.
-- **GLoRIA local contrastive** on `(LN(z_prior), prior_report)`.
+- **GLoRIA local contrastive** on `(z_prior, prior_report)`.
 - **GLoRIA local contrastive** on `(ẑ_cur, current_report)`.
 - **Progression classification CE** — for every (pair, finding) row of
   `silver_findings.parquet`, encode the 5 templated prompts
@@ -43,13 +50,20 @@ Losses:
   `z_cur`. See `losses.progression_classification_loss`.
 
 The image encoder is a shared BioViL-T (ResNet50 + multi-image
-transformer); the prior path receives gradients while the current path
-is encoded by an EMA copy under stop-gradient. The text encoder is
-BioViL-T's CXR-BERT specialized model. The predictor is a small
-transformer that outputs a delta `Δz`, so `ẑ_cur` is reconstructed as
-`LN(z_prior) + Δz` — the "do nothing" baseline (`Δz = 0`) yields
-`ẑ_cur ≈ LN(z_cur)` for unchanged anatomy, leaving the predictor to
-spend capacity only on the actual change described by `τ_cond`.
+transformer) whose built-in `joint_feature_size=128` head projects to
+the joint 128-d space; the prior path receives gradients while the
+current path is encoded by an EMA copy under stop-gradient. The text
+encoder is BioViL-T's CXR-BERT specialized model with the 768→128
+`BertProjectionHead` followed by L2-norm. Both encoders return
+unit-norm features directly — no extra `proj_clip` / `proj_jepa` /
+`target_proj_jepa` heads sit on top.
+
+The predictor is a small transformer that outputs a delta `Δz` at the
+transformer's natural residual scale (no final LayerNorm). The
+prediction is reconstructed as `ẑ_cur = normalize(z_prior + Δz)` — the
+"do nothing" baseline (`Δz ≈ 0`) yields `ẑ_cur ≈ z_prior` on the
+sphere for unchanged anatomy, leaving the predictor to spend capacity
+only on the actual change described by `τ_cond`.
 
 ## Repository layout
 
@@ -59,7 +73,7 @@ cxr-temporal-model/
 ├── dataset_combined_jepa.py    # JEPA dataset (silver corpus, paired)
 ├── progression_phrases.py      # shared CLS_ORDER / phrase bank / label maps
 ├── losses.py                   # local_contrastive_loss (GLoRIA) + progression_classification_loss
-├── losses_jepa.py              # JEPA Smooth L1
+├── losses_jepa.py              # JEPA cosine loss
 ├── resume_train_jepa.py        # JEPA DDP training entry (invoked via torchrun)
 ├── run_jepa.py                 # direct launcher (auto-detects GPUs, no SLURM needed)
 ├── infer_jepa.py               # single-example inference demo
@@ -70,7 +84,7 @@ cxr-temporal-model/
 ├── eval_cig.py                 # 3-way progression classification on Chest ImaGenome
 └── tempcxr/
     └── modules/
-        ├── image_encoder_jepa.py   # JEPA image encoder (raw outputs)
+        ├── image_encoder_jepa.py   # JEPA image encoder (unit-sphere outputs)
         ├── text_encoder.py         # CXR-BERT text encoder
         └── jepa.py                 # JEPA forward orchestration + EMA + predictor
 ```
@@ -223,7 +237,7 @@ python smoke_test_dataset.py --load-images   # also call __getitem__
 - The text encoder forwards three reports (prior / current / condition)
   plus the flat list of progression-loss class prompts.
 - The predictor produces patch-shape outputs.
-- All four losses (JEPA Smooth L1, prior contrastive, current
+- All four losses (JEPA cosine, prior contrastive, current
   contrastive, progression CE) are finite and `total.backward()`
   succeeds.
 - `update_ema(momentum)` runs without error.
@@ -298,8 +312,8 @@ CONDITION_MODE=templated \
 ```
 
 Important: the `condition_mode` you train with should match the
-`condition_mode` you evaluate with — otherwise the val Smooth L1 and
-the per-pair JEPA metrics aren't directly comparable to the training
+`condition_mode` you evaluate with — otherwise the val cosine distance
+and the per-pair JEPA metrics aren't directly comparable to the training
 loss curve. The 5-way / 3-way progression-classification scripts
 (`progression_classify.py`, `eval_mscxrt.py`, `eval_cig.py`) are
 independent of the condition mode because they build their own
@@ -329,29 +343,38 @@ over the full course of training. BatchNorm running stats are copied
 verbatim from the online encoder rather than EMA-averaged (since BN
 running stats are themselves already running averages).
 
-### Normalization
+### Normalization (unit sphere)
 
-Following I-JEPA's recipe rather than BioViL-T's CLIP-style recipe:
+Everything in the JEPA path lives on the unit sphere:
 
-- Image encoder patch + global outputs are returned **raw** (no
-  `F.normalize` to the unit sphere) by `image_encoder_jepa.py`.
-- Both the **prior patches** (going into the predictor) and the
-  **target patches** (used as the JEPA loss target) get a feature-dim
-  **LayerNorm with no learnable parameters** applied inside
-  `TempCXRJEPA.forward`. This puts both sides of the JEPA loss on the
-  same scale (≈ √D) so the delta predictor has a meaningful
-  "do-nothing" baseline rather than fighting a 10× scale gap.
-- Predictor output is `LN(prior) + Δz` (raw, no extra normalization).
-- The downstream contrastive losses (`local_contrastive_loss`)
-  re-normalize their inputs internally with `F.normalize`, so they are
-  invariant to whether they receive raw or LayerNorm-normed patches.
+- The image encoder L2-normalizes both patch and global outputs along
+  the feature dim inside `image_encoder_jepa.py` (one `F.normalize` at
+  the end of `forward`).
+- The text encoder L2-normalizes its per-token (`txt_local`) and global
+  (`txt_global`) outputs inside `text_encoder.py:forward_contrastive`.
+- The predictor takes unit-norm prior patches and unit-norm text
+  tokens, computes `Δz` at the transformer's natural residual scale
+  (no final LayerNorm), and renormalizes the sum: `ẑ_cur =
+  normalize(prior + Δz)`.
+- The JEPA loss is `1 - cos(ẑ_cur, z_cur)`, a directional loss
+  consistent with the geometry.
+- The downstream contrastive losses (`local_contrastive_loss`) and the
+  progression loss re-L2-normalize their inputs defensively — that's a
+  no-op on already-unit-norm inputs but keeps the losses correct if
+  used standalone.
+
+There are no extra `proj_clip` / `proj_jepa` / `target_proj_jepa`
+heads on top of either encoder. The image encoder's built-in
+`joint_feature_size=128` projection and the text encoder's
+`BertProjectionHead` are the only projections that turn raw backbone
+features into the joint 128-d space.
 
 ### Loss reuse
 
 The JEPA pipeline does not duplicate `local_contrastive_loss`. It is
 defined once in `losses.py` alongside `progression_classification_loss`
 and imported by the JEPA model and training script. Only the JEPA
-Smooth L1 loss lives in `losses_jepa.py`.
+cosine loss lives in `losses_jepa.py`.
 
 ### Progression loss in more detail
 
@@ -417,9 +440,12 @@ python infer_jepa.py            # random val sample
 python infer_jepa.py --idx 42   # specific val sample
 ```
 
-Reports the JEPA Smooth L1, the slide-deck inference score
+Reports the JEPA cosine distance (`1 - cos(ẑ_cur, z_cur)`, the
+training-time loss on the unit sphere), the slide-deck inference score
 `cos(ẑ_cur - z_prior, z_cur - z_prior)`, per-patch cosine similarity,
-and a do-nothing baseline (`ẑ_cur := LN(z_prior)`) for comparison.
+and a do-nothing baseline (`ẑ_cur := z_prior`) for comparison. The
+Smooth L1 is also printed as a diagnostic for comparison with
+pre-unit-sphere runs.
 
 Single-example numbers can be misleading: most paired CXR studies are
 "stable" so on any given pair the do-nothing baseline is hard to beat.
@@ -438,7 +464,7 @@ python eval_jepa_val.py --limit 500        # quick smoke test
 python eval_jepa_val.py --batch-size 32    # if VRAM allows
 ```
 
-The reported `Smooth L1 (predictor)` should closely match the
+The reported `Cosine distance (predictor)` should closely match the
 `val_jepa` column in `logs/val_metrics_jepa.csv` at the loaded epoch
 (modulo augmentation — eval runs without).
 

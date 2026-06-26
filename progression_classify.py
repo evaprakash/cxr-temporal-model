@@ -374,12 +374,13 @@ def score_one_pair(
     prior = prior_img.unsqueeze(0).to(device)
     current = current_img.unsqueeze(0).to(device)
 
-    # Encode images once (online for prior, EMA for current — matches training).
-    _, prior_raw = model.image_encoder(prior)
-    z_prior = F.layer_norm(prior_raw, (prior_raw.size(-1),))
-
-    _, curr_raw = model.target_image_encoder(current)
-    z_cur = F.layer_norm(curr_raw, (curr_raw.size(-1),)).detach()
+    # Encode images once (online for prior, EMA for current — matches
+    # training). The encoders already L2-normalize their outputs along
+    # the feature dim, so ``z_prior`` and ``z_cur`` live on the unit
+    # sphere — no further normalization needed.
+    _, z_prior = model.image_encoder(prior)
+    _, z_cur = model.target_image_encoder(current)
+    z_cur = z_cur.detach()
 
     # Batch the predictor across all phrases by expanding prior to match.
     z_prior_b = z_prior.expand(n_phrases, -1, -1).contiguous()  # (n_phrases, N, D)

@@ -11,9 +11,14 @@ checkpoint was trained with via the ``CONDITION_MODE`` env var (default
 
 Reported metrics
 ----------------
-JEPA Smooth L1
-    The training-time loss between ``ẑ_cur`` and the LayerNorm-normed,
-    EMA-encoded ``z_cur``. Lower is better.
+JEPA cosine distance
+    ``1 - cos(ẑ_cur, z_cur)`` averaged over patches. This is the
+    training-time loss on the unit-sphere model. Lower is better.
+
+JEPA Smooth L1 (diagnostic)
+    ``F.smooth_l1_loss(ẑ_cur, z_cur)``. On unit-norm vectors this is
+    monotonically related to the cosine distance; reported for
+    historical comparison with pre-unit-sphere runs.
 
 Slide-deck inference score
     ``cos(ẑ_cur - z_prior, z_cur - z_prior)``: cosine similarity between
@@ -112,9 +117,9 @@ def encode_pair_with_text(
     output.
 
     Returns a dict with at least:
-        prior_patches            (1, 196, D)  LN'd, online encoder
-        current_patches_target   (1, 196, D)  LN'd, EMA encoder, detached
-        pred_current_patches     (1, 196, D)  predictor output ẑ_cur
+        prior_patches            (1, 196, D)  unit-norm, online encoder
+        current_patches_target   (1, 196, D)  unit-norm, EMA encoder, detached
+        pred_current_patches     (1, 196, D)  unit-norm predictor output ẑ_cur
     """
     prior = prior.to(device)
     current = current.to(device)
@@ -131,15 +136,20 @@ def jepa_metrics(pred: torch.Tensor, target: torch.Tensor, prior: torch.Tensor):
     target_f = target.float()
     prior_f = prior.float()
 
+    # Training-time loss on the unit sphere: 1 - cos(pred, target).
+    cos_patches = F.cosine_similarity(pred_f, target_f, dim=-1)  # (B, N)
+    cosine_dist = (1.0 - cos_patches).mean().item()
+
+    # Smooth L1 kept as a diagnostic — monotone in cosine distance on
+    # unit-norm vectors, but lets you compare to pre-unit-sphere runs.
     smooth_l1 = F.smooth_l1_loss(pred_f, target_f).item()
 
     delta_pred = (pred_f - prior_f).flatten()
     delta_true = (target_f - prior_f).flatten()
     cos_delta = F.cosine_similarity(delta_pred, delta_true, dim=0).item()
 
-    # Per-patch cosine similarity
-    cos_patches = F.cosine_similarity(pred_f, target_f, dim=-1)  # (B, N)
     return {
+        "cosine_dist": cosine_dist,
         "smooth_l1": smooth_l1,
         "cos_delta": cos_delta,
         "cos_patch_mean": cos_patches.mean().item(),
@@ -250,32 +260,35 @@ def main():
     m_pred = jepa_metrics(pred, target, z_prior)
 
     # ---- Metrics: do-nothing baseline (ẑ_cur = z_prior, i.e. Δz = 0) ----
-    smooth_l1_naive = F.smooth_l1_loss(z_prior.float(), target.float()).item()
     cos_patches_naive = F.cosine_similarity(z_prior.float(), target.float(), dim=-1)
     naive_patch_mean = cos_patches_naive.mean().item()
+    cosine_dist_naive = (1.0 - cos_patches_naive).mean().item()
+    smooth_l1_naive = F.smooth_l1_loss(z_prior.float(), target.float()).item()
 
-    print("\n=== Predictor (LN(z_prior) + Δz) vs target z_cur ===")
-    print(f"  JEPA Smooth L1:                {m_pred['smooth_l1']:.4f}")
-    print(f"  Slide-deck cos(Δẑ, Δz_true):   {m_pred['cos_delta']:.4f}")
+    print("\n=== Predictor (z_prior + Δz, L2-norm'd) vs target z_cur ===")
+    print(f"  JEPA cosine distance:           {m_pred['cosine_dist']:.4f}")
+    print(f"  JEPA Smooth L1 (diagnostic):    {m_pred['smooth_l1']:.4f}")
+    print(f"  Slide-deck cos(Δẑ, Δz_true):    {m_pred['cos_delta']:.4f}")
     print(f"  Per-patch cos sim mean/min/max: "
           f"{m_pred['cos_patch_mean']:.4f} / "
           f"{m_pred['cos_patch_min']:.4f} / "
           f"{m_pred['cos_patch_max']:.4f}")
 
-    print("\n=== Do-nothing baseline (ẑ_cur := LN(z_prior)) ===")
-    print(f"  JEPA Smooth L1:                {smooth_l1_naive:.4f}")
-    print(f"  Per-patch cos sim mean:        {naive_patch_mean:.4f}")
+    print("\n=== Do-nothing baseline (ẑ_cur := z_prior) ===")
+    print(f"  JEPA cosine distance:           {cosine_dist_naive:.4f}")
+    print(f"  JEPA Smooth L1 (diagnostic):    {smooth_l1_naive:.4f}")
+    print(f"  Per-patch cos sim mean:         {naive_patch_mean:.4f}")
 
     # ---- Improvement ----
-    if smooth_l1_naive > 0:
-        improvement = (smooth_l1_naive - m_pred["smooth_l1"]) / smooth_l1_naive * 100.0
-        print(f"\nSmooth L1 improvement of predictor over do-nothing: {improvement:+.1f}%")
+    if cosine_dist_naive > 0:
+        improvement = (cosine_dist_naive - m_pred["cosine_dist"]) / cosine_dist_naive * 100.0
+        print(f"\nCosine distance improvement of predictor over do-nothing: {improvement:+.1f}%")
 
     print("\nInterpretation:")
-    print("  - Lower Smooth L1 than do-nothing  => predictor is moving in the right direction.")
-    print("  - Slide-deck cosine close to +1     => predicted change aligns with actual change.")
-    print("  - Slide-deck cosine close to  0     => predicted change is uninformative.")
-    print("  - Slide-deck cosine close to -1     => predicted change opposes the actual change.")
+    print("  - Lower cosine distance than do-nothing => predictor moves in the right direction.")
+    print("  - Slide-deck cosine close to +1         => predicted change aligns with actual change.")
+    print("  - Slide-deck cosine close to  0         => predicted change is uninformative.")
+    print("  - Slide-deck cosine close to -1         => predicted change opposes the actual change.")
 
 
 if __name__ == "__main__":

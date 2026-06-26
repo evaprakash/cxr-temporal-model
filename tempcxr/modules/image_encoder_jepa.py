@@ -1,26 +1,29 @@
-"""I-JEPA-style image encoder for temporal CXR JEPA training.
+"""Unit-sphere image encoder for temporal CXR JEPA training.
 
-Wraps the BioViL-T ``MultiImageModel`` backbone but returns RAW patch
-and global outputs (no ``F.normalize`` to the unit sphere). I-JEPA's
-recipe avoids L2 normalization on the JEPA path because it discards
-magnitude information that may carry signal; scale stability is
-achieved via LayerNorm-no-params on the target side at loss time
-(see ``jepa.py``).
+Wraps the BioViL-T ``MultiImageModel`` backbone and L2-normalizes both
+patch and global outputs along the feature dim so every downstream
+consumer (predictor, JEPA cosine loss, GLoRIA contrastive loss,
+progression loss) receives unit-norm vectors.
 
-Loss-side L2 normalization for downstream contrastive heads (e.g.
-``local_contrastive_loss``) is handled by those losses themselves —
-they re-normalize their inputs internally, so consumers that need unit
-vectors are unaffected.
+Why unit-sphere instead of LayerNorm:
+    The previous I-JEPA-style recipe kept raw magnitudes and applied
+    LayerNorm-no-params on the target side at loss time. With multiple
+    multimodal heads (JEPA, GLoRIA, progression) reading from the same
+    encoder, the cleanest geometry is a shared unit sphere — every
+    consumer becomes scale-invariant by construction, and the JEPA loss
+    can be a plain cosine without any extra normalization step.
 
 Constructor signature: ``mode in {"biovil", "biovilt", "biovilt_finetuned"}``,
 optional ``checkpoint_path`` for the finetuned mode. ``forward`` takes
-``(curr_imgs, prev_imgs=None)`` and returns ``(global, patches)``.
+``(curr_imgs, prev_imgs=None)`` and returns ``(global, patches)``, both
+L2-normalized along the last dim.
 """
 
 import os
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # ------------------------------------------------------------------
 # Make hi-ml multimodal visible
@@ -46,7 +49,13 @@ DEBUG = True
 
 
 class BioViLTImageEncoderJEPA(nn.Module):
-    """BioViL-T image encoder with raw (un-normalized) patch + global outputs.
+    """BioViL-T image encoder with L2-normalized patch + global outputs.
+
+    Both outputs are projected to 128-d by BioViL-T's built-in
+    ``joint_feature_size=128`` head, then L2-normalized along the
+    feature dim before being returned. Consumers (predictor, JEPA
+    cosine loss, GLoRIA, progression loss) all read from these
+    unit-norm features directly — no extra projection heads anywhere.
 
     Modes (same as the non-JEPA variant):
 
@@ -103,7 +112,7 @@ class BioViLTImageEncoderJEPA(nn.Module):
                 )
 
     def forward(self, curr_imgs, prev_imgs=None):
-        """Returns (global, patches) — both RAW (no L2 normalization).
+        """Returns (global, patches) — both L2-normalized along feature dim.
 
         curr_imgs : Tensor (B,3,H,W)
         prev_imgs : optional Tensor (B,3,H,W)
@@ -113,12 +122,14 @@ class BioViLTImageEncoderJEPA(nn.Module):
             previous_image=prev_imgs,
         )
 
-        # ---- raw global embedding (B, 128) ----
+        # ---- global embedding (B, 128), L2-normalized ----
         img_emb = out.projected_global_embedding
+        img_emb = F.normalize(img_emb, dim=-1)
 
-        # ---- raw patch embeddings (B, L, 128) ----
+        # ---- patch embeddings (B, L, 128), L2-normalized ----
         feat = out.projected_patch_embeddings  # (B,128,H',W')
         patch_emb = feat.flatten(2).transpose(1, 2)
+        patch_emb = F.normalize(patch_emb, dim=-1)
 
         if DEBUG:
             print(

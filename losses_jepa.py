@@ -1,14 +1,15 @@
-"""I-JEPA-style losses for the temporal CXR task.
+"""JEPA-side loss for the unit-sphere temporal CXR model.
 
-This module is intentionally narrow: it only contains losses that are NEW
-relative to ``losses.py``. The contrastive (GLoRIA) losses are reused
-unchanged via ``from losses import local_contrastive_loss`` in callers.
+After the unit-sphere refactor, both ``pred`` (the predictor's
+``ẑ_cur``) and ``target`` (the EMA encoder's ``z_cur``) are L2-normalized
+along the feature dim inside the model's forward pass. The natural loss
+in that geometry is cosine — a directional loss that is automatically
+scale-invariant — so this module exposes ``jepa_cosine_loss`` as a thin
+wrapper around ``1 − cos(pred, target)`` averaged over patches.
 
-Design choice: the LayerNorm-no-params on the JEPA target is applied
-*inside the model's forward* (mirroring I-JEPA's ``forward_target``),
-not here. By the time the loss is called, the target is already
-LN-normalized; this function is therefore a thin wrapper around
-``F.smooth_l1_loss``.
+The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
+unchanged; they re-L2-normalize their inputs internally, so passing
+already-unit-norm patches is a no-op.
 """
 
 import torch
@@ -16,36 +17,24 @@ import torch.nn.functional as F
 
 
 # =========================================================
-# JEPA SMOOTH L1 LOSS
+# JEPA COSINE LOSS
 # =========================================================
-def jepa_smooth_l1_loss(
+def jepa_cosine_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
+    """Per-patch cosine distance between predicted and target patches.
+
+    pred   : (B, N, D) predictor output (L2-norm, with gradient).
+    target : (B, N, D) EMA target encoder output (L2-norm, detached).
+
+    Returns the mean of ``1 - cos(pred, target)`` across batch and
+    patches. Inputs are expected to already be L2-normalized along the
+    feature dim by the model; we still re-normalize defensively so the
+    loss is well-defined even if a caller forgets.
     """
-    I-JEPA-style Smooth L1 (Huber) loss between predicted and target patches.
-
-    pred   : (B, N, D) predictor output (with gradient).
-    target : (B, N, D) LayerNorm-normalized target encoder output
-             (already detached / under stop-gradient).
-
-    Smooth L1 is MSE for small residuals and L1 in the tails; this is the
-    same loss used in the official I-JEPA reference implementation:
-        https://github.com/facebookresearch/ijepa
-    """
-    return F.smooth_l1_loss(pred, target)
-
-
-# =========================================================
-# (Optional) helper: feature-dim LayerNorm on JEPA targets
-# =========================================================
-def jepa_target_layernorm(target: torch.Tensor) -> torch.Tensor:
-    """
-    Feature-dim LayerNorm with no learnable parameters.
-
-    Mirrors I-JEPA's ``F.layer_norm(h, (h.size(-1),))`` step. Stabilizes
-    the target distribution as the EMA target encoder drifts. The model's
-    forward applies this internally; exposing it here lets callers
-    re-derive the same target geometry outside the model if needed.
-    """
-    return F.layer_norm(target, (target.size(-1),))
+    pred = F.normalize(pred, dim=-1, eps=eps)
+    target = F.normalize(target, dim=-1, eps=eps)
+    cos_per_patch = (pred * target).sum(dim=-1)  # (B, N)
+    return (1.0 - cos_per_patch).mean()

@@ -3,18 +3,30 @@
 The ``forward`` returns a dict of representations and lets the training
 script compute losses externally (using ``losses.local_contrastive_loss``,
 ``losses.progression_classification_loss``, and
-``losses_jepa.jepa_smooth_l1_loss``).
+``losses_jepa.jepa_cosine_loss``).
 
-Architecture (matches the slide-deck diagram):
+Architecture (unit-sphere variant):
 
-    Prior CXR  ─►  E (online, trained)         ──►  LN(z_prior) ──┐
-                                                                   ├──►  Predictor  ──►  ẑ_cur
-    Condition  ─►  text_encoder                ──►  τ_cond     ──┘
-    Current CXR─►  E_target (EMA, stop-grad)   ──►  LN(z_cur)
+    Prior CXR  ─►  E (online, trained, L2-norm)  ──►  z_prior  ──┐
+                                                                  ├──►  Predictor  ──►  ẑ_cur (L2-norm)
+    Condition  ─►  text_encoder (L2-norm)        ──►  τ_cond  ──┘
+    Current CXR─►  E_target (EMA, stop-grad, L2) ──►  z_cur
 
     [progression loss only]
     "{finding} is {cls}." prompts ──► text_encoder (stop-grad) ──► τ_class
     ẑ_cur  ↔  τ_class            ── per-finding 5-way softmax-CE
+
+Every encoder output lives on the unit sphere (L2-norm along the feature
+dim is applied inside the image and text encoders). The predictor takes
+unit-norm prior patches + unit-norm text tokens, computes a small Δz at
+the residual stream's natural scale, and renormalizes the sum to the
+sphere::
+
+    ẑ_cur = normalize(prior_patches + Δz)
+
+That keeps "do nothing" (Δz = 0) as the free default — a near-zero delta
+gives ẑ_cur ≈ prior on the sphere — while letting every loss read the
+same unit-norm features without further scaling.
 
 The class prompts are encoded under ``torch.no_grad()`` and detached
 before leaving ``forward``. The progression loss therefore only updates
@@ -32,13 +44,9 @@ or the per-finding templated string ``"{finding} is {progression}"``
 (``condition_mode="templated"``). The model treats it as an opaque
 string either way.
 
-Both the prior and the target are LayerNorm-normalized over the feature
-dim, so the predictor's delta-prediction starts in the same geometry
-as the JEPA target (no scale gap in the Smooth L1 loss).
-
 Losses (computed by the caller):
-    - JEPA Smooth L1                : ẑ_cur ↔ stop-grad LN(z_cur)
-    - GLoRIA local contrastive      : LN(z_prior) ↔ τ_prior
+    - JEPA cosine                   : 1 − cos(ẑ_cur, stop-grad z_cur)
+    - GLoRIA local contrastive      : z_prior ↔ τ_prior
     - GLoRIA local contrastive      : ẑ_cur ↔ τ_current
     - Progression classification    : per-finding 5-way softmax-CE on
                                       cos(ẑ_cur, τ_{finding-is-class})
@@ -66,7 +74,7 @@ from .image_encoder_jepa import BioViLTImageEncoderJEPA
 from .text_encoder import BioViLTTextEncoder
 
 from losses import local_contrastive_loss, progression_classification_loss
-from losses_jepa import jepa_smooth_l1_loss
+from losses_jepa import jepa_cosine_loss
 
 
 # =========================================================
@@ -119,26 +127,33 @@ def make_momentum_scheduler(
 # I-JEPA TEMPORAL PREDICTOR
 # =========================================================
 class IJEPATemporalPredictor(nn.Module):
-    """Small transformer that predicts the *delta* between prior and current.
+    """Small transformer that predicts the *delta* between prior and current
+    on the unit sphere.
 
     Inputs to the transformer (concatenated, in this order):
       - learnable query tokens, one per output patch position (carrying the
         positional + type embedding for "predict ẑ_cur here")
-      - prior patch tokens with their own positional + type embedding
-      - text condition tokens with a type embedding (no positional)
+      - prior patch tokens (unit-norm from the image encoder) with their
+        own positional + type embedding
+      - text condition tokens (unit-norm from the text encoder) with a
+        type embedding (no positional)
 
     Output: the predicted current patches reconstructed as
-    ``ẑ_cur = prior_patches + Δz``, where ``Δz`` is the first
-    ``num_patches`` positions of the transformer stack (raw, post the
-    trailing LayerNorm; no L2 normalization).
+    ``ẑ_cur = normalize(prior_patches + Δz)``, where ``Δz`` is the first
+    ``num_patches`` positions of the transformer stack (no final
+    LayerNorm — the transformer's internal per-block LayerNorms already
+    stabilize the residual stream, so ``delta_z`` comes out at the
+    transformer's natural small scale and stays comparable to the
+    unit-norm prior).
 
-    This is the "Predict Δz" variant from the slide deck. The "do
-    nothing" baseline becomes free (Δz = 0 reconstructs ẑ_cur = z_prior),
-    so the predictor only spends capacity on the *change* induced by the
-    text condition. Because Δz is computed against the same prior, this
-    also matches the slide-deck inference rule
+    This is the "Predict Δz on the sphere" variant. The "do nothing"
+    baseline is essentially free: Δz ≈ 0 gives ẑ_cur ≈ z_prior after the
+    final L2-norm, so the predictor only spends capacity on the *change*
+    induced by the text condition. Because Δz is computed against the
+    same prior, this also matches the slide-deck inference rule
         S_k = cos(ẑ_cur^k - z_prior, z_cur - z_prior)
-    where the predictor's output is exactly the quantity being scored.
+    where the predictor's residual (pre-renormalization) is exactly the
+    quantity being scored.
     """
 
     def __init__(
@@ -174,7 +189,6 @@ class IJEPATemporalPredictor(nn.Module):
         )
 
         self.blocks = nn.TransformerEncoder(layer, num_layers=depth)
-        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, prior_patches, text_tokens, text_mask):
         B, N, D = prior_patches.shape
@@ -200,13 +214,14 @@ class IJEPATemporalPredictor(nn.Module):
         )
 
         x = self.blocks(x, src_key_padding_mask=key_padding_mask)
-        x = self.norm(x)
 
-        # Delta-prediction: the first N positions are Δz, and ẑ_cur is
-        # reconstructed by adding back the original (un-positionally-
-        # embedded) prior patches.
+        # Delta-prediction on the unit sphere: the first N positions are
+        # Δz at the transformer's natural residual scale. Reconstruct
+        # ẑ_cur by adding back the unit-norm prior_patches and
+        # L2-renormalizing to put the result back on the sphere.
         delta_z = x[:, :N, :]
-        return prior_patches + delta_z
+        pred = prior_patches + delta_z
+        return F.normalize(pred, dim=-1)
 
 
 # =========================================================
@@ -293,32 +308,28 @@ class TempCXRJEPA(nn.Module):
                            case.
 
         Returns a dict containing:
-          - prior_patches            (B, N, D)  online encoder, with grad
-          - current_patches_target   (B, N, D)  target encoder, LN-normed,
-                                                detached (stop-gradient)
-          - pred_current_patches     (B, N, D)  predictor output ẑ_cur
-          - prior_txt_local          (B, T, D)
+          - prior_patches            (B, N, D)  online encoder, unit-norm,
+                                                with grad
+          - current_patches_target   (B, N, D)  EMA target encoder,
+                                                unit-norm, detached
+                                                (stop-gradient)
+          - pred_current_patches     (B, N, D)  predictor output ẑ_cur,
+                                                unit-norm
+          - prior_txt_local          (B, T, D)  unit-norm
           - prior_token_mask         (B, T)
-          - current_txt_local        (B, T, D)
+          - current_txt_local        (B, T, D)  unit-norm
           - current_token_mask       (B, T)
-          - condition_txt_local      (B, T, D)
+          - condition_txt_local      (B, T, D)  unit-norm
           - condition_token_mask     (B, T)
-          - class_prompts_local      (P, T_p, D) or None — detached
+          - class_prompts_local      (P, T_p, D) or None — unit-norm,
+                                                            detached
           - class_prompts_mask       (P, T_p)     or None — detached
         """
 
         # ---- Online encoder on prior (gradients flow) ----
+        # The image encoder already L2-normalizes its outputs, so
+        # ``prior_patches`` arrives on the unit sphere.
         _, prior_patches = self.image_encoder(prior_imgs)
-
-        # Match the LayerNorm scale of the target so the predictor's
-        # delta-prediction starts in the same geometry as the JEPA target.
-        # Without this, prior_patches has BioViL-T's raw scale (~1) while
-        # the LN'd target has scale ~sqrt(D), and the loss is dominated by
-        # the scale gap rather than the directional residual.
-        prior_patches = F.layer_norm(
-            prior_patches,
-            (prior_patches.size(-1),),
-        )
 
         # ---- Text encoder on all three reports (one batched call) ----
         # Concatenate the three text lists, run the encoder once, then
@@ -370,15 +381,13 @@ class TempCXRJEPA(nn.Module):
             class_prompts_local = None
             class_prompts_mask = None
 
-        # ---- Target encoder on current image: stop-gradient + LN target ----
-        # I-JEPA's recipe: feature-dim LayerNorm on target stabilizes the
-        # target distribution as the EMA encoder drifts.
+        # ---- Target encoder on current image: stop-gradient ----
+        # The target encoder is a frozen EMA copy of the online encoder
+        # and inherits the same L2-norm at its output, so the target
+        # also lives on the unit sphere — no extra normalization needed
+        # here. Detach to harden the stop-gradient.
         with torch.no_grad():
             _, current_patches_target = self.target_image_encoder(current_imgs)
-            current_patches_target = F.layer_norm(
-                current_patches_target,
-                (current_patches_target.size(-1),),
-            )
         current_patches_target = current_patches_target.detach()
 
         # ---- Predictor: ẑ_cur from prior + condition text ----
@@ -478,7 +487,7 @@ if __name__ == "__main__":
     # --------------------------------------------------
     # Losses (external)
     # --------------------------------------------------
-    jepa_loss = jepa_smooth_l1_loss(
+    jepa_loss = jepa_cosine_loss(
         out["pred_current_patches"],
         out["current_patches_target"],
     )
@@ -519,7 +528,7 @@ if __name__ == "__main__":
     print("current_patches_target:", tuple(out["current_patches_target"].shape))
     print("class_prompts_local:", tuple(out["class_prompts_local"].shape))
     print()
-    print("JEPA Smooth L1:", jepa_loss.item())
+    print("JEPA cosine:", jepa_loss.item())
     print("Report (z_prior):", prior_loss.item())
     print("Report (ẑ_cur):", pred_loss.item())
     print("Progression CE:", prog_loss.item())

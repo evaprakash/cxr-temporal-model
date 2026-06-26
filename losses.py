@@ -70,13 +70,27 @@ def local_contrastive_loss(
     sim = torch.einsum("btd,knd->bktn", txt_tokens, img_patches)
 
     # --------------------------------------------------
-    # 3️⃣ Soft attention over patches (GLoRIA weighting)
-    # First softmax over tokens (as in original code)
-    # Then temperature scaling + second softmax
+    # 3️⃣ GLoRIA two-step attention.
+    #
+    # ``sim`` has shape (B_text, B_image, T, N) — last two dims are
+    # (tokens, patches). The intended GLoRIA recipe is:
+    #
+    #   1) Softmax over TOKENS (dim=-2) — for each patch, normalize how
+    #      much each token claims it. This is the cross-token balancing
+    #      step that prevents one dominant token from monopolizing
+    #      attention on every patch.
+    #   2) Temperature scale.
+    #   3) Softmax over PATCHES (dim=-1) — for each token, the actual
+    #      attention weights over patches used to build its weighted
+    #      patch context.
+    #
+    # (Previously dim=-1 was used for the first softmax, which made
+    # both normalizations run over patches. Fixed to dim=-2 to restore
+    # the cross-axis balancing.)
     # --------------------------------------------------
-    attn = F.softmax(sim, dim=-1)          # over patches
+    attn = F.softmax(sim, dim=-2)          # over tokens (per patch)
     attn = attn * temp1
-    attn = F.softmax(attn, dim=-1)         # second softmax
+    attn = F.softmax(attn, dim=-1)         # over patches (per token)
 
     # --------------------------------------------------
     # 4️⃣ Weighted patch representation per token
@@ -95,10 +109,17 @@ def local_contrastive_loss(
     token_sim = (txt_tokens.unsqueeze(1) * weighted_context).sum(dim=-1)
 
     # --------------------------------------------------
-    # 6️⃣ Mask padding tokens
+    # 6️⃣ Mask padding tokens.
+    #
+    # The aggregation below does ``log(sum_t exp(temp2 * token_sim))``,
+    # so padded positions must contribute 0 to the sum. Filling padded
+    # positions with 0.0 would let them contribute ``exp(0) = 1`` per
+    # padded slot — a constant offset that flattens the contrastive
+    # signal proportionally to report length. Filling with ``-inf``
+    # makes ``exp(-inf * temp2) = 0`` and pads vanish from the sum.
     # --------------------------------------------------
     token_mask = token_mask.unsqueeze(1)  # (B_text,1,T)
-    token_sim = token_sim.masked_fill(~token_mask, 0.0)
+    token_sim = token_sim.masked_fill(~token_mask, float("-inf"))
 
     # --------------------------------------------------
     # 7️⃣ Log-sum-exp aggregation over tokens (GLoRIA)
