@@ -61,7 +61,8 @@ cxr-temporal-model/
 ├── run_jepa.py                 # direct launcher (auto-detects GPUs, no SLURM needed)
 ├── infer_jepa.py               # single-example inference demo
 ├── eval_jepa_val.py            # average inference metrics over the full val split
-├── progression_classify.py     # 5-way progression classification on gold pairs
+├── progression_classify.py     # 5-way progression on gold pairs (image-text scoring)
+├── eval_progression_jepa.py    # 5-way progression on gold pairs (image-image cosine; matches train rule)
 ├── csv_progression_eval.py     # shared helpers for CSV-based 3-way benchmarks
 ├── eval_mscxrt.py              # 3-way progression classification on MS-CXR-T
 ├── eval_cig.py                 # 3-way progression classification on Chest ImaGenome
@@ -453,6 +454,53 @@ phrase prompts for one finding are batched through both the text
 encoder and the predictor, and the image forward pass runs once per
 (prior, current) pair, so the cost scales with `O(N_pairs)` rather
 than with the size of the prompt bank.
+
+### `eval_progression_jepa.py` — 5-way progression on gold pairs (image-image)
+
+Mirrors the training-time JEPA invariant exactly: ``cos(ẑ_cur, z_cur)``
+on the unit sphere. Where `progression_classify.py` scores predicted
+patches against text prompts (image-text cosine), this script scores
+predicted patches against the *actual* current latent (image-image
+cosine), so the test-time question matches the training-time question.
+
+Per gold row `(prior_image, current_image, finding, gt_progression)`:
+
+  1. Encode prior with the online image encoder → unit-norm `z_prior`.
+  2. Encode current with the EMA target image encoder → unit-norm
+     detached `z_cur`.
+  3. Build 5 templated prompts — one per class in `CLS_ORDER` — using
+     the **same canonical format as the templated training condition**:
+     `"{Finding} is {class}."`.
+  4. Batch the predictor with the same `z_prior` and the 5 different
+     text prompts → 5 candidate `ẑ_cur^c` (one per class).
+  5. Score each by `mean over patches of cos(ẑ_cur^c, z_cur)`.
+  6. **Predicted class = argmax_c** over the 5 cosines.
+
+Also reports the do-nothing baseline `cos(z_prior, z_cur)` and the
+fraction of pairs where the argmax predicted class actually beats it,
+as a sanity check on whether the text-conditioned predictor is doing
+useful work vs. just predicting "no change".
+
+```bash
+# Sanity-check one gold row (random or specific --idx)
+python eval_progression_jepa.py --demo
+python eval_progression_jepa.py --demo --idx 17
+
+# Full 5-way eval over the gold parquet
+python eval_progression_jepa.py --eval
+python eval_progression_jepa.py --eval --limit 200
+
+# Custom checkpoint and per-dataset image roots
+python eval_progression_jepa.py --eval \
+    --ckpt checkpoints_jepa_templated/epoch_30.pt \
+    --image-root mimic=/data/final_gold_mimic_images
+```
+
+The output is overall accuracy, per-class recall, 5×5 confusion
+matrix, mean cosine score per candidate class, the do-nothing baseline
+cosine, and per-finding accuracy — directly comparable to the cosine
+column of `progression_classify.py --eval` but using the image-image
+scoring rule instead of image-text.
 
 ### `eval_mscxrt.py` and `eval_cig.py` — 3-way progression classification
 
