@@ -9,6 +9,11 @@
 #               + GLoRIA local contrastive (ẑ_cur)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
+#   - Text condition (predictor input): ``templated`` by default —
+#               per-finding ``"{Finding} is {progression}."`` sentences
+#               built from ``silver_findings.parquet``. Override via
+#               ``CONDITION_MODE=dynamic`` for joined dynamic report
+#               sentences.
 
 import os
 import glob
@@ -38,29 +43,20 @@ from losses_jepa import jepa_cosine_loss
 # ============================================================
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Which text condition the predictor sees. ``dynamic`` (the default)
-# uses the joined ``label=="dynamic"`` sentences from
-# ``silver_sentences.parquet`` — free-form report text. ``templated``
+# Which text condition the predictor sees. ``templated`` (the default)
 # builds the condition from ``silver_findings.parquet`` as capitalized
 # ``"{Finding} is {progression}."`` clauses joined with a space and
-# shuffled per-sample at train time.
-CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
+# shuffled per-sample at train time. ``dynamic`` uses the joined
+# ``label=="dynamic"`` sentences from ``silver_sentences.parquet`` —
+# free-form report text — and can be selected via ``CONDITION_MODE=dynamic``.
+CONDITION_MODE = os.environ.get("CONDITION_MODE", "templated")
 
-# Namespace checkpoints / logs by condition mode in the default paths
-# so the two modes never clobber each other's checkpoints. The
-# ``dynamic`` default stays at ``checkpoints_jepa/`` / ``logs/`` for
-# backwards compatibility with prior runs; other modes get their own
-# dirs (e.g. ``checkpoints_jepa_templated/`` / ``logs_templated/``).
-_DEFAULT_CKPT_DIR = (
-    os.path.join(_HERE, "checkpoints_jepa")
-    if CONDITION_MODE == "dynamic"
-    else os.path.join(_HERE, f"checkpoints_jepa_{CONDITION_MODE}")
-)
-_DEFAULT_LOG_DIR = (
-    os.path.join(_HERE, "logs")
-    if CONDITION_MODE == "dynamic"
-    else os.path.join(_HERE, f"logs_{CONDITION_MODE}")
-)
+# Always namespace checkpoints / logs by condition mode so the two
+# modes never clobber each other's checkpoints and so legacy
+# ``checkpoints_jepa/`` / ``logs/`` dirs from older (pre-3-loss, pre-
+# softmax-fix) runs are left untouched as an archive.
+_DEFAULT_CKPT_DIR = os.path.join(_HERE, f"checkpoints_jepa_{CONDITION_MODE}")
+_DEFAULT_LOG_DIR = os.path.join(_HERE, f"logs_{CONDITION_MODE}")
 CHECKPOINT_DIR = os.environ.get("JEPA_CHECKPOINT_DIR", _DEFAULT_CKPT_DIR)
 LOG_DIR = os.environ.get("JEPA_LOG_DIR", _DEFAULT_LOG_DIR)
 

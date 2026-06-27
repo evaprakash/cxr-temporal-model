@@ -3,10 +3,10 @@
 I-JEPA-style temporal chest X-ray model. Predicts current-image patch
 features from prior-image patch features conditioned on a textual
 description of the change. The text condition can come from one of two
-sources (see "Condition modes" below): the joined "dynamic" sentences
-of the current study (the default), or per-finding templated clauses
+sources (see "Condition modes" below): per-finding templated clauses
 of the form `"{finding} is {progression}"` built from
-`silver_findings.parquet`.
+`silver_findings.parquet` (the default), or the joined "dynamic"
+sentences of the current study.
 
 ## Architecture
 
@@ -169,9 +169,12 @@ SPLIT_SEED = 42
 
 ### 6. Checkpoint and log directories
 
-`resume_train_jepa.py` writes checkpoints to `./checkpoints_jepa/` and
-validation metrics to `./logs/val_metrics_jepa.csv` (both relative to
-the script). Override with environment variables:
+`resume_train_jepa.py` writes checkpoints to
+`./checkpoints_jepa_<CONDITION_MODE>/` and validation metrics to
+`./logs_<CONDITION_MODE>/val_metrics_jepa.csv` (both relative to the
+script). With the default `CONDITION_MODE=templated` that's
+`./checkpoints_jepa_templated/` and `./logs_templated/`. Override with
+environment variables:
 
 ```bash
 export JEPA_CHECKPOINT_DIR=/data/ckpts
@@ -191,7 +194,7 @@ the step count and is reconstructed on resume.
 
 **Resume:** automatic from the latest `epoch_*.pt` if you rerun
 `python run_jepa.py` with no flags, or explicit via
-`python run_jepa.py --resume checkpoints_jepa/epoch_25.pt`.
+`python run_jepa.py --resume checkpoints_jepa_templated/epoch_25.pt`.
 
 Both directories are excluded from version control via `.gitignore`.
 
@@ -240,7 +243,7 @@ torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_cou
 Resume from a checkpoint:
 
 ```bash
-python run_jepa.py --resume checkpoints_jepa/epoch_5.pt
+python run_jepa.py --resume checkpoints_jepa_templated/epoch_5.pt
 ```
 
 Without `--resume`, `resume_train_jepa.py` auto-resumes from the
@@ -255,8 +258,8 @@ via `JEPACombinedDataset(condition_mode=...)`. Two modes are supported:
 
 | Mode        | Source                                                          | Per-sample text                                                              |
 |-------------|-----------------------------------------------------------------|------------------------------------------------------------------------------|
-| `dynamic` (default) | All `label == "dynamic"` sentences for the current study, joined | Free-text change description ("Right pleural effusion has increased…") |
-| `templated`         | Per-finding rows of `silver_findings.parquet` for the study pair | `"{Finding1} is {prog1}. {Finding2} is {prog2}."` (capitalized, period-terminated, shuffled per-call at train time) |
+| `templated` (default) | Per-finding rows of `silver_findings.parquet` for the study pair | `"{Finding1} is {prog1}. {Finding2} is {prog2}."` (capitalized, period-terminated, shuffled per-call at train time) |
+| `dynamic`             | All `label == "dynamic"` sentences for the current study, joined | Free-text change description ("Right pleural effusion has increased…") |
 
 Regardless of `condition_mode`, every dataset row also exposes
 `findings: list[str]` and `progression_cls_idx: list[int]` (indices
@@ -269,26 +272,28 @@ progression supervision as a training loss lives on the
 
 The mode is selected via the `CONDITION_MODE` env var on the training
 side and via `--condition-mode` (or `CONDITION_MODE`) on the eval side.
-The two modes write to independent default checkpoint / log dirs
-(`checkpoints_jepa/` + `logs/` for `dynamic`; `checkpoints_jepa_<mode>/`
-+ `logs_<mode>/` otherwise), so switching modes never clobbers the
-other mode's checkpoints.
+Both modes write to independent default checkpoint / log dirs
+(`checkpoints_jepa_<mode>/` + `logs_<mode>/`), so switching modes never
+clobbers the other mode's checkpoints. Legacy `checkpoints_jepa/` and
+`logs/` dirs from earlier (pre-3-loss, pre-softmax-fix) runs are left
+untouched as an archive.
 
 ```bash
-# current default: dynamic sentences as the predictor's text condition
+# current default: templated finding + progression sentences as the
+# predictor's text condition
 python run_jepa.py
-# → writes to checkpoints_jepa/ and logs/
-
-# templated finding + progression sentences (opt in via the env var)
-CONDITION_MODE=templated python run_jepa.py
 # → writes to checkpoints_jepa_templated/ and logs_templated/
 
-# evaluate the dynamic-mode checkpoint (matches the default)
-JEPA_CKPT=checkpoints_jepa/best.pt python eval_jepa_val.py
+# dynamic report sentences (opt in via the env var)
+CONDITION_MODE=dynamic python run_jepa.py
+# → writes to checkpoints_jepa_dynamic/ and logs_dynamic/
 
-# evaluate a templated-mode checkpoint
-CONDITION_MODE=templated \
-    JEPA_CKPT=checkpoints_jepa_templated/best.pt \
+# evaluate the templated-mode checkpoint (matches the default)
+JEPA_CKPT=checkpoints_jepa_templated/best.pt python eval_jepa_val.py
+
+# evaluate a dynamic-mode checkpoint
+CONDITION_MODE=dynamic \
+    JEPA_CKPT=checkpoints_jepa_dynamic/best.pt \
     python eval_jepa_val.py
 ```
 
@@ -369,8 +374,8 @@ training script. Only the JEPA cosine loss lives in `losses_jepa.py`.
 ## Inference
 
 Two scripts are provided for evaluating a trained checkpoint
-(`checkpoints_jepa/best.pt` by default; override with `--ckpt` or
-`JEPA_CKPT`).
+(`checkpoints_jepa_templated/best.pt` by default; override with
+`--ckpt` or `JEPA_CKPT`).
 
 ### `infer_jepa.py` — single-example demo
 
