@@ -503,6 +503,14 @@ cosine, and per-finding accuracy — directly comparable to the cosine
 column of `progression_classify.py --eval` but using the image-image
 scoring rule instead of image-text.
 
+The eval also reports **imbalance-corrected metrics** at the end of
+the summary: macro recall (= balanced accuracy), macro precision,
+macro F1, Cohen's kappa, a per-class precision/recall/F1 table, and a
+predicted-vs-true class-distribution table. Raw overall accuracy is
+misleading on class-imbalanced benchmarks (gold pairs are very uneven
+across the 5 classes); macro recall and Cohen's kappa are the metrics
+to read when comparing two models that don't share a prediction bias.
+
 ### `eval_mscxrt_jepa.py` — 3-way MS-CXR-T (image-image, matches train rule)
 
 The MS-CXR-T analog of `eval_progression_jepa.py`. Same image-image
@@ -547,6 +555,16 @@ python eval_mscxrt_jepa.py --eval \
 
 Default `--ckpt` is `checkpoints_jepa_templated/best.pt` (the templated
 training default). Override with `--ckpt` or `JEPA_CKPT=`.
+
+The summary prints the same **imbalance-corrected metrics** block as
+`eval_progression_jepa.py` (macro recall, macro precision, macro F1,
+Cohen's kappa, per-class precision/recall/F1, predicted-vs-true class
+distribution). On MS-CXR-T the class distribution is roughly
+`improving 18% / stable 40% / worsening 42%`, so a model that just
+always predicts "worsening" scores ~42% raw — read **macro recall**
+and **Cohen's kappa** for fair head-to-head comparison with baselines
+like BioViL-T whose image-text scoring tends to over-predict the
+majority class.
 
 ### `eval_mscxrt.py` and `eval_cig.py` — 3-way progression classification
 
