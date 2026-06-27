@@ -90,17 +90,21 @@ PROMPT_TEMPLATE = "{} is {}."
 def build_class_prompts(
     finding: str,
     template: str = PROMPT_TEMPLATE,
+    classes: Optional[List[str]] = None,
 ) -> List[str]:
-    """One templated prompt per class in ``CLS_ORDER`` (length-5 list).
+    """One templated prompt per class in ``classes`` (default: full
+    ``CLS_ORDER`` for 5-way gold; pass a 3-way subset for benchmarks
+    like MS-CXR-T / CIG which lack ``new`` and ``resolved``).
 
     Capitalizes the first letter of ``finding`` to match the templated
     training condition format built by
     ``JEPACombinedDataset._build_templated_condition``.
     """
+    cls_list = CLS_ORDER if classes is None else list(classes)
     if not finding:
-        return [template.format(finding, cls) for cls in CLS_ORDER]
+        return [template.format(finding, cls) for cls in cls_list]
     f_cap = finding[:1].upper() + finding[1:]
-    return [template.format(f_cap, cls) for cls in CLS_ORDER]
+    return [template.format(f_cap, cls) for cls in cls_list]
 
 
 # ============================================================
@@ -113,18 +117,22 @@ def _encode_prompts(
     template: str,
     device: torch.device,
     text_cache: Optional[Dict[str, Tuple]] = None,
+    classes: Optional[List[str]] = None,
 ):
-    """Encode the 5 class prompts for one finding. Cached by (finding, template).
+    """Encode the per-class prompts for one finding. Cached by
+    ``(finding, template, classes)`` so different class subsets don't
+    collide in the cache.
 
     The cache stores CPU tensors so we don't blow up GPU memory across
     many distinct findings; on each call we move them to ``device``.
     """
-    cache_key = f"{finding}||{template}"
+    cls_list = CLS_ORDER if classes is None else list(classes)
+    cache_key = f"{finding}||{template}||{','.join(cls_list)}"
     if text_cache is not None and cache_key in text_cache:
         prompts, txt_local, token_mask = text_cache[cache_key]
         return prompts, txt_local.to(device), token_mask.to(device)
 
-    prompts = build_class_prompts(finding, template)
+    prompts = build_class_prompts(finding, template, classes=cls_list)
     _, txt_local, token_mask = model.text_encoder.forward_contrastive(prompts)
     if text_cache is not None:
         text_cache[cache_key] = (
@@ -144,20 +152,27 @@ def score_one_pair(
     template: str,
     device: torch.device,
     text_cache: Optional[Dict[str, Tuple]] = None,
+    classes: Optional[List[str]] = None,
 ) -> Dict:
-    """5-way image-image scoring for ONE (prior, current, finding) gold row.
+    """N-way image-image scoring for ONE (prior, current, finding) row.
+
+    With ``classes=None`` (the default) this runs the full 5-way gold
+    eval. Passing a 3-element subset
+    (``["improving", "stable", "worsening"]``) gives the 3-way variant
+    used by MS-CXR-T / CIG.
 
     Returns
     -------
-    prompts          : list[str] (length 5) — the per-class templated prompts
-    cos_class_scores : list[float] (length 5) — mean per-patch
+    prompts          : list[str] (length n_classes) — per-class templated prompts
+    cos_class_scores : list[float] (length n_classes) — mean per-patch
                        ``cos(ẑ_cur^c, z_cur)`` for each class ``c``
-    pred_class       : int — argmax over the 5 class scores
+    pred_class       : int — argmax over the class scores (index into
+                       the supplied ``classes``, not into ``CLS_ORDER``)
     cos_naive        : float — mean per-patch ``cos(z_prior, z_cur)``,
                        a do-nothing baseline
     """
     prompts, txt_local, token_mask = _encode_prompts(
-        model, finding, template, device, text_cache,
+        model, finding, template, device, text_cache, classes=classes,
     )
     n_prompts = len(prompts)
 
@@ -171,18 +186,18 @@ def score_one_pair(
     _, z_cur = model.target_image_encoder(current)        # (1, N, D)
     z_cur = z_cur.detach()
 
-    # Batch the predictor across all 5 prompts by broadcasting the
-    # same z_prior. delta_z differs per prompt because txt_local does.
-    z_prior_b = z_prior.expand(n_prompts, -1, -1).contiguous()  # (5, N, D)
-    preds = model.predictor(z_prior_b, txt_local, token_mask)    # (5, N, D), unit-norm
+    # Batch the predictor across all prompts by broadcasting the same
+    # z_prior. delta_z differs per prompt because txt_local does.
+    z_prior_b = z_prior.expand(n_prompts, -1, -1).contiguous()
+    preds = model.predictor(z_prior_b, txt_local, token_mask)
 
     pred_f = preds.float()
     target_f = z_cur.float().expand_as(pred_f)
-    cos_per_patch = F.cosine_similarity(pred_f, target_f, dim=-1)  # (5, N)
-    cos_class_scores = cos_per_patch.mean(dim=1).tolist()           # length 5
+    cos_per_patch = F.cosine_similarity(pred_f, target_f, dim=-1)  # (n_prompts, N)
+    cos_class_scores = cos_per_patch.mean(dim=1).tolist()
 
     # Do-nothing baseline: would a "predict z_prior" predictor have
-    # scored higher than any of these 5? Useful sanity check.
+    # scored higher than any of these? Useful sanity check.
     cos_naive = F.cosine_similarity(
         z_prior.float(), z_cur.float(), dim=-1,
     ).mean().item()
@@ -263,12 +278,15 @@ def _print_eval_summary(
     cos_class_sums: List[float],
     naive_sum: float,
     n_above_naive: int,
+    classes: Optional[List[str]] = None,
 ):
-    classes = CLS_ORDER
-    chance = 1.0 / max(1, len(classes))
+    if classes is None:
+        classes = CLS_ORDER
+    n_classes = len(classes)
+    chance = 1.0 / max(1, n_classes)
 
     print(f"\n{'=' * 60}")
-    print("=== Results: 5-way image-image cosine matching")
+    print(f"=== Results: {n_classes}-way image-image cosine matching")
     print(f"{'=' * 60}")
     acc = n_correct / max(1, n_seen)
     print(

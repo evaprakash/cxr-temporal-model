@@ -64,7 +64,8 @@ cxr-temporal-model/
 ├── progression_classify.py     # 5-way progression on gold pairs (image-text scoring)
 ├── eval_progression_jepa.py    # 5-way progression on gold pairs (image-image cosine; matches train rule)
 ├── csv_progression_eval.py     # shared helpers for CSV-based 3-way benchmarks
-├── eval_mscxrt.py              # 3-way progression classification on MS-CXR-T
+├── eval_mscxrt.py              # 3-way progression on MS-CXR-T (image-text scoring)
+├── eval_mscxrt_jepa.py         # 3-way progression on MS-CXR-T (image-image cosine; matches train rule)
 ├── eval_cig.py                 # 3-way progression classification on Chest ImaGenome
 └── tempcxr/
     └── modules/
@@ -501,6 +502,51 @@ matrix, mean cosine score per candidate class, the do-nothing baseline
 cosine, and per-finding accuracy — directly comparable to the cosine
 column of `progression_classify.py --eval` but using the image-image
 scoring rule instead of image-text.
+
+### `eval_mscxrt_jepa.py` — 3-way MS-CXR-T (image-image, matches train rule)
+
+The MS-CXR-T analog of `eval_progression_jepa.py`. Same image-image
+cosine scoring rule the JEPA loss reads at training time, restricted
+to the 3 classes MS-CXR-T labels (`improving / stable / worsening`):
+
+  1. Encode prior with the online encoder → unit-norm `z_prior`.
+  2. Encode current with the EMA target encoder → unit-norm detached
+     `z_cur`.
+  3. Build 3 templated prompts — one per valid class — using the same
+     canonical format as the templated training condition:
+     `"{Finding} is {class}."`.
+  4. Batch the predictor with the same `z_prior` and the 3 text
+     prompts → 3 candidate `ẑ_cur^c`.
+  5. Score each by `mean over patches of cos(ẑ_cur^c, z_cur)`.
+  6. **Predicted class = argmax_c** over the 3 cosines.
+
+Where `eval_mscxrt.py` (legacy) scores predicted patches against text
+prompts (image-text cosine via GLoRIA), this script scores predicted
+patches against the actual current latent (image-image cosine). The
+test-time question now matches the question the training loss
+optimizes.
+
+Same CSV schema as `eval_mscxrt.py` — absolute MIMIC-CXR-JPG paths in
+`img_path_prev` / `img_path_curr` — and same `LABEL_MAP` for
+normalizing the `comparison` column.
+
+```bash
+# One row, full breakdown of the 3 cosines + the do-nothing baseline
+python eval_mscxrt_jepa.py --demo
+python eval_mscxrt_jepa.py --demo --idx 17
+
+# Full 3-way eval over the CSV
+python eval_mscxrt_jepa.py --eval
+python eval_mscxrt_jepa.py --eval --limit 200
+
+# Custom checkpoint / CSV
+python eval_mscxrt_jepa.py --eval \
+    --ckpt checkpoints_jepa_templated/epoch_30.pt \
+    --csv /path/to/mscxrt_labels_new.csv
+```
+
+Default `--ckpt` is `checkpoints_jepa_templated/best.pt` (the templated
+training default). Override with `--ckpt` or `JEPA_CKPT=`.
 
 ### `eval_mscxrt.py` and `eval_cig.py` — 3-way progression classification
 
