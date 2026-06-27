@@ -122,7 +122,7 @@ def build_class_prompts(
 # GOLD IMAGE ROOT DISCOVERY
 # ============================================================
 def discover_gold_image_roots(parquet_dir: str) -> Dict[str, str]:
-    """Look for ``final_gold_<dataset>_images/`` near the gold parquet.
+    """Look for ``final_gold_<dataset>_images/`` near plausible locations.
 
     Search order (first hit per dataset wins):
       1. ``parquet_dir`` itself — when the gold images are co-located
@@ -130,17 +130,25 @@ def discover_gold_image_roots(parquet_dir: str) -> Dict[str, str]:
       2. ``parquet_dir``'s parent — when the gold images are siblings
          of the parquet's containing folder (e.g. ``~/jepa/`` holds both
          ``CheXTemporal/`` and ``final_gold_*_images/``).
+      3. The directory containing this script — when the gold images
+         are co-located with the repo (e.g. ``~/cxr-temporal-model/``
+         holds both this script and ``final_gold_*_images/``).
+      4. The current working directory — convenient fallback when a
+         user has dropped the gold images next to wherever they're
+         invoking the script from.
 
     Returns a dict mapping ``dataset -> absolute_path``.
     """
     roots: Dict[str, str] = {}
     parent_dir = os.path.dirname(parquet_dir.rstrip("/"))
-    search_bases = [parquet_dir, parent_dir]
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+    search_bases = [parquet_dir, parent_dir, script_dir, cwd]
     for d in DATASETS:
         for base in search_bases:
             cand = os.path.join(base, f"final_gold_{d}_images")
             if os.path.isdir(cand):
-                roots[d] = cand
+                roots[d] = os.path.abspath(cand)
                 break
     return roots
 
