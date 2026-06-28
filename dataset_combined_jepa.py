@@ -261,10 +261,27 @@ class JEPACombinedDataset(Dataset):
         ``"{Finding} is {progression_class}."`` built from
         ``silver_findings.parquet``. Both modes carry the same set of
         study-pair rows under the hood — only the value of
-        ``condition_text`` differs. Regardless of mode, every sample
-        also exposes the per-pair ``findings`` and
-        ``progression_cls_idx`` lists, which the 4th progression-loss
-        head consumes during training.
+        ``condition_text`` differs.
+
+        Regardless of ``condition_mode``, every sample also exposes the
+        per-pair ``findings`` and ``progression_cls_idx`` lists (kept for
+        backward compatibility / inspection), plus two new fields
+        consumed by the 4th progression-classification loss:
+
+          ``prog_finding``     : str
+              One finding sampled from the pair's findings list. Randomly
+              chosen each ``__getitem__`` call when ``train=True`` (so
+              across epochs every finding gets sampled), deterministically
+              chosen (alphabetically first) when ``train=False`` so val
+              metrics are comparable epoch-to-epoch.
+          ``prog_cls_idx``     : int
+              Silver progression-class index (into ``CLS_ORDER``) for the
+              ``prog_finding`` above.
+
+        Training time uses these two fields to build a per-pair 5-prompt
+        bank (one ``"{prog_finding} is {class}."`` per class) and runs
+        the predictor 5 times to score image-image cosine for a 5-way CE
+        — see ``progression_classification_loss`` in ``losses_jepa.py``.
     """
 
     def __init__(
@@ -475,14 +492,34 @@ class JEPACombinedDataset(Dataset):
             condition_text = self._build_templated_condition(row)
 
         # The per-pair finding list and matching silver progression class
-        # are surfaced unconditionally so the 4th progression-loss head
-        # can score ẑ_cur per finding regardless of condition_mode.
+        # are surfaced unconditionally for backward compat / inspection.
         # ``progression_cls_idx`` is the integer index into CLS_ORDER (0–4)
-        # so the training loop never has to re-map class names to ints.
+        # so downstream code never has to re-map class names to ints.
         findings = [str(f) for f in row["finding"]]
         progression_cls_idx = [
             CLS_TO_IDX[str(c)] for c in row["progression_cls"]
         ]
+
+        # For the 4th (progression-classification) loss we score one
+        # finding per pair per epoch. Sampling one here keeps the 5-prompt
+        # bank flat (5*B prompts per batch instead of 5*Σfindings) and lets
+        # the dataloader return a fixed shape; across epochs the random
+        # pick exposes every finding for the pair anyway. Val uses the
+        # alphabetically first finding so val loss is reproducible.
+        if findings:
+            pairs = list(zip(findings, progression_cls_idx))
+            if self.train:
+                prog_finding, prog_cls_idx = random.choice(pairs)
+            else:
+                pairs.sort(key=lambda fp: fp[0])
+                prog_finding, prog_cls_idx = pairs[0]
+        else:
+            # Defensive: rows without findings should have been dropped in
+            # __init__, but if any slip through, surface an empty finding
+            # with class 0 so the collate doesn't crash; the trainer will
+            # have to mask these out (currently it doesn't, because the
+            # filter in __init__ is strict).
+            prog_finding, prog_cls_idx = "", 0
 
         return {
             "prior_image": prior_img,
@@ -493,6 +530,8 @@ class JEPACombinedDataset(Dataset):
             "dataset": dataset,
             "findings": findings,
             "progression_cls_idx": progression_cls_idx,
+            "prog_finding": prog_finding,
+            "prog_cls_idx": int(prog_cls_idx),
         }
 
 
@@ -502,12 +541,18 @@ class JEPACombinedDataset(Dataset):
 def jepa_collate_fn(batch):
     """
     Stack paired images; keep texts as lists of strings (the BioViL-T
-    text encoder tokenizes inside `forward_contrastive`). The ragged
+    text encoder tokenizes inside ``forward_contrastive``). The ragged
     per-pair ``findings`` and ``progression_cls_idx`` lists are kept as
     nested Python lists rather than padded into a tensor — the trainer
     flattens them when building the prompt batch for the progression
     loss, so a tensor of variable shape per pair would just add a
     pad/unpad step.
+
+    ``prog_finding`` and ``prog_cls_idx`` carry the per-epoch sampled
+    finding + silver-progression-class for the 4th loss. They are
+    fixed-shape (B,) — one finding string per pair, one integer label per
+    pair — so the trainer can build a flat (B*5,) prompt list of
+    ``"{Finding} is {class}."`` strings without any padding.
     """
     return {
         "prior_image": torch.stack([b["prior_image"] for b in batch]),
@@ -518,6 +563,10 @@ def jepa_collate_fn(batch):
         "dataset": [b["dataset"] for b in batch],
         "findings": [b["findings"] for b in batch],
         "progression_cls_idx": [b["progression_cls_idx"] for b in batch],
+        "prog_finding": [b["prog_finding"] for b in batch],
+        "prog_cls_idx": torch.tensor(
+            [b["prog_cls_idx"] for b in batch], dtype=torch.long
+        ),
     }
 
 

@@ -40,7 +40,7 @@ Usage
     python eval_jepa_val.py
     python eval_jepa_val.py --limit 500            # quick smoke test
     python eval_jepa_val.py --batch-size 32        # if VRAM allows
-    python eval_jepa_val.py --ckpt checkpoints_jepa_templated/epoch_25.pt
+    python eval_jepa_val.py --ckpt checkpoints_jepa_dynamic/epoch_25.pt
 """
 
 import argparse
@@ -59,8 +59,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ckpt",
-        default=os.environ.get("JEPA_CKPT", "checkpoints_jepa_templated/best.pt"),
-        help="Path to a JEPA checkpoint (default: checkpoints_jepa_templated/best.pt).",
+        default=os.environ.get("JEPA_CKPT", "checkpoints_jepa_dynamic/best.pt"),
+        help="Path to a JEPA checkpoint (default: checkpoints_jepa_dynamic/best.pt).",
     )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)

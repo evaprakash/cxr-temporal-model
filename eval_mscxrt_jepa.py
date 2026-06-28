@@ -50,7 +50,7 @@ Usage
 
     # Custom checkpoint / CSV path
     python eval_mscxrt_jepa.py --eval \\
-        --ckpt checkpoints_jepa_templated/epoch_30.pt \\
+        --ckpt checkpoints_jepa_dynamic/epoch_30.pt \\
         --csv /path/to/mscxrt_labels_new.csv
 """
 
@@ -249,10 +249,11 @@ def main():
     parser.add_argument(
         "--ckpt",
         default=os.environ.get(
-            "JEPA_CKPT", "checkpoints_jepa_templated/best.pt"
+            "JEPA_CKPT", "checkpoints_jepa_dynamic/best.pt"
         ),
         help="Path to a JEPA checkpoint "
-             "(default: checkpoints_jepa_templated/best.pt).",
+             "(default: checkpoints_jepa_dynamic/best.pt — matches the "
+             "current main training default).",
     )
     parser.add_argument(
         "--csv",

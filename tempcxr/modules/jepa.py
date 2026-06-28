@@ -2,7 +2,7 @@
 
 The ``forward`` returns a dict of representations and lets the training
 script compute losses externally (using ``losses.local_contrastive_loss``
-and ``losses_jepa.jepa_cosine_loss``).
+and ``losses_jepa.{jepa_cosine_loss, progression_classification_loss}``).
 
 Architecture (unit-sphere variant):
 
@@ -29,10 +29,21 @@ or the per-finding templated string ``"{finding} is {progression}"``
 (``condition_mode="templated"``). The model treats it as an opaque
 string either way.
 
+The 4th (progression-classification) loss reuses the same predictor and
+text encoder. The trainer passes a flat ``progression_prompts_flat`` list
+of ``B*C`` prompts (one per (pair, class) combo, in pair-major
+class-minor order). The model encodes them in the same batched text-
+encoder call as the other reports, runs the predictor a second time on
+``z_prior.repeat_interleave(C, dim=0)`` with these prompts as the text
+condition, and returns ``pred_progression_patches`` of shape
+``(B, C, N, D)``. Gradients flow back into both the image and text
+encoders through this second predictor pass.
+
 Losses (computed by the caller):
-    - JEPA cosine                   : 1 − cos(ẑ_cur, stop-grad z_cur)
-    - GLoRIA local contrastive      : z_prior ↔ τ_prior
-    - GLoRIA local contrastive      : ẑ_cur ↔ τ_current
+    - JEPA cosine                              : 1 − cos(ẑ_cur, stop-grad z_cur)
+    - GLoRIA local contrastive                 : z_prior ↔ τ_prior
+    - GLoRIA local contrastive                 : ẑ_cur ↔ τ_current
+    - Progression classification (5-way CE)    : argmax_c cos(ẑ_cur^c, z_cur)
 """
 
 import copy
@@ -55,7 +66,7 @@ from .image_encoder_jepa import BioViLTImageEncoderJEPA
 from .text_encoder import BioViLTTextEncoder
 
 from losses import local_contrastive_loss
-from losses_jepa import jepa_cosine_loss
+from losses_jepa import jepa_cosine_loss, progression_classification_loss
 
 
 # =========================================================
@@ -260,6 +271,7 @@ class TempCXRJEPA(nn.Module):
         prior_reports,
         current_reports,
         condition_texts,
+        progression_prompts_flat=None,
     ):
         """
         prior_imgs       : (B, 3, H, W)
@@ -273,6 +285,22 @@ class TempCXRJEPA(nn.Module):
                            per-finding ``"{finding} is {progression}"``
                            string (``"templated"``). The model treats
                            it as an opaque string either way.
+        progression_prompts_flat
+                           Optional ``list[str]`` of length ``B * C`` for
+                           the 4th (progression-classification) loss. The
+                           prompts are expected in **pair-major,
+                           class-minor** order — i.e. the first C entries
+                           are the 5 templated prompts for pair 0, the
+                           next C for pair 1, etc. ``C`` is inferred from
+                           ``len(progression_prompts_flat) // B``.
+
+                           When provided, the predictor is run a second
+                           time on ``z_prior.repeat_interleave(C, dim=0)``
+                           conditioned on these prompts, producing
+                           ``pred_progression_patches`` of shape
+                           ``(B, C, N, D)`` in the output dict. When
+                           ``None`` (e.g. inference / smoke test),
+                           ``pred_progression_patches`` is omitted.
 
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, unit-norm,
@@ -280,7 +308,9 @@ class TempCXRJEPA(nn.Module):
           - current_patches_target   (B, N, D)  EMA target encoder,
                                                 unit-norm, detached
                                                 (stop-gradient)
-          - pred_current_patches     (B, N, D)  predictor output ẑ_cur,
+          - pred_current_patches     (B, N, D)  predictor output ẑ_cur
+                                                conditioned on
+                                                ``condition_texts``,
                                                 unit-norm
           - prior_txt_local          (B, T, D)  unit-norm
           - prior_token_mask         (B, T)
@@ -288,6 +318,13 @@ class TempCXRJEPA(nn.Module):
           - current_token_mask       (B, T)
           - condition_txt_local      (B, T, D)  unit-norm
           - condition_token_mask     (B, T)
+          - pred_progression_patches (B, C, N, D)  predictor outputs
+                                                ``ẑ_cur^c`` for each
+                                                progression class, one
+                                                per ``progression_prompts_flat``
+                                                entry (only present when
+                                                ``progression_prompts_flat
+                                                is not None``).
         """
 
         # ---- Online encoder on prior (gradients flow) ----
@@ -295,27 +332,45 @@ class TempCXRJEPA(nn.Module):
         # ``prior_patches`` arrives on the unit sphere.
         _, prior_patches = self.image_encoder(prior_imgs)
 
-        # ---- Text encoder on all three reports (one batched call) ----
-        # Concatenate the three text lists, run the encoder once, then
-        # split. This costs the same memory as three calls but does only
-        # one CXR-BERT forward pass.
+        # ---- Text encoder on all reports + (optional) progression prompts ----
+        # Concatenate the text lists and run the encoder once. This
+        # costs roughly (B + B + B + B*C) tokenized strings of CXR-BERT,
+        # but it's still a single forward pass, which is cheaper than 4
+        # separate calls for the same total work.
         B = prior_imgs.size(0)
         all_reports = (
             list(prior_reports) + list(current_reports) + list(condition_texts)
         )
+
+        prog_active = (
+            progression_prompts_flat is not None
+            and len(progression_prompts_flat) > 0
+        )
+        if prog_active:
+            n_prog = len(progression_prompts_flat)
+            if n_prog % B != 0:
+                raise ValueError(
+                    f"len(progression_prompts_flat)={n_prog} must be a "
+                    f"multiple of batch size B={B}"
+                )
+            C = n_prog // B
+            all_reports = all_reports + list(progression_prompts_flat)
+        else:
+            n_prog = 0
+            C = 0
+
         _, all_txt_local, all_token_mask = (
             self.text_encoder.forward_contrastive(all_reports)
         )
-        prior_txt_local, current_txt_local, condition_txt_local = (
-            all_txt_local[:B],
-            all_txt_local[B:2 * B],
-            all_txt_local[2 * B:],
-        )
-        prior_token_mask, current_token_mask, condition_token_mask = (
-            all_token_mask[:B],
-            all_token_mask[B:2 * B],
-            all_token_mask[2 * B:],
-        )
+        prior_txt_local = all_txt_local[:B]
+        current_txt_local = all_txt_local[B:2 * B]
+        condition_txt_local = all_txt_local[2 * B:3 * B]
+        prior_token_mask = all_token_mask[:B]
+        current_token_mask = all_token_mask[B:2 * B]
+        condition_token_mask = all_token_mask[2 * B:3 * B]
+        if prog_active:
+            prog_txt_local = all_txt_local[3 * B:3 * B + n_prog]
+            prog_token_mask = all_token_mask[3 * B:3 * B + n_prog]
 
         # ---- Target encoder on current image: stop-gradient ----
         # The target encoder is a frozen EMA copy of the online encoder
@@ -326,14 +381,14 @@ class TempCXRJEPA(nn.Module):
             _, current_patches_target = self.target_image_encoder(current_imgs)
         current_patches_target = current_patches_target.detach()
 
-        # ---- Predictor: ẑ_cur from prior + condition text ----
+        # ---- Predictor pass #1: ẑ_cur from prior + condition text ----
         pred_current_patches = self.predictor(
             prior_patches,
             condition_txt_local,
             condition_token_mask,
         )
 
-        return {
+        out = {
             "prior_patches": prior_patches,
             "current_patches_target": current_patches_target,
             "pred_current_patches": pred_current_patches,
@@ -344,6 +399,27 @@ class TempCXRJEPA(nn.Module):
             "condition_txt_local": condition_txt_local,
             "condition_token_mask": condition_token_mask,
         }
+
+        # ---- Predictor pass #2 (optional): one ẑ_cur^c per class ----
+        # Broadcast the same z_prior across the C progression prompts so
+        # the predictor sees identical priors with different text
+        # conditions. ``repeat_interleave`` puts pair-i's C copies
+        # contiguously in the batch dim — same ordering as
+        # ``prog_txt_local`` (pair-major class-minor) so the rows line
+        # up. Gradients from this pass flow through ``prior_patches``
+        # (image encoder), ``prog_txt_local`` (text encoder), and the
+        # predictor's own weights.
+        if prog_active:
+            prior_b_rep = prior_patches.repeat_interleave(C, dim=0)
+            pred_prog_flat = self.predictor(
+                prior_b_rep,
+                prog_txt_local,
+                prog_token_mask,
+            )
+            _, N, D = pred_prog_flat.shape
+            out["pred_progression_patches"] = pred_prog_flat.view(B, C, N, D)
+
+        return out
 
     # --------------------------------------------------
     # EMA UPDATE (call after optimizer.step())
@@ -384,12 +460,23 @@ if __name__ == "__main__":
         "pneumonia is getting better",
     ]
 
+    # Progression prompts: 5 classes × B pairs (pair-major class-minor).
+    from progression_phrases import CLS_ORDER
+    prog_findings = ["pleural effusion", "pneumonia"]
+    prog_cls_idx = torch.tensor([2, 0], device=device, dtype=torch.long)  # worsening, improving
+    progression_prompts_flat = []
+    for f in prog_findings:
+        f_cap = f[:1].upper() + f[1:]
+        for cls in CLS_ORDER:
+            progression_prompts_flat.append(f"{f_cap} is {cls}.")
+
     out = model(
         prior_imgs,
         current_imgs,
         prior_reports,
         current_reports,
         condition_texts,
+        progression_prompts_flat=progression_prompts_flat,
     )
 
     # --------------------------------------------------
@@ -412,18 +499,34 @@ if __name__ == "__main__":
         out["current_token_mask"],
     )
 
-    total = jepa_loss + 0.1 * prior_loss + 0.1 * pred_loss
+    prog_loss = progression_classification_loss(
+        out["pred_progression_patches"],
+        out["current_patches_target"],
+        prog_cls_idx,
+    )
+
+    total = (
+        jepa_loss
+        + 0.1 * prior_loss
+        + 0.1 * pred_loss
+        + 0.1 * prog_loss
+    )
 
     # --------------------------------------------------
     # Print
     # --------------------------------------------------
     print("prior_patches:", tuple(out["prior_patches"].shape))
     print("pred_current_patches:", tuple(out["pred_current_patches"].shape))
+    print(
+        "pred_progression_patches:",
+        tuple(out["pred_progression_patches"].shape),
+    )
     print("current_patches_target:", tuple(out["current_patches_target"].shape))
     print()
     print("JEPA cosine:", jepa_loss.item())
     print("Report (z_prior):", prior_loss.item())
     print("Report (ẑ_cur):", pred_loss.item())
+    print("Progression 5-way CE:", prog_loss.item())
     print("Total:", total.item())
 
     total.backward()

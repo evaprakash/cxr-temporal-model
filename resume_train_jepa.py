@@ -7,13 +7,27 @@
 #   - Losses:   JEPA cosine (1 - cos(ẑ_cur, z_cur))
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
+#               + Progression 5-way image-image CE
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
-#   - Text condition (predictor input): ``templated`` by default —
-#               per-finding ``"{Finding} is {progression}."`` sentences
-#               built from ``silver_findings.parquet``. Override via
-#               ``CONDITION_MODE=dynamic`` for joined dynamic report
-#               sentences.
+#   - Text condition (predictor input for JEPA loss): ``dynamic`` by
+#               default — joined ``label=="dynamic"`` sentences from
+#               ``silver_sentences.parquet``. Override via
+#               ``CONDITION_MODE=templated`` for the per-finding
+#               ``"{Finding} is {progression}."`` template.
+#
+# Progression loss (the "4th loss"):
+#   For each pair the dataset surfaces one randomly-picked
+#   ``(prog_finding, prog_cls_idx)`` per epoch. The trainer builds 5
+#   templated prompts ``"{prog_finding} is {class}."`` (one per
+#   progression class), passes them to ``TempCXRJEPA.forward`` as
+#   ``progression_prompts_flat`` (length B*5, pair-major class-minor),
+#   and the model runs the predictor a second time on
+#   ``z_prior.repeat_interleave(5, dim=0)`` with these 5 text conditions
+#   to produce ``ẑ_cur^c`` for each class. The loss is
+#   ``F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label)``
+#   — the train-time analog of the image-image eval rule in
+#   ``eval_progression_jepa.py``.
 
 import os
 import glob
@@ -28,6 +42,7 @@ from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 
 from dataset_combined_jepa import JEPACombinedDataset, jepa_collate_fn
+from progression_phrases import CLS_ORDER
 from tempcxr.modules.jepa import (
     TempCXRJEPA,
     make_momentum_scheduler,
@@ -35,7 +50,7 @@ from tempcxr.modules.jepa import (
     EMA_END,
 )
 from losses import local_contrastive_loss
-from losses_jepa import jepa_cosine_loss
+from losses_jepa import jepa_cosine_loss, progression_classification_loss
 
 
 # ============================================================
@@ -43,13 +58,19 @@ from losses_jepa import jepa_cosine_loss
 # ============================================================
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Which text condition the predictor sees. ``templated`` (the default)
-# builds the condition from ``silver_findings.parquet`` as capitalized
-# ``"{Finding} is {progression}."`` clauses joined with a space and
-# shuffled per-sample at train time. ``dynamic`` uses the joined
-# ``label=="dynamic"`` sentences from ``silver_sentences.parquet`` —
-# free-form report text — and can be selected via ``CONDITION_MODE=dynamic``.
-CONDITION_MODE = os.environ.get("CONDITION_MODE", "templated")
+# Which text condition the predictor sees for the JEPA loss. ``dynamic``
+# (the default) uses the joined ``label=="dynamic"`` sentences from
+# ``silver_sentences.parquet`` — free-form report text describing the
+# change between prior and current. ``templated`` uses capitalized
+# per-finding ``"{Finding} is {progression}."`` clauses joined with a
+# space and shuffled per-sample, built from ``silver_findings.parquet``,
+# and can be selected via ``CONDITION_MODE=templated``.
+#
+# The 4th (progression-classification) loss always builds its own
+# templated prompts ``"{prog_finding} is {class}."`` regardless of
+# ``CONDITION_MODE`` — it needs all 5 candidate-class prompts at every
+# step to score the image-image cosine logits.
+CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 
 # Always namespace checkpoints / logs by condition mode so the two
 # modes never clobber each other's checkpoints and so legacy
@@ -144,6 +165,13 @@ SAVE_EVERY_N_EPOCHS = 5
 W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
+# 4th loss: 5-way image-image CE on the predictor's class-conditioned
+# ẑ_cur. Same magnitude bracket as the two contrastive heads; sweep if
+# it dominates or under-shoots at later epochs.
+W_PROG = 0.1
+PROG_TEMP = 0.1
+PROG_TEMPLATE = "{} is {}."
+N_CLS = len(CLS_ORDER)
 
 # Stratified train/val split when the studies parquet has no 'split'
 # column. Both datasets read/write the same cached splits CSV
@@ -293,21 +321,49 @@ if args.resume is not None:
 if local_rank == 0 and not os.path.exists(CSV_LOG):
     with open(CSV_LOG, "w") as f:
         f.write(
-            "epoch,val_total,val_jepa,val_report_prior,val_report_pred\n"
+            "epoch,val_total,val_jepa,val_report_prior,val_report_pred,"
+            "val_prog\n"
         )
+
+
+# ============================================================
+# PROGRESSION-PROMPT HELPER
+# ============================================================
+def build_progression_prompts(prog_findings):
+    """Flatten per-pair findings into a B*N_CLS prompt list.
+
+    Pair-major, class-minor order — ``TempCXRJEPA.forward`` assumes the
+    first ``N_CLS`` entries are pair 0's class prompts, the next
+    ``N_CLS`` are pair 1's, etc. The model then uses
+    ``z_prior.repeat_interleave(N_CLS, dim=0)`` to align text to image.
+
+    The finding string is capitalized to match the templated training
+    convention (``"{Finding} is {class}."``); empty findings (defensive
+    edge case) yield empty-prefix prompts that still tokenize cleanly.
+    """
+    prompts = []
+    for finding in prog_findings:
+        if finding:
+            f_cap = finding[:1].upper() + finding[1:]
+        else:
+            f_cap = ""
+        for cls in CLS_ORDER:
+            prompts.append(PROG_TEMPLATE.format(f_cap, cls))
+    return prompts
 
 
 # ============================================================
 # LOSS COMPUTATION (shared by train + val)
 # ============================================================
-def compute_jepa_losses(out, gather: bool):
+def compute_jepa_losses(out, prog_cls_idx, gather: bool):
     """
-    out    : dict returned by TempCXRJEPA.forward
-    gather : if True, gather contrastive features across ranks for
-             cross-rank negatives (training). If False, use local
-             features only (validation).
+    out          : dict returned by TempCXRJEPA.forward
+    prog_cls_idx : (B,) long tensor — silver class for the 4th loss
+    gather       : if True, gather contrastive features across ranks
+                   for cross-rank negatives (training). If False, use
+                   local features only (validation).
 
-    Returns: (total, jepa, prior, pred) as scalar tensors.
+    Returns: (total, jepa, prior, pred, prog) as scalar tensors.
     """
 
     # JEPA loss is per-patch cosine; cross-rank gathering doesn't add
@@ -350,12 +406,26 @@ def compute_jepa_losses(out, gather: bool):
         current_token_mask,
     )
 
+    # 5-way image-image CE on the predictor's class-conditioned ẑ_cur.
+    # No cross-rank gather here: the candidates and the target are both
+    # per-pair quantities, so other ranks' samples wouldn't add useful
+    # negatives — the "negative classes" are already inside each pair's
+    # own 5-way softmax. Cast to fp32 so the CE on the cosine logits
+    # doesn't lose precision at small (1 - cos) residuals.
+    prog = progression_classification_loss(
+        out["pred_progression_patches"].float(),
+        out["current_patches_target"].float(),
+        prog_cls_idx,
+        temperature=PROG_TEMP,
+    )
+
     total = (
         W_JEPA * jepa
         + W_REPORT_PRIOR * prior
         + W_REPORT_PRED * pred
+        + W_PROG * prog
     )
-    return total, jepa, prior, pred
+    return total, jepa, prior, pred, prog
 
 
 # ============================================================
@@ -384,6 +454,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
         current_reports = batch["current_report"]
         condition_texts = batch["condition_text"]
 
+        prog_prompts = build_progression_prompts(batch["prog_finding"])
+        prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
+
         optimizer.zero_grad()
 
         with torch.amp.autocast("cuda"):
@@ -393,10 +466,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 prior_reports,
                 current_reports,
                 condition_texts,
+                progression_prompts_flat=prog_prompts,
             )
 
-            loss, jepa_l, prior_l, pred_l = compute_jepa_losses(
-                out, gather=True
+            loss, jepa_l, prior_l, pred_l, prog_l = compute_jepa_losses(
+                out, prog_cls_idx, gather=True
             )
 
         scaler.scale(loss).backward()
@@ -418,6 +492,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "jepa": f"{jepa_l.item():.4f}",
+                "prog": f"{prog_l.item():.4f}",
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
             })
@@ -433,7 +508,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # VALIDATION
     # ============================================================
     model.eval()
-    val_total = val_jepa = val_prior = val_pred = 0.0
+    val_total = val_jepa = val_prior = val_pred = val_prog = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -446,6 +521,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
             current_reports = batch["current_report"]
             condition_texts = batch["condition_text"]
 
+            prog_prompts = build_progression_prompts(batch["prog_finding"])
+            prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
+
             with torch.amp.autocast("cuda"):
                 out = model(
                     prior,
@@ -453,27 +531,33 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     prior_reports,
                     current_reports,
                     condition_texts,
+                    progression_prompts_flat=prog_prompts,
                 )
 
-                total, jepa_l, prior_l, pred_l = compute_jepa_losses(
-                    out, gather=False
+                total, jepa_l, prior_l, pred_l, prog_l = (
+                    compute_jepa_losses(
+                        out, prog_cls_idx, gather=False
+                    )
                 )
 
             val_total += total.item()
             val_jepa += jepa_l.item()
             val_prior += prior_l.item()
             val_pred += pred_l.item()
+            val_prog += prog_l.item()
             val_batches += 1
 
     val_total /= max(val_batches, 1)
     val_jepa /= max(val_batches, 1)
     val_prior /= max(val_batches, 1)
     val_pred /= max(val_batches, 1)
+    val_prog /= max(val_batches, 1)
 
     val_total = ddp_reduce(val_total)
     val_jepa = ddp_reduce(val_jepa)
     val_prior = ddp_reduce(val_prior)
     val_pred = ddp_reduce(val_pred)
+    val_prog = ddp_reduce(val_prog)
 
     if local_rank == 0:
 
@@ -482,12 +566,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"Total={val_total:.4f} | "
             f"JEPA={val_jepa:.4f} | "
             f"PriorReport={val_prior:.4f} | "
-            f"PredReport={val_pred:.4f}"
+            f"PredReport={val_pred:.4f} | "
+            f"Prog={val_prog:.4f}"
         )
 
         with open(CSV_LOG, "a") as f:
             f.write(
-                f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred}\n"
+                f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred},"
+                f"{val_prog}\n"
             )
 
         ckpt = {

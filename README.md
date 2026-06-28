@@ -2,11 +2,17 @@
 
 I-JEPA-style temporal chest X-ray model. Predicts current-image patch
 features from prior-image patch features conditioned on a textual
-description of the change. The text condition can come from one of two
-sources (see "Condition modes" below): per-finding templated clauses
-of the form `"{finding} is {progression}"` built from
-`silver_findings.parquet` (the default), or the joined "dynamic"
-sentences of the current study.
+description of the change. The text condition for the JEPA invariant
+can come from one of two sources (see "Condition modes" below): the
+joined "dynamic" sentences of the current study (the default), or
+per-finding templated clauses of the form
+`"{finding} is {progression}"` built from `silver_findings.parquet`.
+
+In addition to the JEPA cosine + two GLoRIA local contrastive losses,
+`main` trains a **4th progression-classification loss** that scores the
+predictor's class-conditioned outputs against the EMA target's
+`z_cur` — making the training objective match the image-image eval rule
+in `eval_progression_jepa.py` / `eval_mscxrt_jepa.py`.
 
 ## Architecture
 
@@ -31,6 +37,15 @@ Losses:
   Computed in fp32 inside the autocast region.
 - **GLoRIA local contrastive** on `(z_prior, prior_report)`.
 - **GLoRIA local contrastive** on `(ẑ_cur, current_report)`.
+- **Progression 5-way image-image CE** (the "4th loss"). For each pair
+  the dataset samples one finding per epoch; the trainer builds 5
+  templated prompts `"{finding} is {class}."` (one per progression
+  class), runs the predictor a second time conditioned on each prompt
+  to produce `ẑ_cur^c`, then computes
+  `F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label)`.
+  This matches the image-image eval rule
+  (`eval_progression_jepa.py` / `eval_mscxrt_jepa.py`) directly, so
+  train-time and test-time read the same per-pair quantity.
 
 The image encoder is a shared BioViL-T (ResNet50 + multi-image
 transformer) whose built-in `joint_feature_size=128` head projects to
@@ -174,8 +189,8 @@ SPLIT_SEED = 42
 `resume_train_jepa.py` writes checkpoints to
 `./checkpoints_jepa_<CONDITION_MODE>/` and validation metrics to
 `./logs_<CONDITION_MODE>/val_metrics_jepa.csv` (both relative to the
-script). With the default `CONDITION_MODE=templated` that's
-`./checkpoints_jepa_templated/` and `./logs_templated/`. Override with
+script). With the default `CONDITION_MODE=dynamic` that's
+`./checkpoints_jepa_dynamic/` and `./logs_dynamic/`. Override with
 environment variables:
 
 ```bash
@@ -196,7 +211,7 @@ the step count and is reconstructed on resume.
 
 **Resume:** automatic from the latest `epoch_*.pt` if you rerun
 `python run_jepa.py` with no flags, or explicit via
-`python run_jepa.py --resume checkpoints_jepa_templated/epoch_25.pt`.
+`python run_jepa.py --resume checkpoints_jepa_dynamic/epoch_25.pt`.
 
 Both directories are excluded from version control via `.gitignore`.
 
@@ -224,8 +239,8 @@ python smoke_test_dataset.py --load-images   # also call __getitem__
 - The shared image encoder + EMA target encoder are wired correctly.
 - The text encoder forwards three reports (prior / current / condition)
 - The predictor produces patch-shape outputs.
-- All three losses (JEPA cosine, prior contrastive, current
-  contrastive) are finite and `total.backward()` succeeds.
+- All four losses (JEPA cosine, prior contrastive, current contrastive,
+  progression 5-way CE) are finite and `total.backward()` succeeds.
 - `update_ema(momentum)` runs without error.
 
 ## Training
@@ -245,7 +260,7 @@ torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_cou
 Resume from a checkpoint:
 
 ```bash
-python run_jepa.py --resume checkpoints_jepa_templated/epoch_5.pt
+python run_jepa.py --resume checkpoints_jepa_dynamic/epoch_5.pt
 ```
 
 Without `--resume`, `resume_train_jepa.py` auto-resumes from the
@@ -255,22 +270,29 @@ latest `epoch_*.pt` in `CHECKPOINT_DIR` if any exist.
 
 ### Condition modes
 
-The predictor's text condition is selected at dataset-construction time
-via `JEPACombinedDataset(condition_mode=...)`. Two modes are supported:
+The predictor's text condition for the **JEPA invariant** is selected
+at dataset-construction time via `JEPACombinedDataset(condition_mode=...)`.
+Two modes are supported:
 
 | Mode        | Source                                                          | Per-sample text                                                              |
 |-------------|-----------------------------------------------------------------|------------------------------------------------------------------------------|
-| `templated` (default) | Per-finding rows of `silver_findings.parquet` for the study pair | `"{Finding1} is {prog1}. {Finding2} is {prog2}."` (capitalized, period-terminated, shuffled per-call at train time) |
-| `dynamic`             | All `label == "dynamic"` sentences for the current study, joined | Free-text change description ("Right pleural effusion has increased…") |
+| `dynamic` (default) | All `label == "dynamic"` sentences for the current study, joined | Free-text change description ("Right pleural effusion has increased…") |
+| `templated`         | Per-finding rows of `silver_findings.parquet` for the study pair | `"{Finding1} is {prog1}. {Finding2} is {prog2}."` (capitalized, period-terminated, shuffled per-call at train time) |
 
-Regardless of `condition_mode`, every dataset row also exposes
-`findings: list[str]` and `progression_cls_idx: list[int]` (indices
-into `CLS_ORDER`) — these are not consumed by the training loop on
-`main` but are kept on the dataset so the eval-time progression
-classifiers (`progression_classify.py`, `eval_mscxrt.py`, `eval_cig.py`)
-and the templated condition mode have access to them. Per-finding
-progression supervision as a training loss lives on the
-`progression-loss` branch.
+The 4th (progression-classification) loss always builds its own
+templated prompts `"{finding} is {class}."` for one randomly-sampled
+finding per pair, regardless of `condition_mode`. So `condition_mode`
+only affects what text the JEPA invariant sees — the 4th loss is
+unchanged across modes.
+
+Regardless of `condition_mode`, every dataset row exposes
+`findings: list[str]`, `progression_cls_idx: list[int]` (indices into
+`CLS_ORDER`), and per-epoch sampled `prog_finding: str` /
+`prog_cls_idx: int`. The `prog_*` fields are consumed by the 4th loss;
+the list-form `findings` / `progression_cls_idx` are kept so the
+eval-time progression classifiers (`progression_classify.py`,
+`eval_mscxrt.py`, `eval_cig.py`) and the templated condition mode have
+access to them.
 
 The mode is selected via the `CONDITION_MODE` env var on the training
 side and via `--condition-mode` (or `CONDITION_MODE`) on the eval side.
@@ -281,21 +303,21 @@ clobbers the other mode's checkpoints. Legacy `checkpoints_jepa/` and
 untouched as an archive.
 
 ```bash
-# current default: templated finding + progression sentences as the
-# predictor's text condition
+# current default: dynamic sentences as the predictor's text condition
+# for the JEPA loss; the 4th loss still uses its own templated prompts
 python run_jepa.py
-# → writes to checkpoints_jepa_templated/ and logs_templated/
-
-# dynamic report sentences (opt in via the env var)
-CONDITION_MODE=dynamic python run_jepa.py
 # → writes to checkpoints_jepa_dynamic/ and logs_dynamic/
 
-# evaluate the templated-mode checkpoint (matches the default)
-JEPA_CKPT=checkpoints_jepa_templated/best.pt python eval_jepa_val.py
+# templated mode (per-finding clauses; opt in via the env var)
+CONDITION_MODE=templated python run_jepa.py
+# → writes to checkpoints_jepa_templated/ and logs_templated/
 
-# evaluate a dynamic-mode checkpoint
-CONDITION_MODE=dynamic \
-    JEPA_CKPT=checkpoints_jepa_dynamic/best.pt \
+# evaluate the dynamic-mode checkpoint (matches the default)
+JEPA_CKPT=checkpoints_jepa_dynamic/best.pt python eval_jepa_val.py
+
+# evaluate a templated-mode checkpoint
+CONDITION_MODE=templated \
+    JEPA_CKPT=checkpoints_jepa_templated/best.pt \
     python eval_jepa_val.py
 ```
 
@@ -303,9 +325,10 @@ Important: the `condition_mode` you train with should match the
 `condition_mode` you evaluate with — otherwise the val cosine distance
 and the per-pair JEPA metrics aren't directly comparable to the training
 loss curve. The 5-way / 3-way progression-classification scripts
-(`progression_classify.py`, `eval_mscxrt.py`, `eval_cig.py`) are
-independent of the condition mode because they build their own
-single-finding prompts at score time.
+(`progression_classify.py`, `eval_mscxrt.py`, `eval_cig.py`,
+`eval_progression_jepa.py`, `eval_mscxrt_jepa.py`) are independent of
+the condition mode because they build their own single-finding prompts
+at score time.
 
 ### What gets trained vs. frozen
 
@@ -365,18 +388,27 @@ training script. Only the JEPA cosine loss lives in `losses_jepa.py`.
 
 ### Branches
 
-- `main` (this branch): three-loss model — JEPA cosine + two GLoRIA
-  local contrastive losses — on the dynamic sentence condition by
-  default.
-- `progression-loss`: adds a 4th per-finding 5-way progression
-  classification loss on top of `main` (see that branch's README for
-  details). Kept around as a separate experiment; not the current
-  canonical training setup.
+- `main` (this branch): four-loss model — JEPA cosine + two GLoRIA
+  local contrastive losses + 5-way image-image progression-classification
+  CE — with the JEPA invariant conditioned on the **dynamic** sentence
+  text by default. The 4th loss runs the predictor a second time per
+  step on 5 templated `"{finding} is {class}."` prompts per pair (one
+  finding sampled per epoch) and scores image-image
+  `cos(ẑ_cur^c, z_cur)` — exactly matching the eval-time inference
+  rule.
+- `base-template`: snapshot of the previous templated-condition,
+  three-loss model (JEPA cosine + two GLoRIA contrastives, predictor
+  conditioned on the per-finding templated sentence, no 4th loss). Kept
+  as an archive baseline for ablations.
+- `progression-loss`: older experimental branch that added an
+  *image-text* (mean-pooled cosine) variant of the 4th loss on top of
+  the templated-condition setup. Superseded by `main`, which uses the
+  train/test-matched image-image rule instead. Kept as an archive.
 
 ## Inference
 
 Two scripts are provided for evaluating a trained checkpoint
-(`checkpoints_jepa_templated/best.pt` by default; override with
+(`checkpoints_jepa_dynamic/best.pt` by default; override with
 `--ckpt` or `JEPA_CKPT`).
 
 ### `infer_jepa.py` — single-example demo
@@ -493,7 +525,7 @@ python eval_progression_jepa.py --eval --limit 200
 
 # Custom checkpoint and per-dataset image roots
 python eval_progression_jepa.py --eval \
-    --ckpt checkpoints_jepa_templated/epoch_30.pt \
+    --ckpt checkpoints_jepa_dynamic/epoch_30.pt \
     --image-root mimic=/data/final_gold_mimic_images
 ```
 
@@ -549,12 +581,12 @@ python eval_mscxrt_jepa.py --eval --limit 200
 
 # Custom checkpoint / CSV
 python eval_mscxrt_jepa.py --eval \
-    --ckpt checkpoints_jepa_templated/epoch_30.pt \
+    --ckpt checkpoints_jepa_dynamic/epoch_30.pt \
     --csv /path/to/mscxrt_labels_new.csv
 ```
 
-Default `--ckpt` is `checkpoints_jepa_templated/best.pt` (the templated
-training default). Override with `--ckpt` or `JEPA_CKPT=`.
+Default `--ckpt` is `checkpoints_jepa_dynamic/best.pt` (matching the
+current `main` training default). Override with `--ckpt` or `JEPA_CKPT=`.
 
 The summary prints the same **imbalance-corrected metrics** block as
 `eval_progression_jepa.py` (macro recall, macro precision, macro F1,

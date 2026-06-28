@@ -44,7 +44,7 @@ Usage
     python infer_jepa.py --idx 42
 
     # Different checkpoint
-    python infer_jepa.py --ckpt checkpoints_jepa_templated/epoch_25.pt --idx 42
+    python infer_jepa.py --ckpt checkpoints_jepa_dynamic/epoch_25.pt --idx 42
 """
 
 import argparse
@@ -165,8 +165,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ckpt",
-        default=os.environ.get("JEPA_CKPT", "checkpoints_jepa_templated/best.pt"),
-        help="Path to a JEPA checkpoint (default: checkpoints_jepa_templated/best.pt).",
+        default=os.environ.get("JEPA_CKPT", "checkpoints_jepa_dynamic/best.pt"),
+        help="Path to a JEPA checkpoint (default: checkpoints_jepa_dynamic/best.pt).",
     )
     parser.add_argument(
         "--idx",

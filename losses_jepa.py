@@ -1,11 +1,20 @@
-"""JEPA-side loss for the unit-sphere temporal CXR model.
+"""JEPA-side losses for the unit-sphere temporal CXR model.
 
 After the unit-sphere refactor, both ``pred`` (the predictor's
 ``ẑ_cur``) and ``target`` (the EMA encoder's ``z_cur``) are L2-normalized
 along the feature dim inside the model's forward pass. The natural loss
 in that geometry is cosine — a directional loss that is automatically
-scale-invariant — so this module exposes ``jepa_cosine_loss`` as a thin
-wrapper around ``1 − cos(pred, target)`` averaged over patches.
+scale-invariant — so this module exposes:
+
+  * ``jepa_cosine_loss`` for the main JEPA invariant:
+    ``1 - cos(ẑ_cur, z_cur)`` averaged over patches.
+  * ``progression_classification_loss`` for the 4th loss: a 5-way CE on
+    image-image cosine *logits*, computed from N candidate ``ẑ_cur^c``
+    (one per progression class). This is the train-time analog of the
+    image-image eval rule in ``eval_progression_jepa.py`` —
+    "best match is determined through cos(ẑ_cur, z_cur)" — so the
+    training objective matches what's actually being measured at test
+    time.
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
@@ -38,3 +47,73 @@ def jepa_cosine_loss(
     target = F.normalize(target, dim=-1, eps=eps)
     cos_per_patch = (pred * target).sum(dim=-1)  # (B, N)
     return (1.0 - cos_per_patch).mean()
+
+
+# =========================================================
+# 4TH LOSS — PROGRESSION CLASSIFICATION (IMAGE–IMAGE 5-WAY CE)
+# =========================================================
+def progression_classification_loss(
+    pred_progression_patches: torch.Tensor,  # (B, C, N, D)
+    current_patches_target: torch.Tensor,    # (B, N, D), detached
+    silver_labels: torch.Tensor,             # (B,) long, values in [0, C)
+    temperature: float = 0.1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """5-way image-image cross-entropy on the predictor's candidate latents.
+
+    For each pair ``b`` and progression class ``c``:
+
+        logit[b, c] = mean over patches of cos(ẑ_cur^c[b], z_cur[b])
+
+    where ``ẑ_cur^c[b]`` is the predictor's output when conditioned on the
+    class-c prompt ``"{prog_finding[b]} is {class[c]}."`` (computed
+    upstream by ``TempCXRJEPA.forward`` running the predictor C times per
+    pair). The standard cross-entropy is then applied to
+    ``logits / temperature`` against the silver progression label.
+
+    The aggregation is mean-over-patches because the JEPA loss is
+    per-patch cosine averaged over patches — this keeps the
+    classification objective consistent with the regression objective:
+    both are scored on the same per-patch quantity, just rolled up two
+    different ways (regression = average; classification = pick the
+    argmax candidate's average).
+
+    Parameters
+    ----------
+    pred_progression_patches
+        ``(B, C, N, D)``. The predictor's ``ẑ_cur^c`` for each pair and
+        candidate class. Already L2-normalized by the predictor's final
+        renormalization; we re-normalize defensively.
+    current_patches_target
+        ``(B, N, D)``. The EMA target encoder's ``z_cur``, detached
+        (stop-grad).
+    silver_labels
+        ``(B,)`` integers in ``[0, C)``. The silver-derived progression
+        class index for the per-pair ``prog_finding``.
+    temperature
+        Softmax temperature. Cosine logits live in ``[-1, 1]``, so
+        ``temperature=0.1`` gives an effective ``[-10, 10]`` logit range
+        — peaky enough to be discriminative without saturating.
+    eps
+        L2-normalization numeric stability epsilon.
+
+    Returns
+    -------
+    Scalar CE loss tensor on the same device as ``pred_progression_patches``.
+    Returns 0 if the batch carries no candidates (degenerate edge case
+    that shouldn't fire in practice but lets the trainer keep a single
+    code path).
+    """
+    if pred_progression_patches.numel() == 0:
+        return pred_progression_patches.new_zeros(())
+
+    pred = F.normalize(pred_progression_patches, dim=-1, eps=eps)
+    target = F.normalize(current_patches_target, dim=-1, eps=eps)
+    # Broadcast target over the candidate-class dim:
+    #   pred   : (B, C, N, D)
+    #   target : (B, 1, N, D)
+    cos_per_patch = (pred * target.unsqueeze(1)).sum(dim=-1)  # (B, C, N)
+    logits = cos_per_patch.mean(dim=-1)                        # (B, C)
+    logits = logits / temperature
+
+    return F.cross_entropy(logits, silver_labels)
