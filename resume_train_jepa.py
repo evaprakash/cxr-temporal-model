@@ -31,8 +31,10 @@
 
 import os
 import glob
+import random
 import argparse
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -51,6 +53,36 @@ from tempcxr.modules.jepa import (
 )
 from losses import local_contrastive_loss
 from losses_jepa import jepa_cosine_loss, progression_classification_loss
+
+
+# ============================================================
+# DATALOADER WORKER SEEDING
+# ============================================================
+def seed_dataloader_worker(worker_id):
+    """Seed Python ``random`` + numpy from the per-worker, per-epoch torch seed.
+
+    The 4th progression-classification loss reads one randomly-picked
+    finding per pair per epoch via ``random.choice`` inside
+    ``JEPACombinedDataset.__getitem__``. PyTorch's DataLoader sets a
+    fresh per-worker, per-epoch ``torch`` seed automatically, but does
+    NOT propagate that seed to Python's ``random`` module or to numpy
+    by default. Without this hook, on fork-based multiprocessing the
+    workers can inherit the parent's ``random`` state — and if the
+    parent process never calls ``random.X(...)`` between epochs, that
+    state is identical at the start of each epoch, which means
+    ``random.choice`` could (in pathological cases) replay the same
+    sequence across epochs.
+
+    Reseeding both libraries from ``torch.initial_seed()`` here makes
+    the per-worker, per-epoch variation explicit. The 4th-loss finding
+    pick is then guaranteed to:
+      * differ across workers within the same epoch, and
+      * differ across epochs within the same worker,
+    without depending on fork timing or other process-level state.
+    """
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 # ============================================================
@@ -231,6 +263,7 @@ train_loader = DataLoader(
     pin_memory=True,
     collate_fn=jepa_collate_fn,
     drop_last=True,
+    worker_init_fn=seed_dataloader_worker,
 )
 
 val_loader = DataLoader(
@@ -241,6 +274,7 @@ val_loader = DataLoader(
     pin_memory=True,
     collate_fn=jepa_collate_fn,
     drop_last=True,
+    worker_init_fn=seed_dataloader_worker,
 )
 
 
