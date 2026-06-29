@@ -46,19 +46,30 @@ CLS_TO_IDX = {cls: i for i, cls in enumerate(CLS_ORDER)}
 # ============================================================
 # CONDITION MODES
 # ============================================================
-# ``dynamic``   : use the study-level concatenation of all
-#                 ``label == "dynamic"`` sentences from
-#                 ``silver_sentences.parquet`` (the original behavior).
-# ``templated`` : build the condition from the per-finding
-#                 ``(finding, progression)`` rows of
-#                 ``silver_findings.parquet`` joined to the same study
-#                 pair, formatted as
-#                 ``"{finding.lower()} is {progression_class}"`` and
-#                 joined with ". ". Order is shuffled per
-#                 ``__getitem__`` call when ``train=True`` and
-#                 deterministically sorted otherwise, so the val
-#                 condition is stable epoch-to-epoch.
-CONDITION_MODES = ("dynamic", "templated")
+# ``dynamic``        : use the study-level concatenation of all
+#                       ``label == "dynamic"`` sentences from
+#                       ``silver_sentences.parquet`` (the original
+#                       behavior, requires CheXTemporal silver labels).
+# ``templated``      : build the condition from the per-finding
+#                       ``(finding, progression)`` rows of
+#                       ``silver_findings.parquet`` joined to the same
+#                       study pair, formatted as
+#                       ``"{finding.lower()} is {progression_class}"``
+#                       and joined with ". ". Order is shuffled per
+#                       ``__getitem__`` call when ``train=True`` and
+#                       deterministically sorted otherwise, so the val
+#                       condition is stable epoch-to-epoch.
+# ``current_report`` : use the full current report (impression +
+#                       findings of the current study) as the
+#                       predictor's text condition. No CheXTemporal
+#                       silver labels or sentences feed into the
+#                       condition, so this is the natural baseline for
+#                       a JEPA model that ignores silver progression
+#                       supervision. Pair selection still uses the
+#                       silver dataset (the rest of the loader is
+#                       unchanged), but the condition itself is just
+#                       the raw radiology report.
+CONDITION_MODES = ("dynamic", "templated", "current_report")
 
 
 # ============================================================
@@ -488,6 +499,8 @@ class JEPACombinedDataset(Dataset):
 
         if self.condition_mode == "dynamic":
             condition_text = row["dynamic_report"]
+        elif self.condition_mode == "current_report":
+            condition_text = row["current_report"]
         else:  # "templated" — validated in __init__
             condition_text = self._build_templated_condition(row)
 

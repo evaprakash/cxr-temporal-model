@@ -7,14 +7,18 @@
 #   - Losses:   JEPA cosine (1 - cos(ẑ_cur, z_cur))
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE
+#               + Progression 5-way image-image CE   (disable via
+#                 ``DISABLE_PROG=1`` for a JEPA-only baseline)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
 #               default — joined ``label=="dynamic"`` sentences from
 #               ``silver_sentences.parquet``. Override via
 #               ``CONDITION_MODE=templated`` for the per-finding
-#               ``"{Finding} is {progression}."`` template.
+#               ``"{Finding} is {progression}."`` template, or
+#               ``CONDITION_MODE=current_report`` for the raw current
+#               radiology report (the baseline that uses no
+#               CheXTemporal silver supervision in the condition).
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -28,6 +32,11 @@
 #   ``F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label)``
 #   — the train-time analog of the image-image eval rule in
 #   ``eval_progression_jepa.py``.
+#
+#   Set ``DISABLE_PROG=1`` to skip this 4th loss entirely (no second
+#   predictor pass, no silver-label dependency). The remaining
+#   3-loss objective (JEPA + 2 local CL) is the baseline against
+#   which the progression-CE addition is measured.
 
 import os
 import glob
@@ -104,12 +113,22 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # step to score the image-image cosine logits.
 CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 
-# Always namespace checkpoints / logs by condition mode so the two
-# modes never clobber each other's checkpoints and so legacy
+# Toggle the 4th (progression-classification) loss. When ``1``/``true``,
+# the trainer skips building progression prompts, doesn't run the
+# predictor's second pass, and drops the CE term from the total. This
+# is the "no CheXTemporal silver supervision" baseline — pair it with
+# ``CONDITION_MODE=current_report`` to also remove silver-derived
+# sentences from the predictor's text condition. Checkpoints and logs
+# get a ``_noprog`` suffix so they never collide with a 4-loss run.
+DISABLE_PROG = os.environ.get("DISABLE_PROG", "0").lower() in ("1", "true", "yes")
+
+# Always namespace checkpoints / logs by condition mode (and prog flag)
+# so the variants never clobber each other's checkpoints and so legacy
 # ``checkpoints_jepa/`` / ``logs/`` dirs from older (pre-3-loss, pre-
 # softmax-fix) runs are left untouched as an archive.
-_DEFAULT_CKPT_DIR = os.path.join(_HERE, f"checkpoints_jepa_{CONDITION_MODE}")
-_DEFAULT_LOG_DIR = os.path.join(_HERE, f"logs_{CONDITION_MODE}")
+_RUN_SUFFIX = f"{CONDITION_MODE}{'_noprog' if DISABLE_PROG else ''}"
+_DEFAULT_CKPT_DIR = os.path.join(_HERE, f"checkpoints_jepa_{_RUN_SUFFIX}")
+_DEFAULT_LOG_DIR = os.path.join(_HERE, f"logs_{_RUN_SUFFIX}")
 CHECKPOINT_DIR = os.environ.get("JEPA_CHECKPOINT_DIR", _DEFAULT_CKPT_DIR)
 LOG_DIR = os.environ.get("JEPA_LOG_DIR", _DEFAULT_LOG_DIR)
 
@@ -236,6 +255,7 @@ val_dataset = JEPACombinedDataset(
 
 if local_rank == 0:
     print(f"[train] condition_mode={CONDITION_MODE}")
+    print(f"[train] disable_prog={DISABLE_PROG}")
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
     print(f"[train] log dir:        {LOG_DIR}")
 
@@ -392,12 +412,16 @@ def build_progression_prompts(prog_findings):
 def compute_jepa_losses(out, prog_cls_idx, gather: bool):
     """
     out          : dict returned by TempCXRJEPA.forward
-    prog_cls_idx : (B,) long tensor — silver class for the 4th loss
+    prog_cls_idx : (B,) long tensor — silver class for the 4th loss.
+                   Ignored when ``DISABLE_PROG`` is set (and the dict
+                   has no ``pred_progression_patches``).
     gather       : if True, gather contrastive features across ranks
                    for cross-rank negatives (training). If False, use
                    local features only (validation).
 
     Returns: (total, jepa, prior, pred, prog) as scalar tensors.
+    When the progression loss is disabled, ``prog`` is a 0-tensor on
+    the same device so callers / CSV logging stay shape-stable.
     """
 
     # JEPA loss is per-patch cosine; cross-rank gathering doesn't add
@@ -446,19 +470,31 @@ def compute_jepa_losses(out, prog_cls_idx, gather: bool):
     # negatives — the "negative classes" are already inside each pair's
     # own 5-way softmax. Cast to fp32 so the CE on the cosine logits
     # doesn't lose precision at small (1 - cos) residuals.
-    prog = progression_classification_loss(
-        out["pred_progression_patches"].float(),
-        out["current_patches_target"].float(),
-        prog_cls_idx,
-        temperature=PROG_TEMP,
-    )
+    #
+    # Skipped entirely when ``DISABLE_PROG`` is on (no second predictor
+    # pass was run in TempCXRJEPA.forward so ``pred_progression_patches``
+    # is absent from ``out``).
+    if "pred_progression_patches" in out:
+        prog = progression_classification_loss(
+            out["pred_progression_patches"].float(),
+            out["current_patches_target"].float(),
+            prog_cls_idx,
+            temperature=PROG_TEMP,
+        )
+        total = (
+            W_JEPA * jepa
+            + W_REPORT_PRIOR * prior
+            + W_REPORT_PRED * pred
+            + W_PROG * prog
+        )
+    else:
+        prog = torch.zeros((), device=jepa.device, dtype=jepa.dtype)
+        total = (
+            W_JEPA * jepa
+            + W_REPORT_PRIOR * prior
+            + W_REPORT_PRED * pred
+        )
 
-    total = (
-        W_JEPA * jepa
-        + W_REPORT_PRIOR * prior
-        + W_REPORT_PRED * pred
-        + W_PROG * prog
-    )
     return total, jepa, prior, pred, prog
 
 
@@ -488,8 +524,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
         current_reports = batch["current_report"]
         condition_texts = batch["condition_text"]
 
-        prog_prompts = build_progression_prompts(batch["prog_finding"])
-        prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
+        if DISABLE_PROG:
+            prog_prompts = None
+            prog_cls_idx = None
+        else:
+            prog_prompts = build_progression_prompts(batch["prog_finding"])
+            prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
 
         optimizer.zero_grad()
 
@@ -555,8 +595,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
             current_reports = batch["current_report"]
             condition_texts = batch["condition_text"]
 
-            prog_prompts = build_progression_prompts(batch["prog_finding"])
-            prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
+            if DISABLE_PROG:
+                prog_prompts = None
+                prog_cls_idx = None
+            else:
+                prog_prompts = build_progression_prompts(batch["prog_finding"])
+                prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
 
             with torch.amp.autocast("cuda"):
                 out = model(
