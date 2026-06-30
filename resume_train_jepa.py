@@ -2,16 +2,21 @@
 #
 # DDP training entry point for the JEPA-style temporal CXR model.
 #
-# Branch defaults (``baseline-jepa-dynamic-noprog``):
+# Branch defaults (``baseline-jepa-current-report-noprog``):
 #   - 3-loss objective only (JEPA + 2 local CL); no 5-way progression
 #     CE. Enabled via the ``DISABLE_PROG=1`` default below.
-#   - ``CONDITION_MODE=dynamic`` — predictor reads joined dynamic
-#     sentences as its text condition (same as main).
-#   - 15 training epochs (3-loss + dynamic converges by ~epoch 10 in
-#     prior templated-baseline runs).
+#   - ``CONDITION_MODE=current_report`` — predictor reads the raw
+#     current report (impression + findings of the current study) as
+#     its text condition. No CheXTemporal silver labels or sentences
+#     feed into the condition, so this is the "no silver supervision
+#     anywhere" baseline (paired with DISABLE_PROG=1 the 4th loss is
+#     off too).
+#   - 15 training epochs (3-loss has consistently converged by
+#     ~epoch 10 in prior templated- and dynamic-condition runs).
 #   - Checkpoints / logs auto-suffix to
-#     ``checkpoints_jepa_dynamic_noprog/`` and ``logs_dynamic_noprog/``
-#     so they don't collide with the 4-loss runs from main.
+#     ``checkpoints_jepa_current_report_noprog/`` and
+#     ``logs_current_report_noprog/`` so they don't collide with the
+#     4-loss runs from main or with the sibling dynamic-noprog branch.
 #
 # Pipeline:
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
@@ -24,14 +29,15 @@
 #                 ``DISABLE_PROG=0``)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
-#   - Text condition (predictor input for JEPA loss): ``dynamic`` by
-#               default — joined ``label=="dynamic"`` sentences from
-#               ``silver_sentences.parquet``. Override via
+#   - Text condition (predictor input for JEPA loss):
+#               ``current_report`` by default on this branch — the raw
+#               current-study impression + findings (no silver labels
+#               or silver sentences). Override via
+#               ``CONDITION_MODE=dynamic`` for the joined
+#               ``label=="dynamic"`` sentences from
+#               ``silver_sentences.parquet``, or
 #               ``CONDITION_MODE=templated`` for the per-finding
-#               ``"{Finding} is {progression}."`` template, or
-#               ``CONDITION_MODE=current_report`` for the raw current
-#               radiology report (the baseline that uses no
-#               CheXTemporal silver supervision in the condition).
+#               ``"{Finding} is {progression}."`` template.
 #
 # Progression loss (the "4th loss", off by default on this branch):
 #   For each pair the dataset surfaces one randomly-picked
@@ -48,9 +54,10 @@
 #
 #   Set ``DISABLE_PROG=0`` to re-enable the 4th loss. The default on
 #   this branch is ``1`` (no second predictor pass, no silver-label
-#   dependency), so the remaining 3-loss objective (JEPA + 2 local CL)
-#   matches the original templated 3-loss baseline byte-for-byte except
-#   for the dynamic-sentence condition.
+#   dependency); combined with ``CONDITION_MODE=current_report`` the
+#   trainer never touches CheXTemporal silver supervision at all, so
+#   the model is a clean image-text JEPA baseline on the silver pair
+#   set (only the pair selection still comes from silver).
 
 import os
 import glob
@@ -113,30 +120,34 @@ def seed_dataloader_worker(worker_id):
 # ============================================================
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Which text condition the predictor sees for the JEPA loss. ``dynamic``
-# (the default) uses the joined ``label=="dynamic"`` sentences from
-# ``silver_sentences.parquet`` — free-form report text describing the
-# change between prior and current. ``templated`` uses capitalized
+# Which text condition the predictor sees for the JEPA loss.
+# ``current_report`` (the default on this branch) uses the full
+# current-study impression + findings as the condition — the strongest
+# "no silver supervision in the condition" baseline. ``dynamic`` uses
+# the joined ``label=="dynamic"`` sentences from
+# ``silver_sentences.parquet`` (free-form report text describing the
+# change between prior and current). ``templated`` uses capitalized
 # per-finding ``"{Finding} is {progression}."`` clauses joined with a
-# space and shuffled per-sample, built from ``silver_findings.parquet``,
-# and can be selected via ``CONDITION_MODE=templated``.
+# space and shuffled per-sample, built from ``silver_findings.parquet``.
+# Select via ``CONDITION_MODE=dynamic`` or ``CONDITION_MODE=templated``.
 #
 # The 4th (progression-classification) loss always builds its own
 # templated prompts ``"{prog_finding} is {class}."`` regardless of
 # ``CONDITION_MODE`` — it needs all 5 candidate-class prompts at every
-# step to score the image-image cosine logits.
-CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
+# step to score the image-image cosine logits. On this branch the 4th
+# loss is off by default (DISABLE_PROG=1 below), so those prompts are
+# never built.
+CONDITION_MODE = os.environ.get("CONDITION_MODE", "current_report")
 
 # Toggle the 4th (progression-classification) loss. When ``1``/``true``,
 # the trainer skips building progression prompts, doesn't run the
 # predictor's second pass, and drops the CE term from the total. On
-# this branch the default is ``1``: the goal of ``baseline-jepa-
-# dynamic-noprog`` is to reproduce the original 3-loss model exactly
-# (JEPA + 2 local CL) but with the dynamic-sentence condition that the
-# 4-loss main branch introduced, so that the only training-time change
-# vs. the original templated 3-loss baseline is the predictor's text
-# input. Checkpoints and logs get a ``_noprog`` suffix so they never
-# collide with a 4-loss run.
+# this branch the default is ``1``: the goal of
+# ``baseline-jepa-current-report-noprog`` is a pure 3-loss
+# (JEPA + 2 local CL) JEPA model whose text condition is the raw
+# current report, so no CheXTemporal silver supervision (labels OR
+# sentences) feeds into training at all. Checkpoints and logs get a
+# ``_noprog`` suffix so they never collide with a 4-loss run.
 DISABLE_PROG = os.environ.get("DISABLE_PROG", "1").lower() in ("1", "true", "yes")
 
 # Always namespace checkpoints / logs by condition mode (and prog flag)

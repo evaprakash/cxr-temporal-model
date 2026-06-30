@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_dyn_np
+#SBATCH --job-name=jepa_cr_np
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,20 +8,23 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=2:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_dyn_np_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_dyn_np_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cr_np_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cr_np_%j.err
 
 # ============================================================
-# SLURM launcher for the baseline-jepa-dynamic-noprog branch.
+# SLURM launcher for the baseline-jepa-current-report-noprog
+# branch.
 #
 # Mirrors the existing biovilt SLURM template (preempt partition,
 # 4 GPUs, 32 CPUs, 400G mem, 2h wall clock) and just swaps the
 # project directory + entry point.
 #
 # This branch trains a 3-loss JEPA model (JEPA + 2 local CL, no
-# 5-way progression CE) with the dynamic-sentence condition, for
-# 15 epochs. With the 4-GPU template that's well under the 2h
-# wall clock; bump --time if your run is longer.
+# 5-way progression CE) with the current-report condition (raw
+# impression + findings of the current study, no silver labels
+# or silver sentences) for 15 epochs. With the 4-GPU template
+# that's well under the 2h wall clock; bump --time if your run
+# is longer.
 #
 # Override PROJECT_DIR if you cloned somewhere other than the
 # default below. Auto-resume from the latest epoch checkpoint
@@ -56,7 +59,7 @@ export PYTHONFAULTHANDLER=1
 # `sbatch`). Defaults to the conventional scratch location for
 # this branch's clone.
 # ============================================================
-PROJECT_DIR="${PROJECT_DIR:-/scratch/m000081/eprakash/temporal/final/cxr-temporal-model-dynamic-noprog}"
+PROJECT_DIR="${PROJECT_DIR:-/scratch/m000081/eprakash/temporal/final/cxr-temporal-model-current-report-noprog}"
 cd "$PROJECT_DIR"
 echo "[slurm] PROJECT_DIR = $PROJECT_DIR"
 echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<not a git checkout>')"
