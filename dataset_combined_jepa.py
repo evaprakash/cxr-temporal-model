@@ -64,12 +64,14 @@ CONDITION_MODES = ("dynamic", "templated")
 # ============================================================
 # DEFAULT SILVER DATASET PATHS
 # ============================================================
-# Local copy of the CheXTemporal silver annotation parquets. Override
-# the parent directory via the ``CHEXTEMPORAL_DIR`` env var or pass
-# explicit paths to ``JEPACombinedDataset(...)``.
+# Local copy of the CheXTemporal silver annotation parquets. Default
+# is ``CheXTemporal/`` next to this file (same convention as the
+# ``final_gold_<dataset>_images/`` lookup in ``progression_classify``).
+# Override via the ``CHEXTEMPORAL_DIR`` env var or pass explicit paths
+# to ``JEPACombinedDataset(...)``.
 DEFAULT_DATASET_DIR = os.environ.get(
     "CHEXTEMPORAL_DIR",
-    "/home/evaprakash/CheXTemporal",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "CheXTemporal"),
 )
 DEFAULT_FINDINGS = os.path.join(DEFAULT_DATASET_DIR, "silver_findings.parquet")
 DEFAULT_STUDIES = os.path.join(DEFAULT_DATASET_DIR, "silver_studies.parquet")
