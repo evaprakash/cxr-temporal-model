@@ -2,13 +2,26 @@
 #
 # DDP training entry point for the JEPA-style temporal CXR model.
 #
+# Branch defaults (``baseline-jepa-dynamic-noprog``):
+#   - 3-loss objective only (JEPA + 2 local CL); no 5-way progression
+#     CE. Enabled via the ``DISABLE_PROG=1`` default below.
+#   - ``CONDITION_MODE=dynamic`` — predictor reads joined dynamic
+#     sentences as its text condition (same as main).
+#   - 15 training epochs (3-loss + dynamic converges by ~epoch 10 in
+#     prior templated-baseline runs).
+#   - Checkpoints / logs auto-suffix to
+#     ``checkpoints_jepa_dynamic_noprog/`` and ``logs_dynamic_noprog/``
+#     so they don't collide with the 4-loss runs from main.
+#
+# Pipeline:
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
 #   - Model:    TempCXRJEPA (online + EMA + predictor) — unit-sphere
 #   - Losses:   JEPA cosine (1 - cos(ẑ_cur, z_cur))
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE   (disable via
-#                 ``DISABLE_PROG=1`` for a JEPA-only baseline)
+#               + Progression 5-way image-image CE   (disabled by
+#                 default on this branch; re-enable via
+#                 ``DISABLE_PROG=0``)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
@@ -20,7 +33,7 @@
 #               radiology report (the baseline that uses no
 #               CheXTemporal silver supervision in the condition).
 #
-# Progression loss (the "4th loss"):
+# Progression loss (the "4th loss", off by default on this branch):
 #   For each pair the dataset surfaces one randomly-picked
 #   ``(prog_finding, prog_cls_idx)`` per epoch. The trainer builds 5
 #   templated prompts ``"{prog_finding} is {class}."`` (one per
@@ -33,10 +46,11 @@
 #   — the train-time analog of the image-image eval rule in
 #   ``eval_progression_jepa.py``.
 #
-#   Set ``DISABLE_PROG=1`` to skip this 4th loss entirely (no second
-#   predictor pass, no silver-label dependency). The remaining
-#   3-loss objective (JEPA + 2 local CL) is the baseline against
-#   which the progression-CE addition is measured.
+#   Set ``DISABLE_PROG=0`` to re-enable the 4th loss. The default on
+#   this branch is ``1`` (no second predictor pass, no silver-label
+#   dependency), so the remaining 3-loss objective (JEPA + 2 local CL)
+#   matches the original templated 3-loss baseline byte-for-byte except
+#   for the dynamic-sentence condition.
 
 import os
 import glob
@@ -115,12 +129,15 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 
 # Toggle the 4th (progression-classification) loss. When ``1``/``true``,
 # the trainer skips building progression prompts, doesn't run the
-# predictor's second pass, and drops the CE term from the total. This
-# is the "no CheXTemporal silver supervision" baseline — pair it with
-# ``CONDITION_MODE=current_report`` to also remove silver-derived
-# sentences from the predictor's text condition. Checkpoints and logs
-# get a ``_noprog`` suffix so they never collide with a 4-loss run.
-DISABLE_PROG = os.environ.get("DISABLE_PROG", "0").lower() in ("1", "true", "yes")
+# predictor's second pass, and drops the CE term from the total. On
+# this branch the default is ``1``: the goal of ``baseline-jepa-
+# dynamic-noprog`` is to reproduce the original 3-loss model exactly
+# (JEPA + 2 local CL) but with the dynamic-sentence condition that the
+# 4-loss main branch introduced, so that the only training-time change
+# vs. the original templated 3-loss baseline is the predictor's text
+# input. Checkpoints and logs get a ``_noprog`` suffix so they never
+# collide with a 4-loss run.
+DISABLE_PROG = os.environ.get("DISABLE_PROG", "1").lower() in ("1", "true", "yes")
 
 # Always namespace checkpoints / logs by condition mode (and prog flag)
 # so the variants never clobber each other's checkpoints and so legacy
@@ -205,7 +222,11 @@ def gather_with_grad(tensor):
 LR = 2e-5
 WEIGHT_DECAY = 0.01
 BATCH_SIZE = 32
-EPOCHS = 50
+# We've consistently seen the 3-loss model converge by ~epoch 10 on
+# both the templated and the dynamic conditions, so 15 epochs is plenty
+# for this branch and saves ~70% of the wall-clock vs. the 50-epoch
+# schedule used on main.
+EPOCHS = 15
 WARMUP_RATIO = 0.03
 
 # Checkpoint schedule: always save epoch 1 + every SAVE_EVERY_N_EPOCHS,
