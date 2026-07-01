@@ -2,6 +2,24 @@
 #
 # DDP training entry point for the JEPA-style temporal CXR model.
 #
+# Branch defaults (``raddino-image-encoder``):
+#   - Image encoder swapped from BioViL-T (ResNet50 + temporal
+#     transformer, 128-d joint space) to RAD-DINO-MAIRA-2 (DINOv2-base
+#     ViT finetuned on chest X-rays, 768-d hidden). The paired text
+#     encoder (BioViL-T CXR-BERT) is instantiated with
+#     ``use_projection=False`` so text tokens are also raw 768-d and
+#     match the image-patch dim without any projection heads.
+#   - Predictor sized to ``d_model=768`` and ``num_patches=1369``
+#     (RAD-DINO's 37x37 patch grid at 518x518).
+#   - 15 epochs (rather than 50) with per-epoch checkpoint snapshots so
+#     the RAD-DINO baseline is directly comparable to the noprog
+#     branches.
+#   - Batch size lowered to 16 by default because RAD-DINO's much larger
+#     feature/patch footprint (768-d vs 128-d, 1369 patches vs 196)
+#     roughly 40x's the size of the tensors flowing through the
+#     predictor and the local contrastive loss. Bump back to 32 (or
+#     higher) if it fits on your GPU.
+#
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
 #   - Model:    TempCXRJEPA (online + EMA + predictor) — unit-sphere
 #   - Losses:   JEPA cosine (1 - cos(ẑ_cur, z_cur))
@@ -104,12 +122,22 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # step to score the image-image cosine logits.
 CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 
-# Always namespace checkpoints / logs by condition mode so the two
-# modes never clobber each other's checkpoints and so legacy
-# ``checkpoints_jepa/`` / ``logs/`` dirs from older (pre-3-loss, pre-
-# softmax-fix) runs are left untouched as an archive.
-_DEFAULT_CKPT_DIR = os.path.join(_HERE, f"checkpoints_jepa_{CONDITION_MODE}")
-_DEFAULT_LOG_DIR = os.path.join(_HERE, f"logs_{CONDITION_MODE}")
+# Which image encoder backs the JEPA model. ``raddino`` (this branch's
+# default) uses ``microsoft/rad-dino-maira-2`` — a DINOv2-base ViT
+# finetuned on chest X-rays, 768-d hidden, 37x37 patches at 518x518.
+# ``biovilt`` reverts to the original BioViL-T ResNet50 + temporal
+# transformer with the 128-d joint-space head. Any BioViL-T variant
+# (biovil / biovilt / biovilt_finetuned) or RAD-DINO variant
+# (raddino / raddino_finetuned) accepted by ``TempCXRJEPA`` works here.
+MODEL_MODE = os.environ.get("MODEL_MODE", "raddino")
+
+# Namespace checkpoints / logs by (model_mode, condition_mode) so the
+# BioViL-T and RAD-DINO variants never clobber each other's checkpoints
+# and so legacy ``checkpoints_jepa/`` / ``logs/`` dirs from older runs
+# are left untouched as an archive.
+_RUN_SUFFIX = f"{MODEL_MODE}_{CONDITION_MODE}"
+_DEFAULT_CKPT_DIR = os.path.join(_HERE, f"checkpoints_jepa_{_RUN_SUFFIX}")
+_DEFAULT_LOG_DIR = os.path.join(_HERE, f"logs_{_RUN_SUFFIX}")
 CHECKPOINT_DIR = os.environ.get("JEPA_CHECKPOINT_DIR", _DEFAULT_CKPT_DIR)
 LOG_DIR = os.environ.get("JEPA_LOG_DIR", _DEFAULT_LOG_DIR)
 
@@ -185,13 +213,21 @@ def gather_with_grad(tensor):
 # ============================================================
 LR = 2e-5
 WEIGHT_DECAY = 0.01
-BATCH_SIZE = 32
-EPOCHS = 50
+# RAD-DINO's 768-d, 1369-patch features (vs BioViL-T's 128-d, 196)
+# roughly 40x the size of the tensors flowing through the predictor
+# and the local contrastive loss, so BATCH_SIZE=16 (per GPU) is the
+# safe default on 80 GB A100s. Bump if it fits — 32 does fit on some
+# 80 GB configurations but leaves less headroom for the 4th-loss
+# second predictor pass (which scales as B*C=5B in the batch dim).
+BATCH_SIZE = 16
+EPOCHS = 15
 WARMUP_RATIO = 0.03
 
-# Checkpoint schedule: always save epoch 1 + every SAVE_EVERY_N_EPOCHS,
-# plus best.pt whenever val total improves.
-SAVE_EVERY_N_EPOCHS = 5
+# Checkpoint schedule: save every epoch so we get 15 comparable
+# snapshots for the RAD-DINO baseline (matches "save every epoch"
+# request for this branch); best.pt still gets written whenever val
+# total improves.
+SAVE_EVERY_N_EPOCHS = 1
 
 # Loss weights (matching the smoke-test defaults in the old jepa.py)
 W_JEPA = 1.0
@@ -235,7 +271,10 @@ val_dataset = JEPACombinedDataset(
 )
 
 if local_rank == 0:
+    print(f"[train] model_mode    ={MODEL_MODE}")
     print(f"[train] condition_mode={CONDITION_MODE}")
+    print(f"[train] batch_size    ={BATCH_SIZE}  epochs={EPOCHS}")
+    print(f"[train] save every N  ={SAVE_EVERY_N_EPOCHS} epoch(s)")
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
     print(f"[train] log dir:        {LOG_DIR}")
 
@@ -281,7 +320,7 @@ val_loader = DataLoader(
 # ============================================================
 # MODEL
 # ============================================================
-model = TempCXRJEPA().to(DEVICE)
+model = TempCXRJEPA(mode=MODEL_MODE).to(DEVICE)
 model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
 optimizer = AdamW(

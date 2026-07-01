@@ -62,15 +62,50 @@ class ImageGuidedCrossAttention(nn.Module):
 # BIOVIL / BIOVIL-T TEXT ENCODER
 # ================================================================
 class BioViLTTextEncoder(nn.Module):
+    """CXR-BERT wrapper with an optional 768→128 projection head.
+
+    Parameters
+    ----------
+    mode
+        Which pretrained CXR-BERT variant to load (biovil / biovilt /
+        biovilt_finetuned).
+    checkpoint_path
+        Required when ``mode == "biovilt_finetuned"``.
+    mlm_prob
+        Masking probability for the (image-guided) MLM path.
+    use_projection
+        Controls whether ``forward_contrastive`` emits 128-d projected
+        tokens (the BioViL-T default) or the raw 768-d CXR-BERT hidden
+        states.
+
+        - ``True`` (default): behavior identical to the pre-change
+          BioViL-T pipeline — ``token_hidden`` (dim 768) is passed
+          through ``self.text_projection`` (a ``BertProjectionHead``)
+          and L2-normalized, giving 128-d unit-norm tokens. This is
+          what the BioViL-T image encoder path expects, since its
+          patches are also 128-d after the ``joint_feature_size=128``
+          head.
+
+        - ``False``: skip ``self.text_projection`` entirely and
+          L2-normalize the 768-d hidden states directly. Use this when
+          the paired image encoder outputs raw 768-d features and you
+          want to avoid an image/text dim mismatch (e.g. with the
+          RAD-DINO-MAIRA-2 image encoder). ``self.text_projection`` is
+          still allocated so the state_dict layout is stable, but its
+          parameters get no gradient in this configuration.
+    """
+
     def __init__(
         self,
         mode: str = "biovilt",
         checkpoint_path: str | None = None,
         mlm_prob: float = 0.45,
+        use_projection: bool = True,
     ):
         super().__init__()
         assert mode in {"biovil", "biovilt", "biovilt_finetuned"}
         self.mlm_prob = mlm_prob
+        self.use_projection = use_projection
 
         # ------------------------------------------------------------
         # Select model
@@ -108,6 +143,10 @@ class BioViLTTextEncoder(nn.Module):
 
         self.hidden_dim = self.model.config.hidden_size      # 768
         self.proj_dim = self.model.config.projection_size    # 128
+        # Dim actually emitted by ``forward_contrastive`` — used by
+        # downstream modules that want to size predictor/loss heads to
+        # match the text token dim.
+        self.output_dim = self.hidden_dim if not self.use_projection else self.proj_dim
 
         # ------------------------------------------------------------
         # φ_txt projection (same as CLS projection head)
@@ -149,12 +188,24 @@ class BioViLTTextEncoder(nn.Module):
 
         # ---- LOCAL (drop CLS) ----
         token_hidden = hidden[:, 1:, :]     # (B, T-1, 768)
-        txt_local = self.text_projection(token_hidden)
+        if self.use_projection:
+            txt_local = self.text_projection(token_hidden)
+        else:
+            # Use raw 768-d hidden states so the token dim matches an
+            # image encoder that also outputs 768-d features (e.g.
+            # RAD-DINO-MAIRA-2). The projection head is bypassed but
+            # kept allocated for state_dict layout stability.
+            txt_local = token_hidden
         txt_local = F.normalize(txt_local, dim=-1)
 
         token_mask = tok.attention_mask[:, 1:].bool()
 
         # ---- GLOBAL (CLS only) ----
+        # The projected global embedding is 128-d by construction. It is
+        # not consumed by the JEPA forward path (which only reads
+        # ``txt_local``), so we return it unchanged even when
+        # ``use_projection=False`` — callers that need a raw 768-d CLS
+        # feature can grab ``hidden[:, 0]`` themselves.
         txt_global = self.model.get_projected_text_embeddings(
             input_ids=tok.input_ids,
             attention_mask=tok.attention_mask,

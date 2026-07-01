@@ -63,10 +63,27 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from .image_encoder_jepa import BioViLTImageEncoderJEPA
+from .image_encoder_raddino import (
+    RADDINOImageEncoderJEPA,
+    RAD_DINO_HIDDEN_SIZE,
+    RAD_DINO_NUM_PATCHES,
+)
 from .text_encoder import BioViLTTextEncoder
 
 from losses import local_contrastive_loss
 from losses_jepa import jepa_cosine_loss, progression_classification_loss
+
+
+# Modes that use the BioViL-T image encoder (128-d, 196 patches). These
+# are all the "original" pipelines and are also used verbatim by the
+# text encoder (which projects to 128-d to match).
+BIOVILT_IMAGE_MODES = {"biovil", "biovilt", "biovilt_finetuned"}
+
+# Modes that use the RAD-DINO-MAIRA-2 image encoder (768-d, 1369 patches
+# at 518x518). The paired text encoder is instantiated with
+# ``use_projection=False`` so its tokens stay 768-d and match the image
+# features dim-for-dim; the predictor is sized accordingly.
+RADDINO_IMAGE_MODES = {"raddino", "raddino_finetuned"}
 
 
 # =========================================================
@@ -223,10 +240,22 @@ class TempCXRJEPA(nn.Module):
     """Forward-pass orchestration for the JEPA-style temporal CXR setup.
 
     Holds:
-      - ``image_encoder``        : online BioViL-T (raw, no L2) — trained.
+      - ``image_encoder``        : online image encoder — trained.
+        Two backbones are supported (auto-selected from ``mode``):
+          * ``"biovil" / "biovilt" / "biovilt_finetuned"`` →
+            :class:`BioViLTImageEncoderJEPA` (128-d, 14x14=196 patches).
+          * ``"raddino" / "raddino_finetuned"`` →
+            :class:`RADDINOImageEncoderJEPA` (768-d, 37x37=1369 patches).
       - ``target_image_encoder`` : EMA copy of ``image_encoder`` — frozen.
-      - ``text_encoder``         : BioViL-T text encoder — trained.
+      - ``text_encoder``         : BioViL-T CXR-BERT — trained. When
+        paired with a RAD-DINO image encoder the text encoder is
+        instantiated with ``use_projection=False`` so its tokens stay
+        768-d and match the image-patch dim without any extra projection
+        head; the BioViL-T image encoder path keeps the 128-d projection.
       - ``predictor``            : IJEPATemporalPredictor — trained.
+        Sized to match ``(num_patches, d_model)`` for the active image
+        encoder (defaults to the encoder's native shape unless the
+        caller overrides).
 
     Returns a dict of representations; losses live in ``losses.py`` and
     ``losses_jepa.py``.
@@ -236,23 +265,62 @@ class TempCXRJEPA(nn.Module):
         self,
         mode: str = "biovilt",
         checkpoint_path: str = None,
-        num_patches: int = 196,
-        d_model: int = 128,
+        num_patches: int | None = None,
+        d_model: int | None = None,
         predictor_depth: int = 6,
         predictor_heads: int = 4,
     ):
         super().__init__()
 
-        self.image_encoder = BioViLTImageEncoderJEPA(
-            mode=mode,
-            checkpoint_path=checkpoint_path,
-        )
+        # ------------------------------------------------------------
+        # Image encoder — BioViL-T vs. RAD-DINO-MAIRA-2. The mode also
+        # dictates the shared feature dim and patch count used by the
+        # predictor and the text encoder's projection setting; both are
+        # auto-derived unless overridden.
+        # ------------------------------------------------------------
+        if mode in BIOVILT_IMAGE_MODES:
+            self.image_encoder = BioViLTImageEncoderJEPA(
+                mode=mode,
+                checkpoint_path=checkpoint_path,
+            )
+            default_num_patches = 196
+            default_d_model = 128
+            text_mode = mode
+            text_use_projection = True
+            text_checkpoint = checkpoint_path
+        elif mode in RADDINO_IMAGE_MODES:
+            self.image_encoder = RADDINOImageEncoderJEPA(
+                mode=mode,
+                checkpoint_path=checkpoint_path,
+            )
+            default_num_patches = RAD_DINO_NUM_PATCHES
+            default_d_model = RAD_DINO_HIDDEN_SIZE
+            # RAD-DINO has no companion text encoder, so we always pair
+            # it with pretrained BioViL-T CXR-BERT. Skip the 768→128
+            # projection so text tokens match the 768-d image patches.
+            text_mode = "biovilt"
+            text_use_projection = False
+            text_checkpoint = None
+        else:
+            raise ValueError(
+                f"Unknown mode {mode!r}; expected one of "
+                f"{sorted(BIOVILT_IMAGE_MODES | RADDINO_IMAGE_MODES)}"
+            )
+
         self.target_image_encoder = _build_target_encoder(self.image_encoder)
 
         self.text_encoder = BioViLTTextEncoder(
-            mode=mode,
-            checkpoint_path=checkpoint_path,
+            mode=text_mode,
+            checkpoint_path=text_checkpoint,
+            use_projection=text_use_projection,
         )
+
+        if num_patches is None:
+            num_patches = default_num_patches
+        if d_model is None:
+            d_model = default_d_model
+        self.num_patches = num_patches
+        self.d_model = d_model
 
         self.predictor = IJEPATemporalPredictor(
             num_patches=num_patches,
