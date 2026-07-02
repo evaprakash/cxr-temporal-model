@@ -50,13 +50,23 @@ from dataset_combined_jepa import (
 )
 
 
+# Bulk data lives under ``<repo>/all_data`` by default (typically a
+# symlink to scratch storage). ``JEPA_IMAGE_ROOTS_DIR`` overrides the
+# whole tree; the per-dataset ``*_ROOT`` env vars still win over that.
+_DEFAULT_ROOTS_DIR = os.environ.get(
+    "JEPA_IMAGE_ROOTS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "all_data"),
+)
 DEFAULT_IMAGE_ROOTS = {
-    "mimic": os.environ.get("MIMIC_ROOT", "/home/evaprakash/all_data/mimic"),
+    "mimic": os.environ.get(
+        "MIMIC_ROOT", os.path.join(_DEFAULT_ROOTS_DIR, "mimic")
+    ),
     "chexpert": os.environ.get(
-        "CHEXPERT_ROOT", "/home/evaprakash/all_data/chexpert/train"
+        "CHEXPERT_ROOT", os.path.join(_DEFAULT_ROOTS_DIR, "chexpert", "train")
     ),
     "rexgradient": os.environ.get(
-        "REXGRADIENT_ROOT", "/home/evaprakash/all_data/rexgradient/deid_png"
+        "REXGRADIENT_ROOT",
+        os.path.join(_DEFAULT_ROOTS_DIR, "rexgradient", "deid_png"),
     ),
 }
 

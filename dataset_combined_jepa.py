@@ -578,10 +578,20 @@ def jepa_collate_fn(batch):
 if __name__ == "__main__":
     import argparse
 
+    # CLI defaults mirror the training-time resolution rule: bulk data
+    # lives under ``<repo>/all_data`` by default (typically a symlink),
+    # overridable via ``JEPA_IMAGE_ROOTS_DIR`` or the per-root flags below.
+    _CLI_ROOTS_DIR = os.environ.get(
+        "JEPA_IMAGE_ROOTS_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "all_data"),
+    )
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mimic-root", default="/home/evaprakash/all_data/mimic")
-    parser.add_argument("--chexpert-root", default="/home/evaprakash/all_data/chexpert/train")
-    parser.add_argument("--rexgradient-root", default="/home/evaprakash/all_data/rexgradient/deid_png")
+    parser.add_argument("--mimic-root",
+                        default=os.path.join(_CLI_ROOTS_DIR, "mimic"))
+    parser.add_argument("--chexpert-root",
+                        default=os.path.join(_CLI_ROOTS_DIR, "chexpert", "train"))
+    parser.add_argument("--rexgradient-root",
+                        default=os.path.join(_CLI_ROOTS_DIR, "rexgradient", "deid_png"))
     parser.add_argument("--split", default=None)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--split-seed", type=int, default=42)

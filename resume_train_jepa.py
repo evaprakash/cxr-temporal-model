@@ -137,10 +137,20 @@ _DEFAULT_LOG_DIR = os.path.join(_HERE, f"logs_{CONDITION_MODE}")
 CHECKPOINT_DIR = os.environ.get("JEPA_CHECKPOINT_DIR", _DEFAULT_CKPT_DIR)
 LOG_DIR = os.environ.get("JEPA_LOG_DIR", _DEFAULT_LOG_DIR)
 
+# Image roots resolve relative to this script's directory by default,
+# so ``all_data/`` is a peer of ``CheXTemporal/`` inside the project
+# clone (both are typically symlinks into scratch storage on the
+# cluster). Override the base directory via ``JEPA_IMAGE_ROOTS_DIR`` if
+# you keep the bulk data somewhere else — same pattern as
+# ``CHEXTEMPORAL_DIR`` in ``dataset_combined_jepa.py``.
+_IMAGE_ROOTS_DIR = os.environ.get(
+    "JEPA_IMAGE_ROOTS_DIR",
+    os.path.join(_HERE, "all_data"),
+)
 IMAGE_ROOTS = {
-    "mimic": "/home/evaprakash/all_data/mimic",
-    "chexpert": "/home/evaprakash/all_data/chexpert/train",
-    "rexgradient": "/home/evaprakash/all_data/rexgradient/deid_png",
+    "mimic":       os.path.join(_IMAGE_ROOTS_DIR, "mimic"),
+    "chexpert":    os.path.join(_IMAGE_ROOTS_DIR, "chexpert", "train"),
+    "rexgradient": os.path.join(_IMAGE_ROOTS_DIR, "rexgradient", "deid_png"),
 }
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
