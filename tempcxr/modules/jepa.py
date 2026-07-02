@@ -272,6 +272,7 @@ class TempCXRJEPA(nn.Module):
         current_reports,
         condition_texts,
         progression_prompts_flat=None,
+        progression_prior_pair_idx=None,
     ):
         """
         prior_imgs       : (B, 3, H, W)
@@ -286,21 +287,51 @@ class TempCXRJEPA(nn.Module):
                            string (``"templated"``). The model treats
                            it as an opaque string either way.
         progression_prompts_flat
-                           Optional ``list[str]`` of length ``B * C`` for
-                           the 4th (progression-classification) loss. The
-                           prompts are expected in **pair-major,
-                           class-minor** order — i.e. the first C entries
-                           are the 5 templated prompts for pair 0, the
-                           next C for pair 1, etc. ``C`` is inferred from
-                           ``len(progression_prompts_flat) // B``.
+                           Optional ``list[str]`` for the 4th
+                           (progression-classification) loss. Two
+                           layouts are supported, discriminated by
+                           ``progression_prior_pair_idx``:
 
-                           When provided, the predictor is run a second
-                           time on ``z_prior.repeat_interleave(C, dim=0)``
-                           conditioned on these prompts, producing
-                           ``pred_progression_patches`` of shape
-                           ``(B, C, N, D)`` in the output dict. When
-                           ``None`` (e.g. inference / smoke test),
-                           ``pred_progression_patches`` is omitted.
+                           * ``progression_prior_pair_idx is None``:
+                             pair-major, class-minor with F = 1
+                             finding per pair. Length must be
+                             ``B * C``: first ``C`` entries are pair
+                             0's class prompts, next ``C`` are pair
+                             1's, etc. ``C`` is inferred from
+                             ``len(progression_prompts_flat) // B``.
+                             Output ``pred_progression_patches`` is
+                             reshaped to ``(B, C, N, D)``.
+
+                           * ``progression_prior_pair_idx`` provided
+                             (F_total,): finding-major, class-minor
+                             with variable F per pair. Length must be
+                             ``F_total * C``: first ``C`` entries are
+                             finding-0's class prompts, next ``C`` are
+                             finding-1's, etc. ``C`` is inferred from
+                             ``len(progression_prompts_flat) //
+                             F_total``. ``pred_progression_patches``
+                             is reshaped to ``(F_total, C, N, D)``
+                             and the caller is responsible for
+                             mapping findings back to pairs (via
+                             ``progression_prior_pair_idx``) when
+                             gathering targets and silver labels.
+
+                           When ``None`` (inference / smoke test) or
+                           empty, ``pred_progression_patches`` is
+                           omitted from the output dict.
+        progression_prior_pair_idx
+                           Optional 1-D ``LongTensor`` of length
+                           ``F_total`` mapping each finding-block of
+                           ``C`` prompts back to its source pair index
+                           in the main batch (values in ``[0, B)``).
+                           Only used when
+                           ``progression_prompts_flat`` is also
+                           provided. When passed, the predictor's
+                           prog pass uses ``prior_patches[pair_idx]``
+                           to gather ``z_prior`` per finding — this is
+                           the "all findings per pair" configuration
+                           where pairs with more silver findings
+                           contribute more predictor calls.
 
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, unit-norm,
@@ -318,13 +349,17 @@ class TempCXRJEPA(nn.Module):
           - current_token_mask       (B, T)
           - condition_txt_local      (B, T, D)  unit-norm
           - condition_token_mask     (B, T)
-          - pred_progression_patches (B, C, N, D)  predictor outputs
+          - pred_progression_patches (M, C, N, D)  predictor outputs
                                                 ``ẑ_cur^c`` for each
-                                                progression class, one
-                                                per ``progression_prompts_flat``
-                                                entry (only present when
+                                                progression class,
+                                                where ``M == B`` when
+                                                ``progression_prior_pair_idx``
+                                                is ``None`` and
+                                                ``M == F_total``
+                                                otherwise. Only present
+                                                when
                                                 ``progression_prompts_flat
-                                                is not None``).
+                                                is not None``.
         """
 
         # ---- Online encoder on prior (gradients flow) ----
@@ -348,16 +383,38 @@ class TempCXRJEPA(nn.Module):
         )
         if prog_active:
             n_prog = len(progression_prompts_flat)
-            if n_prog % B != 0:
-                raise ValueError(
-                    f"len(progression_prompts_flat)={n_prog} must be a "
-                    f"multiple of batch size B={B}"
-                )
-            C = n_prog // B
+            if progression_prior_pair_idx is not None:
+                # ``all-findings-per-pair`` layout: F_total findings across
+                # the batch (variable per pair), each contributing a
+                # ``C``-tuple of class prompts. The pair-index tensor
+                # dictates the prog batch dim, not B.
+                M = int(progression_prior_pair_idx.numel())
+                if M == 0:
+                    raise ValueError(
+                        "progression_prior_pair_idx is empty; pass None "
+                        "(and empty progression_prompts_flat) instead"
+                    )
+                if n_prog % M != 0:
+                    raise ValueError(
+                        f"len(progression_prompts_flat)={n_prog} must be "
+                        f"a multiple of F_total={M} (= "
+                        f"len(progression_prior_pair_idx))"
+                    )
+                C = n_prog // M
+            else:
+                # Legacy pair-major, class-minor layout with F=1 per pair.
+                M = B
+                if n_prog % B != 0:
+                    raise ValueError(
+                        f"len(progression_prompts_flat)={n_prog} must be "
+                        f"a multiple of batch size B={B}"
+                    )
+                C = n_prog // B
             all_reports = all_reports + list(progression_prompts_flat)
         else:
             n_prog = 0
             C = 0
+            M = 0
 
         _, all_txt_local, all_token_mask = (
             self.text_encoder.forward_contrastive(all_reports)
@@ -403,21 +460,41 @@ class TempCXRJEPA(nn.Module):
         # ---- Predictor pass #2 (optional): one ẑ_cur^c per class ----
         # Broadcast the same z_prior across the C progression prompts so
         # the predictor sees identical priors with different text
-        # conditions. ``repeat_interleave`` puts pair-i's C copies
-        # contiguously in the batch dim — same ordering as
-        # ``prog_txt_local`` (pair-major class-minor) so the rows line
-        # up. Gradients from this pass flow through ``prior_patches``
-        # (image encoder), ``prog_txt_local`` (text encoder), and the
-        # predictor's own weights.
+        # conditions. Two dispatch paths:
+        #
+        #   * F=1 per pair (``progression_prior_pair_idx is None``):
+        #     ``repeat_interleave`` puts pair-i's C copies contiguously
+        #     in the batch dim — same ordering as ``prog_txt_local``
+        #     (pair-major class-minor) so the rows line up. Prog batch
+        #     dim = B.
+        #
+        #   * Variable F per pair (``progression_prior_pair_idx`` given):
+        #     the pair-index tensor gathers ``prior_patches`` per
+        #     finding, then ``repeat_interleave(C)`` expands into
+        #     finding-major, class-minor order (matching
+        #     ``prog_txt_local``). Prog batch dim = F_total.
+        #
+        # Gradients flow through ``prior_patches`` (image encoder),
+        # ``prog_txt_local`` (text encoder), and the predictor's own
+        # weights in both paths.
         if prog_active:
-            prior_b_rep = prior_patches.repeat_interleave(C, dim=0)
+            if progression_prior_pair_idx is not None:
+                prior_per_finding = prior_patches.index_select(
+                    0, progression_prior_pair_idx
+                )
+                prior_prog_input = prior_per_finding.repeat_interleave(
+                    C, dim=0
+                )
+            else:
+                prior_prog_input = prior_patches.repeat_interleave(C, dim=0)
+
             pred_prog_flat = self.predictor(
-                prior_b_rep,
+                prior_prog_input,
                 prog_txt_local,
                 prog_token_mask,
             )
             _, N, D = pred_prog_flat.shape
-            out["pred_progression_patches"] = pred_prog_flat.view(B, C, N, D)
+            out["pred_progression_patches"] = pred_prog_flat.view(M, C, N, D)
 
         return out
 

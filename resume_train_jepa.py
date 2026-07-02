@@ -2,12 +2,28 @@
 #
 # DDP training entry point for the JEPA-style temporal CXR model.
 #
+# Branch defaults (``prog-loss-all-findings``):
+#   Same setup as main, with one change to the 4th (progression-
+#   classification) loss: every optimizer step processes *all* silver
+#   findings for *all* pairs in the batch, not just one randomly
+#   sampled finding per pair per epoch. Concretely, if pair ``p`` has
+#   ``F_p`` silver findings the prog pass builds ``F_p * 5`` prompts
+#   for it (all findings x all 5 progression classes), and the total
+#   prog batch across the whole mini-batch is
+#   ``F_total = sum_p F_p`` findings x ``5`` classes. The predictor
+#   runs once over that whole flattened batch, one CE per finding is
+#   averaged into ``prog_loss``, then a single ``optimizer.step()``
+#   fires. Result: no finding gets ``.step()``-ed on without every
+#   other finding for the same pair having contributed to the same
+#   gradient update.
+#
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
 #   - Model:    TempCXRJEPA (online + EMA + predictor) — unit-sphere
 #   - Losses:   JEPA cosine (1 - cos(ẑ_cur, z_cur))
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE
+#               + Progression 5-way image-image CE (over ALL findings
+#                 for every pair, not a per-epoch random pick)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
@@ -16,18 +32,26 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Progression loss (the "4th loss"):
-#   For each pair the dataset surfaces one randomly-picked
-#   ``(prog_finding, prog_cls_idx)`` per epoch. The trainer builds 5
-#   templated prompts ``"{prog_finding} is {class}."`` (one per
-#   progression class), passes them to ``TempCXRJEPA.forward`` as
-#   ``progression_prompts_flat`` (length B*5, pair-major class-minor),
-#   and the model runs the predictor a second time on
-#   ``z_prior.repeat_interleave(5, dim=0)`` with these 5 text conditions
-#   to produce ``ẑ_cur^c`` for each class. The loss is
-#   ``F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label)``
-#   — the train-time analog of the image-image eval rule in
-#   ``eval_progression_jepa.py``.
+# Progression loss (the "4th loss") — all-findings variant:
+#   The trainer walks every ``(pair, finding)`` tuple in the batch and
+#   emits 5 templated prompts ``"{finding} is {class}."`` per tuple,
+#   plus a per-finding pair index (which source pair it came from) and
+#   a per-finding silver label. The model runs the predictor on
+#   ``prior_patches[pair_idx].repeat_interleave(5, dim=0)`` conditioned
+#   on the ``F_total * 5`` prompt tokens, producing
+#   ``pred_progression_patches`` of shape ``(F_total, 5, N, D)``. The
+#   trainer gathers the EMA target the same way
+#   (``current_patches_target[pair_idx]`` -> ``(F_total, N, D)``) and
+#   calls ``progression_classification_loss`` with the ``F_total``
+#   silver labels, giving one mean-over-findings CE that lands in
+#   ``val_prog`` / ``prog_l``.
+#
+#   This differs from ``main`` in two places only: the trainer builds
+#   an all-findings prompt list + pair-idx tensor instead of a
+#   per-epoch random pick, and ``TempCXRJEPA.forward`` gathers
+#   ``z_prior`` per finding when ``progression_prior_pair_idx`` is
+#   provided. Everything else (loss weights, LR, EMA schedule, JEPA
+#   and local-CL branches, dataset filtering) matches main.
 
 import os
 import glob
@@ -361,41 +385,74 @@ if local_rank == 0 and not os.path.exists(CSV_LOG):
 
 
 # ============================================================
-# PROGRESSION-PROMPT HELPER
+# PROGRESSION-PROMPT HELPER (all-findings variant)
 # ============================================================
-def build_progression_prompts(prog_findings):
-    """Flatten per-pair findings into a B*N_CLS prompt list.
+def build_progression_prompts_all(batch_findings, batch_prog_cls_idx):
+    """Flatten every ``(pair, finding)`` in the batch into a prog prompt list.
 
-    Pair-major, class-minor order — ``TempCXRJEPA.forward`` assumes the
-    first ``N_CLS`` entries are pair 0's class prompts, the next
-    ``N_CLS`` are pair 1's, etc. The model then uses
-    ``z_prior.repeat_interleave(N_CLS, dim=0)`` to align text to image.
+    Layout is **finding-major, class-minor**: for each pair ``p`` (in
+    input order) and each of pair ``p``'s findings (in the order they
+    appear in ``batch_findings[p]``), emit ``N_CLS`` templated prompts
+    ``"{Finding} is {class}."``. Also emit a per-finding pair index
+    (which source pair index the finding came from) and the silver
+    progression class for that finding.
 
-    The finding string is capitalized to match the templated training
-    convention (``"{Finding} is {class}."``); empty findings (defensive
-    edge case) yield empty-prefix prompts that still tokenize cleanly.
+    Returns
+    -------
+    prompts : list[str]
+        Length ``F_total * N_CLS`` where ``F_total = sum_p F_p``.
+    pair_idx : list[int]
+        Length ``F_total``. ``pair_idx[i]`` is the batch position of the
+        pair that finding ``i`` belongs to. Consumed by
+        ``TempCXRJEPA.forward`` via ``progression_prior_pair_idx`` to
+        gather ``z_prior`` and (in the trainer) ``z_cur`` per finding.
+    silver_labels : list[int]
+        Length ``F_total``. ``silver_labels[i]`` is the silver
+        progression class index (into ``CLS_ORDER``) for finding ``i``,
+        used as the CE target in
+        ``progression_classification_loss``.
+
+    Pairs with no findings are skipped silently. The dataset already
+    drops those rows in ``__init__``, so in practice every pair
+    contributes at least one finding.
     """
     prompts = []
-    for finding in prog_findings:
-        if finding:
+    pair_idx = []
+    silver_labels = []
+    for p, (findings, cls_ids) in enumerate(
+        zip(batch_findings, batch_prog_cls_idx)
+    ):
+        for finding, cls in zip(findings, cls_ids):
+            if not finding:
+                # Defensive: dataset filter should have removed these,
+                # but skip rather than emit an empty-prefix prompt that
+                # would train the model to associate "" with a real
+                # silver label.
+                continue
             f_cap = finding[:1].upper() + finding[1:]
-        else:
-            f_cap = ""
-        for cls in CLS_ORDER:
-            prompts.append(PROG_TEMPLATE.format(f_cap, cls))
-    return prompts
+            for prog_cls in CLS_ORDER:
+                prompts.append(PROG_TEMPLATE.format(f_cap, prog_cls))
+            pair_idx.append(p)
+            silver_labels.append(int(cls))
+    return prompts, pair_idx, silver_labels
 
 
 # ============================================================
 # LOSS COMPUTATION (shared by train + val)
 # ============================================================
-def compute_jepa_losses(out, prog_cls_idx, gather: bool):
+def compute_jepa_losses(out, prog_pair_idx, prog_silver_labels, gather: bool):
     """
-    out          : dict returned by TempCXRJEPA.forward
-    prog_cls_idx : (B,) long tensor — silver class for the 4th loss
-    gather       : if True, gather contrastive features across ranks
-                   for cross-rank negatives (training). If False, use
-                   local features only (validation).
+    out                : dict returned by TempCXRJEPA.forward
+    prog_pair_idx      : (F_total,) long tensor — for each finding
+                         contributing to the prog loss, the batch
+                         position of the pair it came from. Used to
+                         gather the EMA target patches per finding so
+                         they line up with ``pred_progression_patches``.
+    prog_silver_labels : (F_total,) long tensor — silver progression
+                         class index per finding.
+    gather             : if True, gather contrastive features across
+                         ranks for cross-rank negatives (training). If
+                         False, use local features only (validation).
 
     Returns: (total, jepa, prior, pred, prog) as scalar tensors.
     """
@@ -446,12 +503,28 @@ def compute_jepa_losses(out, prog_cls_idx, gather: bool):
     # negatives — the "negative classes" are already inside each pair's
     # own 5-way softmax. Cast to fp32 so the CE on the cosine logits
     # doesn't lose precision at small (1 - cos) residuals.
-    prog = progression_classification_loss(
-        out["pred_progression_patches"].float(),
-        out["current_patches_target"].float(),
-        prog_cls_idx,
-        temperature=PROG_TEMP,
-    )
+    #
+    # All-findings variant: the model returns
+    # ``pred_progression_patches`` of shape ``(F_total, C, N, D)`` (one
+    # ẑ_cur^c per (pair, finding) pair, not per pair). We gather the
+    # EMA target the same way — ``current_patches_target[pair_idx]``
+    # duplicates the target across findings sharing a pair — so
+    # ``progression_classification_loss`` sees F_total-shaped tensors
+    # everywhere and reduces to a plain mean-CE across findings.
+    if prog_pair_idx.numel() == 0:
+        # Extreme edge case: the batch had zero valid findings. Skip
+        # the prog term so we don't blow up on an empty batch dim.
+        prog = out["pred_current_patches"].new_zeros(())
+    else:
+        target_per_finding = out["current_patches_target"].index_select(
+            0, prog_pair_idx
+        )
+        prog = progression_classification_loss(
+            out["pred_progression_patches"].float(),
+            target_per_finding.float(),
+            prog_silver_labels,
+            temperature=PROG_TEMP,
+        )
 
     total = (
         W_JEPA * jepa
@@ -488,8 +561,17 @@ for epoch in range(start_epoch, EPOCHS + 1):
         current_reports = batch["current_report"]
         condition_texts = batch["condition_text"]
 
-        prog_prompts = build_progression_prompts(batch["prog_finding"])
-        prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
+        prog_prompts, prog_pair_idx_list, prog_silver_list = (
+            build_progression_prompts_all(
+                batch["findings"], batch["progression_cls_idx"]
+            )
+        )
+        prog_pair_idx = torch.tensor(
+            prog_pair_idx_list, dtype=torch.long, device=DEVICE
+        )
+        prog_silver_labels = torch.tensor(
+            prog_silver_list, dtype=torch.long, device=DEVICE
+        )
 
         optimizer.zero_grad()
 
@@ -501,10 +583,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 current_reports,
                 condition_texts,
                 progression_prompts_flat=prog_prompts,
+                progression_prior_pair_idx=prog_pair_idx,
             )
 
             loss, jepa_l, prior_l, pred_l, prog_l = compute_jepa_losses(
-                out, prog_cls_idx, gather=True
+                out, prog_pair_idx, prog_silver_labels, gather=True
             )
 
         scaler.scale(loss).backward()
@@ -527,6 +610,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "loss": f"{loss.item():.4f}",
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
+                "F_tot": int(prog_pair_idx.numel()),
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
             })
@@ -555,8 +639,17 @@ for epoch in range(start_epoch, EPOCHS + 1):
             current_reports = batch["current_report"]
             condition_texts = batch["condition_text"]
 
-            prog_prompts = build_progression_prompts(batch["prog_finding"])
-            prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
+            prog_prompts, prog_pair_idx_list, prog_silver_list = (
+                build_progression_prompts_all(
+                    batch["findings"], batch["progression_cls_idx"]
+                )
+            )
+            prog_pair_idx = torch.tensor(
+                prog_pair_idx_list, dtype=torch.long, device=DEVICE
+            )
+            prog_silver_labels = torch.tensor(
+                prog_silver_list, dtype=torch.long, device=DEVICE
+            )
 
             with torch.amp.autocast("cuda"):
                 out = model(
@@ -566,11 +659,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     current_reports,
                     condition_texts,
                     progression_prompts_flat=prog_prompts,
+                    progression_prior_pair_idx=prog_pair_idx,
                 )
 
                 total, jepa_l, prior_l, pred_l, prog_l = (
                     compute_jepa_losses(
-                        out, prog_cls_idx, gather=False
+                        out, prog_pair_idx, prog_silver_labels,
+                        gather=False,
                     )
                 )
 
