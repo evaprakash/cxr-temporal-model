@@ -50,15 +50,26 @@ CNR + Pointing Game in model space.
 Inputs
 ------
 * ``--gold-parquet`` (default: ``CheXTemporal/gold_bboxes.parquet``).
-  Read with pandas. Expected columns: ``dataset``, ``patient_id``,
-  ``study_id_prev``, ``study_id_curr``, ``disease_name``,
-  ``comparison``, ``img_path_prev``, ``img_path_curr``,
-  ``prior_bboxes``, ``current_bboxes``. Bbox columns may be
+  Read with pandas. Column names are auto-detected via the same
+  coalesce lists ``progression_classify.load_gold_pairs`` uses, so
+  both the canonical CheXTemporal parquet schema
+  (``progression`` / ``finding`` / ``parent_image_prev`` /
+  ``parent_image_curr``) and the legacy BioViL-T CSV schema
+  (``comparison`` / ``disease_name`` / ``img_path_prev`` /
+  ``img_path_curr``) are supported. Bbox columns
+  (``prior_bboxes`` / ``current_bboxes`` and their aliases) may be
   JSON-encoded strings or native list-of-list objects; both work.
+* Progression labels are lower-cased and mapped via
+  ``progression_classify._normalize_label``, then filtered to the
+  canonical 5-way CLS_ORDER — matches how the 5-way JEPA eval
+  filters gold rows.
 * Image roots for ``final_gold_<dataset>_images/`` auto-detect from
   the parquet's directory + its parent, mirroring
   ``eval_progression_jepa.py``'s ``discover_gold_image_roots``.
   ``--image-root DATASET=PATH`` overrides per-dataset.
+* Output ``cnr.csv`` uses the BioViL-T script's original column
+  names (``disease_name`` / ``comparison``) so the two CSVs merge
+  cleanly for side-by-side analysis.
 
 Notes
 -----
@@ -93,9 +104,12 @@ from dataset_combined_jepa import DEFAULT_DATASET_DIR
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
 from progression_classify import (
     DATASETS,
+    _coalesce_columns,
+    _normalize_label,
     _resolve_with_fallbacks,
     discover_gold_image_roots,
 )
+from progression_phrases import CLS_ORDER as _CANONICAL_CLS_ORDER
 from tempcxr.modules.jepa import TempCXRJEPA
 
 # ===============================================================
@@ -433,6 +447,106 @@ def render_heatmap_png(display_pil: Image.Image, heatmap: np.ndarray,
 
 
 # ===============================================================
+# GOLD-BBOXES SCHEMA NORMALIZATION
+# ===============================================================
+# Mirrors ``progression_classify.load_gold_pairs`` — the CheXTemporal
+# gold parquets use canonical names ``progression`` / ``finding`` /
+# ``parent_image_prev`` / ``parent_image_curr``, but the BioViL-T
+# heatmap-CSV export used ``comparison`` / ``disease_name`` /
+# ``img_path_prev`` / ``img_path_curr``. Auto-detect either layout so
+# the same script works on both.
+_LABEL_COLS = [
+    "progression", "comparison", "progression_label", "label", "temporal_label",
+]
+_FINDING_COLS = [
+    "finding", "disease_name", "disease", "pathology", "label_name",
+]
+_IMG_PREV_COLS = [
+    "parent_image_prev", "img_path_prev", "image_prev",
+    "image_path_prev", "image_prev_path", "prior_image_path", "img_prev",
+]
+_IMG_CURR_COLS = [
+    "parent_image_curr", "img_path_curr", "image_curr",
+    "image_path_curr", "image_curr_path", "current_image_path", "img_curr",
+]
+_PREV_BBOX_COLS = [
+    "prior_bboxes", "prev_bboxes", "bboxes_prev", "bbox_prev",
+]
+_CURR_BBOX_COLS = [
+    "current_bboxes", "curr_bboxes", "bboxes_curr", "bbox_curr",
+]
+
+
+def normalize_gold_bboxes_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename gold-bboxes columns to a canonical set + filter labels.
+
+    Canonical output columns used downstream:
+      * ``progression``       (lowercased + mapped via _normalize_label)
+      * ``finding``
+      * ``parent_image_prev`` / ``parent_image_curr``
+      * ``prior_bboxes``      / ``current_bboxes``
+      * ``dataset`` / ``patient_id`` / ``study_id_prev`` / ``study_id_curr``
+        (left untouched — required for filenames and grouping)
+
+    Rows whose progression label isn't in the canonical 5-way CLS_ORDER
+    are dropped, matching how the 5-way JEPA eval filters gold rows.
+    """
+    print(f"[gold] parquet columns: {list(df.columns)}")
+
+    label_col = _coalesce_columns(df, _LABEL_COLS)
+    if label_col is None:
+        raise ValueError(
+            f"Could not find a progression-label column. Tried: {_LABEL_COLS}. "
+            f"Columns present: {list(df.columns)}"
+        )
+    finding_col = _coalesce_columns(df, _FINDING_COLS)
+    if finding_col is None:
+        raise ValueError(
+            f"Could not find a finding column. Tried: {_FINDING_COLS}. "
+            f"Columns present: {list(df.columns)}"
+        )
+    img_prev_col = _coalesce_columns(df, _IMG_PREV_COLS)
+    img_curr_col = _coalesce_columns(df, _IMG_CURR_COLS)
+    if img_prev_col is None or img_curr_col is None:
+        raise ValueError(
+            "Could not find image-path columns. Tried prev="
+            f"{_IMG_PREV_COLS} / curr={_IMG_CURR_COLS}. "
+            f"Columns present: {list(df.columns)}"
+        )
+    prev_bbox_col = _coalesce_columns(df, _PREV_BBOX_COLS)
+    curr_bbox_col = _coalesce_columns(df, _CURR_BBOX_COLS)
+    if prev_bbox_col is None or curr_bbox_col is None:
+        raise ValueError(
+            "Could not find bbox columns. Tried prev="
+            f"{_PREV_BBOX_COLS} / curr={_CURR_BBOX_COLS}. "
+            f"Columns present: {list(df.columns)}"
+        )
+    print(
+        f"[gold]   label='{label_col}', finding='{finding_col}', "
+        f"img={img_prev_col}/{img_curr_col}, bbox={prev_bbox_col}/{curr_bbox_col}"
+    )
+
+    df = df.rename(columns={
+        label_col: "progression",
+        finding_col: "finding",
+        img_prev_col: "parent_image_prev",
+        img_curr_col: "parent_image_curr",
+        prev_bbox_col: "prior_bboxes",
+        curr_bbox_col: "current_bboxes",
+    })
+    df["progression"] = df["progression"].apply(_normalize_label)
+    kept = df["progression"].isin(_CANONICAL_CLS_ORDER)
+    n_dropped = int((~kept).sum())
+    if n_dropped > 0:
+        print(
+            f"[gold]   dropped {n_dropped} row(s) whose progression label was "
+            f"not in the canonical 5-way vocabulary ({list(_CANONICAL_CLS_ORDER)})"
+        )
+    df = df[kept].reset_index(drop=True)
+    return df
+
+
+# ===============================================================
 # BBOX PARSING (parquet-friendly)
 # ===============================================================
 def _parse_bboxes(raw) -> list:
@@ -472,7 +586,7 @@ def pick_examples(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     rng = random.Random(seed)
     by_cls: dict[str, list[int]] = {}
     for idx, row in df.iterrows():
-        by_cls.setdefault(str(row["comparison"]).lower(), []).append(idx)
+        by_cls.setdefault(str(row["progression"]).lower(), []).append(idx)
     for ids in by_cls.values():
         rng.shuffle(ids)
 
@@ -558,11 +672,13 @@ def main():
         image_roots[d] = p
         print(f"[gold] override: {d} -> {p}")
 
-    # --- Load gold_bboxes parquet ---
+    # --- Load gold_bboxes parquet + normalize schema ---
     df = pd.read_parquet(args.gold_parquet)
     if args.datasets:
         df = df[df["dataset"].isin(args.datasets)].reset_index(drop=True)
     print(f"📄 Loaded {len(df)} rows from {args.gold_parquet}")
+    df = normalize_gold_bboxes_schema(df)
+    print(f"📄 {len(df)} rows after schema normalization + label filter")
 
     def _resolve(row, col):
         try:
@@ -570,8 +686,8 @@ def main():
         except FileNotFoundError:
             return None
 
-    df["_prev_resolved"] = df.apply(lambda r: _resolve(r, "img_path_prev"), axis=1)
-    df["_curr_resolved"] = df.apply(lambda r: _resolve(r, "img_path_curr"), axis=1)
+    df["_prev_resolved"] = df.apply(lambda r: _resolve(r, "parent_image_prev"), axis=1)
+    df["_curr_resolved"] = df.apply(lambda r: _resolve(r, "parent_image_curr"), axis=1)
     df = df[df["_prev_resolved"].notna() & df["_curr_resolved"].notna()]
     df = df.reset_index(drop=True)
     print(f"📄 {len(df)} rows have both images present locally")
@@ -604,7 +720,8 @@ def main():
         prev_patches = get_patches(model, prev_t)
         curr_patches = get_patches(model, curr_t)
 
-        true_label = str(row["comparison"]).lower()
+        true_label = str(row["progression"]).lower()
+        finding_name = str(row["finding"])
 
         # Same prompt on both sides — the JEPA encoder does not encode a
         # temporal direction into its patch tokens, so there's no need to
@@ -613,7 +730,7 @@ def main():
         # localizes the finding on the two visits, not a text/encoding
         # mismatch.
         text_emb = encode_progression_prompt(
-            model, disease=row["disease_name"], progression=true_label,
+            model, disease=finding_name, progression=true_label,
         )
 
         prev_hm = patches_to_heatmap(prev_patches, text_emb, INPUT_SIZE)
@@ -641,7 +758,10 @@ def main():
             "patient_id": row["patient_id"],
             "study_id_prev": row["study_id_prev"],
             "study_id_curr": row["study_id_curr"],
-            "disease_name": row["disease_name"],
+            # Keep the ``disease_name`` + ``comparison`` output column names
+            # so the resulting cnr.csv is drop-in comparable to the
+            # BioViL-T heatmap script's output.
+            "disease_name": finding_name,
             "comparison": true_label,
         }
         cnr_records.append({**meta_common, "side": "prev",
@@ -658,7 +778,7 @@ def main():
         # ----- render -----
         p_drawn = c_drawn = 0
         if not args.no_render:
-            disease_safe = (str(row["disease_name"])
+            disease_safe = (finding_name
                             .replace(" ", "-").replace("/", "-"))
             base = (
                 f"{i:04d}_{row['dataset']}_{row['patient_id']}_"
@@ -683,7 +803,7 @@ def main():
                 return str(v) if v is not None else "-"
             print(
                 f"  [{i+1}/{len(examples)}] ds={row['dataset']:11s} "
-                f"{str(row['disease_name'])[:18]:18s} | "
+                f"{finding_name[:18]:18s} | "
                 f"prog={true_label:10s} "
                 f"prev_box={len(prev_boxes)} curr_box={len(curr_boxes)} "
                 f"CNR(prev)={_fmt(prev_cnr)} CNR(curr)={_fmt(curr_cnr)} "
