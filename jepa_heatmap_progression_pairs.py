@@ -549,14 +549,55 @@ def normalize_gold_bboxes_schema(df: pd.DataFrame) -> pd.DataFrame:
 # ===============================================================
 # BBOX PARSING (parquet-friendly)
 # ===============================================================
-def _parse_bboxes(raw) -> list:
-    """Coerce a ``prior_bboxes`` / ``current_bboxes`` cell into a list.
+# Struct-typed parquet columns (pyarrow ``list<struct<x1, y1, x2, y2,
+# label>>``) load as list-of-dicts in pandas. Support both those and
+# plain list-of-list storage, plus JSON-encoded strings from the old
+# CSV export, and normalize every box to ``[x1, y1, x2, y2, label]``.
+_BOX_KEY_ALIASES = {
+    "x1": ("x1", "x_min", "xmin", "x0", "left"),
+    "y1": ("y1", "y_min", "ymin", "y0", "top"),
+    "x2": ("x2", "x_max", "xmax", "right"),
+    "y2": ("y2", "y_max", "ymax", "bottom"),
+    "label": ("label", "name", "class", "id", "box_label"),
+}
 
-    The BioViL-T script assumed CSV storage (JSON-encoded strings), but
-    ``gold_bboxes.parquet`` can store the same field as a native
-    list-of-lists (or as JSON strings depending on how it was written).
-    Handle both, plus the various empty representations pandas can
-    produce.
+
+def _first_present(d: dict, aliases: tuple):
+    for k in aliases:
+        if k in d:
+            return d[k]
+    return None
+
+
+def _extract_box(b):
+    """Coerce one box (dict, list, tuple, ndarray) to
+    ``[x1, y1, x2, y2, label]`` — or ``None`` if the shape is unusable.
+
+    Numeric coords are left as whatever type they came in as (float,
+    int, numpy scalar); the caller casts to float when it needs to.
+    """
+    # Struct-typed parquet: dict per box.
+    if isinstance(b, dict):
+        x1 = _first_present(b, _BOX_KEY_ALIASES["x1"])
+        y1 = _first_present(b, _BOX_KEY_ALIASES["y1"])
+        x2 = _first_present(b, _BOX_KEY_ALIASES["x2"])
+        y2 = _first_present(b, _BOX_KEY_ALIASES["y2"])
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            return None
+        label = _first_present(b, _BOX_KEY_ALIASES["label"]) or ""
+        return [x1, y1, x2, y2, label]
+    if isinstance(b, np.ndarray):
+        b = b.tolist()
+    if isinstance(b, (list, tuple)):
+        if len(b) < 4:
+            return None
+        return list(b)
+    return None
+
+
+def _parse_bboxes(raw) -> list:
+    """Coerce a ``prior_bboxes`` / ``current_bboxes`` cell into a list of
+    ``[x1, y1, x2, y2, label]`` boxes, whatever the storage format was.
     """
     if raw is None:
         return []
@@ -570,12 +611,17 @@ def _parse_bboxes(raw) -> list:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             return []
-        return list(parsed) if parsed else []
+        raw = parsed
     if isinstance(raw, np.ndarray):
         raw = raw.tolist()
-    if isinstance(raw, (list, tuple)):
-        return [list(b) for b in raw]
-    return []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    boxes = []
+    for b in raw:
+        box = _extract_box(b)
+        if box is not None:
+            boxes.append(box)
+    return boxes
 
 
 # ===============================================================
