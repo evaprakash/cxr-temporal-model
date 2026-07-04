@@ -12,50 +12,54 @@ Design
   weights BioViL-T's image + text encoders ship with).
 * Image:  ``model.image_encoder(curr, prev)`` gives a pair-conditioned
   128-D global embedding. L2-normalize.
-* Text:   the prompt for each candidate finding ``d`` is *just the
-  finding name* (default template = ``"{finding}"``), rather than the
-  ``"{finding} is {progression}"`` template the JEPA disease eval uses.
-  Encoded through ``model.text_encoder.forward_contrastive``.
-  L2-normalize.
+* Text:   the prompt for each candidate finding ``d`` is
+  ``"{finding} is {gt_progression}."`` — same template as the JEPA
+  disease eval, with the finding swept and the progression class held
+  fixed to the row's ground-truth label. Encoded through
+  ``model.text_encoder.forward_contrastive``. L2-normalize.
 * Score:  ``cos(img_global, text_global[d])`` per candidate finding.
 * Predict: ``argmax_d``.
 
-Why the prompts are just the finding names
+Why the prompts include the GT progression
 ------------------------------------------
-BioViL-T's image encoder is pair-conditioned but its text-image
-contrastive alignment was trained on report text describing findings
-directly — clauses like "small pleural effusion" or "cardiomegaly" —
-rather than progression templates like "cardiomegaly is worsening".
-Feeding it the raw finding name matches what BioViL-T's alignment was
-optimized for. It also isolates the comparison: the JEPA disease eval
-gives its predictor the GT progression in the prompt, while BioViL-T
-here does not — the BioViL-T column of the results table answers
-"what does the zero-shot pretrained model think this pair depicts
-purely from the images + a bare finding name?" which is the clean
-BioViL-T baseline.
+Apples-to-apples with ``eval_disease_jepa.py``. The JEPA disease eval
+feeds its predictor ``"{finding} is {gt_progression}."`` and asks
+"which finding, given the GT progression, makes the predictor land
+closest to the true current image?" — i.e. the predictor gets *both*
+the finding token and the progression token as hints. If the BioViL-T
+counterpart only got the finding name, BioViL-T would be answering a
+harder question (no progression hint) and any accuracy gap would
+conflate model capability with the extra information JEPA received.
+Conditioning both on the GT progression is also well within
+BioViL-T's operating regime — its own zero-shot progression eval
+(``biovilt_progression_pairs.py``) uses the same ``{finding} is
+{phrase}`` template style.
 
-You can still ask BioViL-T the progression-aware question by passing
-``--prompt-template "{} is <YOUR_PROGRESSION_HINT>"`` or any other
-single-slot template with a fixed context string.
+If you want the plain "no progression hint" baseline instead, pass
+``--prompt-template "{}"`` — the script auto-detects 1-slot vs.
+2-slot templates and drops the progression when the template has
+only one positional slot.
 
 Usage
 -----
     # Sanity-check one gold row (top-5 predictions shown)
     python eval_disease_biovilt.py --demo
 
-    # Full N-way eval over the gold parquet
+    # Full N-way eval over the gold parquet (progression-conditioned)
     python eval_disease_biovilt.py --eval
 
     # Restrict vocab to findings with >=20 gold rows, run full eval
     python eval_disease_biovilt.py --eval --min-per-finding 20
 
-    # Only score rows whose GT progression is "worsening" (slice the
-    # results; the BioViL-T prompt itself is unchanged)
+    # Only score rows whose GT progression is "worsening"
     python eval_disease_biovilt.py --eval --progression worsening
 
-    # Add a natural-language wrapper around the finding name
+    # Diagnostic: bare finding name (no progression conditioning)
+    python eval_disease_biovilt.py --eval --prompt-template "{}"
+
+    # Natural-language wrapper (2-slot: finding + progression)
     python eval_disease_biovilt.py --eval \
-        --prompt-template "Findings suggest {}."
+        --prompt-template "Findings suggest {} is {}."
 """
 
 from __future__ import annotations
@@ -113,11 +117,13 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 INPUT_SIZE = 448           # matches BASE_TRANSFORM / biovilt_progression_pairs
 RESIZE_SHORT = 512
 
-# Default prompt template — just the (capitalized) finding name. Users
-# can wrap it, e.g. ``--prompt-template "There is {}."`` to add context.
-# Must contain exactly one positional slot; the finding is inserted
-# there.
-PROMPT_TEMPLATE = "{}"
+# Default prompt template — matches eval_disease_jepa exactly: the
+# (capitalized) finding is inserted in the first slot and the row's GT
+# progression class in the second slot ({improving, stable, worsening,
+# new, resolved}). Users can drop back to a 1-slot template like
+# ``"{}"`` for the bare-finding baseline; the script auto-detects the
+# slot count.
+PROMPT_TEMPLATE = "{} is {}."
 
 
 # ============================================================
@@ -152,20 +158,50 @@ def load_model() -> TempCXR:
 # ============================================================
 # PROMPT BUILDING
 # ============================================================
+def _count_slots(template: str) -> int:
+    """Count positional ``{}`` slots in the template. Only positional
+    slots are supported here — keyword templates like ``"{finding}"``
+    are rejected upstream by ``main``'s validation. The count decides
+    whether progression is inserted (2-slot) or ignored (1-slot)."""
+    n = template.count("{}")
+    if n not in (1, 2):
+        raise ValueError(
+            f"--prompt-template must contain 1 or 2 positional {{}} "
+            f"slots, got {n} in {template!r}"
+        )
+    return n
+
+
 def build_disease_prompts(
     findings_vocab: List[str],
+    progression: Optional[str],
     template: str = PROMPT_TEMPLATE,
 ) -> List[str]:
     """One prompt per candidate finding. Capitalizes the first letter of
-    the finding to match how reports typically render pathology names,
-    then applies the single-slot template."""
+    the finding to match how reports typically render pathology names.
+
+    * 2-slot templates (default ``"{} is {}."``): ``progression`` is
+      required and inserted as the second slot. Mirrors
+      ``eval_disease_jepa.build_disease_prompts``.
+    * 1-slot templates (e.g. ``"{}"``): ``progression`` is ignored —
+      this is the bare-finding baseline reachable via
+      ``--prompt-template "{}"``.
+    """
+    n_slots = _count_slots(template)
+    if n_slots == 2 and progression is None:
+        raise ValueError(
+            "2-slot template requires a progression class; got None. "
+            "Pass a 1-slot template (--prompt-template \"{}\") if you "
+            "really want the bare-finding baseline."
+        )
+
     out: List[str] = []
     for f in findings_vocab:
-        if not f:
-            out.append(template.format(f))
-            continue
-        f_cap = f[:1].upper() + f[1:]
-        out.append(template.format(f_cap))
+        f_cap = f[:1].upper() + f[1:] if f else f
+        if n_slots == 1:
+            out.append(template.format(f_cap))
+        else:
+            out.append(template.format(f_cap, progression))
     return out
 
 
@@ -173,18 +209,23 @@ def build_disease_prompts(
 def _encode_text_bank(
     model: TempCXR,
     findings_vocab: List[str],
+    progression: Optional[str],
     template: str,
     device: torch.device,
     text_cache: Optional[Dict[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Encode the full finding-name bank once. Cached on
-    ``(template, vocab)`` — since the vocab is fixed for a run, the
-    cache fires ``len(gold_df) − 1`` times over a full eval."""
-    cache_key = f"{template}||{','.join(findings_vocab)}"
+    """Encode the full finding bank once per (progression, template,
+    vocab) triple. In progression-conditioned mode the eval only has 5
+    distinct progression classes, so the cache fires
+    ``len(gold_df) − 5`` times over a full run; in 1-slot mode it fires
+    ``len(gold_df) − 1`` times."""
+    cache_key = (
+        f"{template}||{progression or ''}||{','.join(findings_vocab)}"
+    )
     if text_cache is not None and cache_key in text_cache:
         return text_cache[cache_key].to(device)
 
-    prompts = build_disease_prompts(findings_vocab, template)
+    prompts = build_disease_prompts(findings_vocab, progression, template)
     txt_global, _, _ = model.text_encoder.forward_contrastive(prompts)
     txt_global = F.normalize(txt_global, dim=-1)  # (N, D)
     if text_cache is not None:
@@ -201,12 +242,17 @@ def score_one_pair_biovilt(
     prev_path,
     curr_path,
     findings_vocab: List[str],
+    progression: Optional[str],
     template: str,
     device: torch.device,
     text_cache: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict:
     """N-way BioViL-T image-text disease classification for ONE (prev,
-    curr) pair.
+    curr, progression) row.
+
+    Sweeps the finding axis with the progression held fixed (to the GT
+    progression class, in 2-slot mode). Mirrors the signature of
+    ``eval_disease_jepa.score_one_pair_disease``.
 
     Returns
     -------
@@ -223,7 +269,7 @@ def score_one_pair_biovilt(
     img_emb = F.normalize(img_global, dim=-1)  # (1, D)
 
     phrase_embs = _encode_text_bank(
-        model, findings_vocab, template, device, text_cache,
+        model, findings_vocab, progression, template, device, text_cache,
     )
     sims = (img_emb @ phrase_embs.T).squeeze(0)  # (N,)
     cos_finding_scores = sims.detach().cpu().float().tolist()
@@ -265,9 +311,10 @@ def run_demo(args, model, gold_df, device, findings_vocab):
         row["dataset"], row["parent_image_curr"], args.image_roots,
     )
 
+    prog_arg = gt_progression if _count_slots(args.prompt_template) == 2 else None
     out = score_one_pair_biovilt(
         model, prev_path, curr_path, findings_vocab,
-        args.prompt_template, device,
+        prog_arg, args.prompt_template, device,
     )
 
     scored = sorted(
@@ -417,14 +464,20 @@ def run_eval(args, model, gold_df, device, findings_vocab):
     per_progression_ct: Dict[str, List[int]] = defaultdict(lambda: [0, 0])
 
     text_cache: Dict[str, torch.Tensor] = {}
+    n_slots = _count_slots(args.prompt_template)
 
     print(
         f"\n[eval] running {len(findings_vocab)}-way BioViL-T zero-shot "
         f"disease classification on {len(gold_df)} rows"
     )
+    cond_str = (
+        "progression-conditioned (GT progression in prompt)"
+        if n_slots == 2
+        else "bare finding name (no progression conditioning)"
+    )
     print(
         f"[eval] one prompt per finding "
-        f"(template: {args.prompt_template!r})"
+        f"(template: {args.prompt_template!r}, {cond_str})"
     )
 
     for i in range(len(gold_df)):
@@ -455,9 +508,11 @@ def run_eval(args, model, gold_df, device, findings_vocab):
             continue
 
         try:
+            prog_arg = gt_progression if n_slots == 2 else None
             out = score_one_pair_biovilt(
                 model, prev_path, curr_path, findings_vocab,
-                args.prompt_template, device, text_cache=text_cache,
+                prog_arg, args.prompt_template, device,
+                text_cache=text_cache,
             )
         except Exception as e:
             skipped_io += 1
@@ -562,9 +617,10 @@ def main():
     parser.add_argument(
         "--prompt-template",
         default=PROMPT_TEMPLATE,
-        help="Single-slot template applied to each candidate finding "
-             "(default: '{}' — just the finding name). Example: "
-             "\"Findings suggest {}.\" adds a natural-language wrapper.",
+        help="Positional-slot template applied to each candidate "
+             "finding. Default (\"{} is {}.\") is 2-slot: finding + GT "
+             "progression, matching eval_disease_jepa. Pass a 1-slot "
+             "template like \"{}\" for the bare-finding baseline.",
     )
     parser.add_argument(
         "--device",
@@ -602,9 +658,9 @@ def main():
         default=None,
         choices=list(CLS_ORDER),
         help="Optionally restrict eval to rows whose GT progression is "
-             "one of {improving, stable, worsening, new, resolved}. The "
-             "prompt is unchanged (progression isn't in the prompt "
-             "template); this just filters the eval slice.",
+             "one of {improving, stable, worsening, new, resolved}. "
+             "Filters the eval slice; the per-row GT progression is "
+             "still what's inserted into the 2-slot prompt.",
     )
     parser.add_argument(
         "--show-full-distribution",
@@ -638,16 +694,19 @@ def main():
 
     args = parser.parse_args()
 
-    # Prompt-template sanity check — must accept exactly one positional
-    # {} slot for the finding name. Two-slot templates aren't supported
-    # here; if you want to condition on progression, run the JEPA
-    # disease eval (which does use ``{finding} is {progression}``).
+    # Prompt-template sanity check — must accept 1 or 2 positional {}
+    # slots. 2-slot = finding + progression (default, matches JEPA
+    # disease eval). 1-slot = finding only (bare-finding baseline).
+    n_slots = _count_slots(args.prompt_template)
     try:
-        _ = args.prompt_template.format("test_disease")
+        if n_slots == 2:
+            _ = args.prompt_template.format("test_disease", "worsening")
+        else:
+            _ = args.prompt_template.format("test_disease")
     except (IndexError, KeyError) as e:
         raise ValueError(
-            f"--prompt-template must accept exactly one positional {{}} "
-            f"slot. Got {args.prompt_template!r}: {e}"
+            f"--prompt-template failed to format with {n_slots} "
+            f"positional arg(s). Got {args.prompt_template!r}: {e}"
         )
 
     # Image roots: same resolution rule as eval_progression_jepa.py.
