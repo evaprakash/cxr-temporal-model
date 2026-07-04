@@ -72,9 +72,9 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 
-# ``tempcxr.modules.tempcxr_model`` imports ``losses`` from the project
-# root. We don't need the training losses here (we're only running
-# inference), so stub the module out if it isn't present before
+# ``tempcxr_biovilt.modules.tempcxr_model`` imports ``losses`` from the
+# project root. We don't need the training losses here (we're only
+# running inference), so stub the module out if it isn't present before
 # importing TempCXR — same shim biovilt_progression_pairs.py uses.
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BASE_DIR not in sys.path:
@@ -102,7 +102,7 @@ from progression_classify import (  # noqa: E402
     load_gold_pairs,
 )
 from progression_phrases import CLS_ORDER  # noqa: E402
-from tempcxr.modules.tempcxr_model import TempCXR  # noqa: E402
+from tempcxr_biovilt.modules.tempcxr_model import TempCXR  # noqa: E402
 
 
 # ============================================================
