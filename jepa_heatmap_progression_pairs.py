@@ -47,6 +47,19 @@ similarity grid to the 448x448 input, overlay on the 1024-fit
 display image, draw the single-disease bboxes, and compute BioViL
 CNR + Pointing Game in model space.
 
+Inputs
+------
+* ``--gold-parquet`` (default: ``CheXTemporal/gold_bboxes.parquet``).
+  Read with pandas. Expected columns: ``dataset``, ``patient_id``,
+  ``study_id_prev``, ``study_id_curr``, ``disease_name``,
+  ``comparison``, ``img_path_prev``, ``img_path_curr``,
+  ``prior_bboxes``, ``current_bboxes``. Bbox columns may be
+  JSON-encoded strings or native list-of-list objects; both work.
+* Image roots for ``final_gold_<dataset>_images/`` auto-detect from
+  the parquet's directory + its parent, mirroring
+  ``eval_progression_jepa.py``'s ``discover_gold_image_roots``.
+  ``--image-root DATASET=PATH`` overrides per-dataset.
+
 Notes
 -----
 * The 14x14 patch grid + 448x448 input assumption matches every
@@ -56,10 +69,8 @@ Notes
   to 518 and ``RESIZE_SHORT`` to the RAD-DINO short side — the
   ``patches_to_heatmap`` code already handles the resulting 37x37
   grid via its ``side = round(sqrt(L))`` reshape.
-* Auto-locates ``gold_bboxes.csv`` in the script directory by
-  default (drop-in with the BioViL-T script) and writes PNGs +
-  ``cnr.csv`` under ``--out-dir``. Set ``--no-render`` to compute
-  metrics without rendering the ~2xN PNGs.
+* Writes PNGs + ``cnr.csv`` under ``--out-dir``. Set ``--no-render``
+  to compute metrics without rendering the ~2xN PNGs.
 """
 
 from __future__ import annotations
@@ -78,7 +89,13 @@ import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageFont
 from matplotlib import pyplot as plt
 
-from infer_jepa import load_jepa_model
+from dataset_combined_jepa import DEFAULT_DATASET_DIR
+from infer_jepa import IMAGE_ROOTS, load_jepa_model
+from progression_classify import (
+    DATASETS,
+    _resolve_with_fallbacks,
+    discover_gold_image_roots,
+)
 from tempcxr.modules.jepa import TempCXRJEPA
 
 # ===============================================================
@@ -86,8 +103,12 @@ from tempcxr.modules.jepa import TempCXRJEPA
 # ===============================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-DEFAULT_IMAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_GOLD_PREFIX = "final_gold_"
+# Gold bboxes and gold images live next to the CheXTemporal parquets by
+# default (same layout as ``eval_progression_jepa.py``): the parquet
+# ``CheXTemporal/gold_bboxes.parquet``, the images
+# ``final_gold_<dataset>_images/`` as siblings of ``CheXTemporal/`` (or
+# inside it — both layouts are handled by ``discover_gold_image_roots``).
+DEFAULT_GOLD_PARQUET = os.path.join(DEFAULT_DATASET_DIR, "gold_bboxes.parquet")
 DEFAULT_CKPT = os.environ.get(
     "JEPA_CKPT", "checkpoints_jepa_dynamic/best.pt"
 )
@@ -141,8 +162,11 @@ transform = T.Compose([
 ])
 
 
-def load_image(path: str) -> tuple[torch.Tensor, Image.Image, tuple[int, int]]:
+def load_image(path) -> tuple[torch.Tensor, Image.Image, tuple[int, int]]:
     """Returns (model_tensor on DEVICE, display_pil, original (W, H)).
+
+    ``path`` may be ``str`` or ``pathlib.Path`` (as returned by
+    ``_resolve_with_fallbacks``).
 
     ``model_tensor`` is what the model sees: the original PIL image after
     ``Resize(512)`` + ``CenterCrop(448)`` + ``ToTensor``.
@@ -153,7 +177,7 @@ def load_image(path: str) -> tuple[torch.Tensor, Image.Image, tuple[int, int]]:
     coords from the annotation tool can be drawn with their *raw* values,
     no transform.
     """
-    img = Image.open(path).convert("RGB")
+    img = Image.open(str(path)).convert("RGB")
     orig_size = img.size  # (W, H)
 
     img_t = transform(img)
@@ -164,11 +188,6 @@ def load_image(path: str) -> tuple[torch.Tensor, Image.Image, tuple[int, int]]:
     display_pil.thumbnail((BBOX_FIT_SIZE, BBOX_FIT_SIZE))
 
     return img_t.to(DEVICE), display_pil, orig_size
-
-
-def resolve_image_path(image_root: str, gold_prefix: str,
-                       dataset: str, rel_path: str) -> str:
-    return os.path.join(image_root, f"{gold_prefix}{dataset}_images", rel_path)
 
 
 # ===============================================================
@@ -414,6 +433,38 @@ def render_heatmap_png(display_pil: Image.Image, heatmap: np.ndarray,
 
 
 # ===============================================================
+# BBOX PARSING (parquet-friendly)
+# ===============================================================
+def _parse_bboxes(raw) -> list:
+    """Coerce a ``prior_bboxes`` / ``current_bboxes`` cell into a list.
+
+    The BioViL-T script assumed CSV storage (JSON-encoded strings), but
+    ``gold_bboxes.parquet`` can store the same field as a native
+    list-of-lists (or as JSON strings depending on how it was written).
+    Handle both, plus the various empty representations pandas can
+    produce.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, float) and np.isnan(raw):
+        return []
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return list(parsed) if parsed else []
+    if isinstance(raw, np.ndarray):
+        raw = raw.tolist()
+    if isinstance(raw, (list, tuple)):
+        return [list(b) for b in raw]
+    return []
+
+
+# ===============================================================
 # EXAMPLE SELECTION
 # ===============================================================
 def pick_examples(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
@@ -448,19 +499,28 @@ def main():
     parser.add_argument("--ckpt", default=DEFAULT_CKPT,
                         help="Path to a JEPA checkpoint (default: "
                              f"{DEFAULT_CKPT}). Override via JEPA_CKPT env var.")
-    parser.add_argument("--input-csv", default="gold_bboxes.csv",
-                        help="CSV with prior_bboxes / current_bboxes columns")
+    parser.add_argument("--gold-parquet", default=DEFAULT_GOLD_PARQUET,
+                        help=f"Path to gold_bboxes.parquet "
+                             f"(default: {DEFAULT_GOLD_PARQUET}). "
+                             f"The parquet's directory is used as the search "
+                             f"root for auto-detecting "
+                             f"final_gold_<dataset>_images/ folders.")
     parser.add_argument("--out-dir", default="heatmaps_progression_pairs_jepa",
                         help="Folder to save the rendered PNGs in")
-    parser.add_argument("--image-root", default=DEFAULT_IMAGE_ROOT)
-    parser.add_argument("--gold-prefix", default=DEFAULT_GOLD_PREFIX,
-                        choices=("final_gold_", "gold_"))
+    parser.add_argument("--image-root", action="append", default=[],
+                        metavar="DATASET=PATH",
+                        help="Override an image root for one dataset. Can "
+                             "repeat. Example: --image-root "
+                             "mimic=/data/final_gold_mimic_images. Defaults: "
+                             "final_gold_<dataset>_images/ next to the gold "
+                             "parquet if present, else IMAGE_ROOTS from "
+                             "infer_jepa.py.")
     parser.add_argument("--datasets", nargs="*", default=None,
                         help="Optional dataset filter, e.g. mimic chexpert")
     parser.add_argument("--num-examples", type=int, default=None,
                         help="If set, only render N examples (one per "
                              "progression class when possible). Default: "
-                             "run on every row in the CSV.")
+                             "run on every row in the parquet.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=0.75,
                         help="Heatmap opacity (0..1)")
@@ -474,23 +534,52 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(args.input_csv)
+    # --- Image roots: same resolution rule as eval_progression_jepa.py ---
+    # Start from the silver IMAGE_ROOTS (so paths like "mimic/p11/..." also
+    # resolve under all_data/), prefer final_gold_<dataset>_images/ near the
+    # parquet if present, then apply --image-root overrides last.
+    parquet_dir = os.path.dirname(os.path.abspath(args.gold_parquet))
+    auto_gold_roots = discover_gold_image_roots(parquet_dir)
+    image_roots: dict[str, str] = {**IMAGE_ROOTS, **auto_gold_roots}
+    if auto_gold_roots:
+        print("[gold] auto-detected gold image roots:")
+        for d, p in auto_gold_roots.items():
+            print(f"  {d}: {p}")
+    for spec in args.image_root:
+        if "=" not in spec:
+            raise ValueError(
+                f"--image-root expects DATASET=PATH, got: {spec!r}"
+            )
+        d, p = spec.split("=", 1)
+        if d not in DATASETS:
+            raise ValueError(
+                f"--image-root dataset must be one of {DATASETS}, got {d!r}"
+            )
+        image_roots[d] = p
+        print(f"[gold] override: {d} -> {p}")
+
+    # --- Load gold_bboxes parquet ---
+    df = pd.read_parquet(args.gold_parquet)
     if args.datasets:
         df = df[df["dataset"].isin(args.datasets)].reset_index(drop=True)
-    print(f"📄 Loaded {len(df)} rows from {args.input_csv}")
+    print(f"📄 Loaded {len(df)} rows from {args.gold_parquet}")
 
-    def both_exist(row):
-        p = resolve_image_path(args.image_root, args.gold_prefix,
-                               row["dataset"], row["img_path_prev"])
-        c = resolve_image_path(args.image_root, args.gold_prefix,
-                               row["dataset"], row["img_path_curr"])
-        return os.path.isfile(p) and os.path.isfile(c)
+    def _resolve(row, col):
+        try:
+            return _resolve_with_fallbacks(row["dataset"], row[col], image_roots)
+        except FileNotFoundError:
+            return None
 
-    df = df[df.apply(both_exist, axis=1)].reset_index(drop=True)
+    df["_prev_resolved"] = df.apply(lambda r: _resolve(r, "img_path_prev"), axis=1)
+    df["_curr_resolved"] = df.apply(lambda r: _resolve(r, "img_path_curr"), axis=1)
+    df = df[df["_prev_resolved"].notna() & df["_curr_resolved"].notna()]
+    df = df.reset_index(drop=True)
     print(f"📄 {len(df)} rows have both images present locally")
     if len(df) == 0:
         raise SystemExit(
-            "No usable examples — check --image-root and --gold-prefix.")
+            "No usable examples — check --gold-parquet, --image-root, and "
+            "the presence of final_gold_<dataset>_images/ next to the parquet."
+        )
 
     if args.num_examples is not None:
         examples = pick_examples(df, n=args.num_examples, seed=args.seed)
@@ -503,10 +592,8 @@ def main():
     cnr_records: list[dict] = []  # one row per (example, side)
 
     for i, row in examples.iterrows():
-        prev_path = resolve_image_path(args.image_root, args.gold_prefix,
-                                       row["dataset"], row["img_path_prev"])
-        curr_path = resolve_image_path(args.image_root, args.gold_prefix,
-                                       row["dataset"], row["img_path_curr"])
+        prev_path = row["_prev_resolved"]
+        curr_path = row["_curr_resolved"]
 
         prev_t, prev_disp, prev_orig = load_image(prev_path)
         curr_t, curr_disp, curr_orig = load_image(curr_path)
@@ -536,8 +623,8 @@ def main():
         vmin = float(min(prev_hm.min(), curr_hm.min()))
         vmax = float(max(prev_hm.max(), curr_hm.max()))
 
-        prev_boxes = json.loads(row.get("prior_bboxes") or "[]")
-        curr_boxes = json.loads(row.get("current_bboxes") or "[]")
+        prev_boxes = _parse_bboxes(row.get("prior_bboxes"))
+        curr_boxes = _parse_bboxes(row.get("current_bboxes"))
 
         # ----- CNR / PG -----
         prev_mask = boxes_mask_in_model_space(
