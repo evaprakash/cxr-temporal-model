@@ -71,14 +71,31 @@ IMAGE_ROOTS = {
 # ============================================================
 # SHARED HELPERS (also imported by progression_classify.py)
 # ============================================================
-def load_jepa_model(ckpt_path: str, device: torch.device) -> TempCXRJEPA:
+def load_jepa_model(
+    ckpt_path: str,
+    device: torch.device,
+    mode: str | None = None,
+) -> TempCXRJEPA:
     """Build a TempCXRJEPA and load weights from ``ckpt_path``.
 
     The checkpoint dict is the one produced by ``resume_train_jepa.py``:
     ``ckpt["model"]`` is the full state dict (online + EMA target image
     encoders, text encoder, predictor).
+
+    ``mode`` selects the image-encoder backbone (see ``TempCXRJEPA``):
+    ``"biovilt"`` / ``"biovilt_finetuned"`` for the BioViL-T backbone
+    (128-d, 14x14=196 patches) or ``"raddino"`` /
+    ``"raddino_finetuned"`` for RAD-DINO-MAIRA-2 (768-d, 37x37=1369
+    patches, 518x518 input). Must match how the checkpoint was
+    trained — a mismatch will silently zero out the encoder / predictor
+    via ``strict=False``, so pass the right one explicitly. Falls back
+    to the ``MODEL_MODE`` env var if ``mode`` is ``None`` (same knob the
+    trainer uses), then to ``"biovilt"`` as the historical default.
     """
+    if mode is None:
+        mode = os.environ.get("MODEL_MODE", "biovilt")
     print(f"[infer] loading checkpoint: {ckpt_path}")
+    print(f"[infer]   model_mode: {mode}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if "model" not in ckpt:
         raise ValueError(
@@ -87,7 +104,7 @@ def load_jepa_model(ckpt_path: str, device: torch.device) -> TempCXRJEPA:
         )
     print(f"[infer]   epoch={ckpt.get('epoch', '?')}  "
           f"best_val_loss={ckpt.get('best_val_loss', '?')}")
-    model = TempCXRJEPA()
+    model = TempCXRJEPA(mode=mode)
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     if missing:
         print(f"[infer] WARNING: {len(missing)} missing keys "
