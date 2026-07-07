@@ -61,10 +61,18 @@ from tempcxr.modules.jepa import TempCXRJEPA
 # ============================================================
 # IMAGE ROOTS (must match training)
 # ============================================================
+# Same resolution rule as ``resume_train_jepa.py``: default to
+# ``<script_dir>/all_data`` so a single symlink at the project root
+# feeds both training and inference. ``JEPA_IMAGE_ROOTS_DIR`` overrides.
+_HERE_IMG = os.path.dirname(os.path.abspath(__file__))
+_IMAGE_ROOTS_DIR = os.environ.get(
+    "JEPA_IMAGE_ROOTS_DIR",
+    os.path.join(_HERE_IMG, "all_data"),
+)
 IMAGE_ROOTS = {
-    "mimic": "/home/evaprakash/all_data/mimic",
-    "chexpert": "/home/evaprakash/all_data/chexpert/train",
-    "rexgradient": "/home/evaprakash/all_data/rexgradient/deid_png",
+    "mimic":       os.path.join(_IMAGE_ROOTS_DIR, "mimic"),
+    "chexpert":    os.path.join(_IMAGE_ROOTS_DIR, "chexpert", "train"),
+    "rexgradient": os.path.join(_IMAGE_ROOTS_DIR, "rexgradient", "deid_png"),
 }
 
 
