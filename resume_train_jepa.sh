@@ -78,7 +78,7 @@ export PYTHONFAULTHANDLER=1
 # the class-balanced-weighting ablation so its checkpoint /log dirs
 # don't collide with any other ``main``-based experiment.
 # ============================================================
-PROJECT_DIR="${PROJECT_DIR:-/scratch/m000081/eprakash/temporal/final/cxr-temporal-model-cbw}"
+PROJECT_DIR="${PROJECT_DIR:-/scratch/m000081/eprakash/temporal/final/cxr-temporal-model-cbw/cxr-temporal-model}"
 cd "$PROJECT_DIR"
 echo "[slurm] PROJECT_DIR = $PROJECT_DIR"
 echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<not a git checkout>')"
