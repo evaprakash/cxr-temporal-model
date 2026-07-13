@@ -7,7 +7,9 @@
 #   - Losses:   JEPA cosine (1 - cos(ẑ_cur, z_cur))
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE
+#               + Progression 5-way image-image CE, class-balanced
+#                 (Cui et al. 2019, β=0.99999 by default) — see the
+#                 ``CBW_*`` constants below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
@@ -25,9 +27,12 @@
 #   and the model runs the predictor a second time on
 #   ``z_prior.repeat_interleave(5, dim=0)`` with these 5 text conditions
 #   to produce ``ẑ_cur^c`` for each class. The loss is
-#   ``F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label)``
+#   ``F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label,
+#                     weight=class_weights)``
 #   — the train-time analog of the image-image eval rule in
-#   ``eval_progression_jepa.py``.
+#   ``eval_progression_jepa.py``, class-balanced via effective-
+#   number-of-samples weights so rare silver classes (``resolved`` is
+#   only ~1 % of silver) contribute a meaningful gradient.
 
 import os
 import glob
@@ -104,19 +109,49 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # step to score the image-image cosine logits.
 CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 
-# Always namespace checkpoints / logs by condition mode so the two
-# modes never clobber each other's checkpoints and so legacy
-# ``checkpoints_jepa/`` / ``logs/`` dirs from older (pre-3-loss, pre-
-# softmax-fix) runs are left untouched as an archive.
-_DEFAULT_CKPT_DIR = os.path.join(_HERE, f"checkpoints_jepa_{CONDITION_MODE}")
-_DEFAULT_LOG_DIR = os.path.join(_HERE, f"logs_{CONDITION_MODE}")
+# Cui et al. 2019 "Class-Balanced Loss" hyperparameter for the 4th
+# (progression) loss. Beta close to 1 approaches inverse-frequency
+# weighting; closer to 0 approaches uniform weights. β=0.99999
+# saturates the effective-count formula around ~100k samples, giving
+# the middle three silver classes (improving / worsening / new,
+# 32k–65k) a real ~2× boost vs the majority ``stable`` class and the
+# rare ``resolved`` class (3.1k) roughly a 25× boost. See the summary
+# comment above and ``_compute_cui_class_weights`` below.
+CBW_BETA = 0.99999
+
+# Encode the setting in the ckpt / log dir names so this ablation
+# never clobbers earlier unweighted-CE runs. For CBW_BETA=0.99999 the
+# tag is ``cbw99999`` (five 9s = five decimal places of ``0.99999``).
+_beta_tag = str(CBW_BETA).replace("0.", "").replace(".", "")
+_SETTING_TAG = f"cbw{_beta_tag}"
+
+# Always namespace checkpoints / logs by condition mode + setting tag
+# so nothing clobbers earlier runs and legacy ``checkpoints_jepa/`` /
+# ``logs/`` dirs from older (pre-4-loss / pre-CBW) runs are left
+# untouched as archives.
+_DEFAULT_CKPT_DIR = os.path.join(
+    _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
+)
+_DEFAULT_LOG_DIR = os.path.join(
+    _HERE, f"logs_{CONDITION_MODE}_{_SETTING_TAG}"
+)
 CHECKPOINT_DIR = os.environ.get("JEPA_CHECKPOINT_DIR", _DEFAULT_CKPT_DIR)
 LOG_DIR = os.environ.get("JEPA_LOG_DIR", _DEFAULT_LOG_DIR)
 
+# Image roots resolve relative to this script's directory by default,
+# so ``all_data/`` is a peer of ``CheXTemporal/`` inside the project
+# clone (both are typically symlinks into scratch storage on the
+# cluster). Override the base directory via ``JEPA_IMAGE_ROOTS_DIR`` if
+# you keep the bulk data somewhere else — same pattern as
+# ``CHEXTEMPORAL_DIR`` in ``dataset_combined_jepa.py``.
+_IMAGE_ROOTS_DIR = os.environ.get(
+    "JEPA_IMAGE_ROOTS_DIR",
+    os.path.join(_HERE, "all_data"),
+)
 IMAGE_ROOTS = {
-    "mimic": "/home/evaprakash/all_data/mimic",
-    "chexpert": "/home/evaprakash/all_data/chexpert/train",
-    "rexgradient": "/home/evaprakash/all_data/rexgradient/deid_png",
+    "mimic":       os.path.join(_IMAGE_ROOTS_DIR, "mimic"),
+    "chexpert":    os.path.join(_IMAGE_ROOTS_DIR, "chexpert", "train"),
+    "rexgradient": os.path.join(_IMAGE_ROOTS_DIR, "rexgradient", "deid_png"),
 }
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -214,6 +249,45 @@ SPLIT_SEED = 42
 
 
 # ============================================================
+# CLASS-BALANCED WEIGHTS (Cui et al. 2019)
+# ============================================================
+def _compute_cui_class_weights(dataset, beta: float) -> torch.Tensor:
+    """Effective-number-of-samples class weights (Cui et al. 2019).
+
+    For each class ``c`` with ``n_c`` per-finding rows in the training
+    split::
+
+        E_c = (1 - β^n_c) / (1 - β)
+        w_c ∝ 1 / E_c
+
+    then normalized so the K weights average to 1 (i.e. sum to K),
+    which keeps the CE magnitude comparable to the unweighted version
+    and thus keeps ``W_PROG`` on the same scale as before.
+
+    Counts are taken from the *actual training split* (not the raw
+    silver totals from the HF dataset card), so if the train/val
+    split shifts the class distribution slightly the weights follow.
+    Every rank computes the same weights from the deterministic split,
+    so no broadcast is needed.
+    """
+    # Flatten the per-pair ``progression_cls`` lists into a single
+    # class-name column, then value_counts by class.
+    exploded = dataset.df["progression_cls"].explode()
+    counts_by_name = exploded.value_counts()
+
+    counts = torch.zeros(N_CLS, dtype=torch.float64)
+    for name, c in counts_by_name.items():
+        if name in CLS_ORDER:
+            counts[CLS_ORDER.index(name)] = float(c)
+
+    beta_t = torch.tensor(beta, dtype=torch.float64)
+    effective_num = (1.0 - torch.pow(beta_t, counts)) / (1.0 - beta_t)
+    weights = 1.0 / effective_num
+    weights = weights * N_CLS / weights.sum()
+    return weights.float(), counts.long()
+
+
+# ============================================================
 # DATASETS
 # ============================================================
 train_dataset = JEPACombinedDataset(
@@ -234,10 +308,31 @@ val_dataset = JEPACombinedDataset(
     condition_mode=CONDITION_MODE,
 )
 
+# Compute Cui et al. class-balanced weights from the ACTUAL training
+# split (same numbers on every rank because the split is deterministic).
+# Weights are pushed to ``DEVICE`` once so the loss doesn't move them
+# every step.
+_prog_class_weights_cpu, _prog_class_counts = _compute_cui_class_weights(
+    train_dataset, beta=CBW_BETA
+)
+PROG_CLASS_WEIGHTS = _prog_class_weights_cpu.to(DEVICE)
+
 if local_rank == 0:
     print(f"[train] condition_mode={CONDITION_MODE}")
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
     print(f"[train] log dir:        {LOG_DIR}")
+    print(
+        f"[train] progression-class CBW: β={CBW_BETA} "
+        f"(Cui et al. 2019, effective-number-of-samples)"
+    )
+    for cls, n, w in zip(
+        CLS_ORDER,
+        _prog_class_counts.tolist(),
+        _prog_class_weights_cpu.tolist(),
+    ):
+        print(
+            f"[train]   {cls:<10} n_train={n:>7d}  weight={w:.4f}"
+        )
 
 train_sampler = DistributedSampler(
     train_dataset,
@@ -445,12 +540,16 @@ def compute_jepa_losses(out, prog_cls_idx, gather: bool):
     # per-pair quantities, so other ranks' samples wouldn't add useful
     # negatives — the "negative classes" are already inside each pair's
     # own 5-way softmax. Cast to fp32 so the CE on the cosine logits
-    # doesn't lose precision at small (1 - cos) residuals.
+    # doesn't lose precision at small (1 - cos) residuals. ``weight=``
+    # uses the Cui et al. class-balanced weights so the rare silver
+    # classes (``resolved``, ~1 % of silver) contribute a proportionally
+    # larger gradient than the majority ``stable`` class.
     prog = progression_classification_loss(
         out["pred_progression_patches"].float(),
         out["current_patches_target"].float(),
         prog_cls_idx,
         temperature=PROG_TEMP,
+        class_weights=PROG_CLASS_WEIGHTS,
     )
 
     total = (

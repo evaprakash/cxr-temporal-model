@@ -14,12 +14,17 @@ scale-invariant — so this module exposes:
     image-image eval rule in ``eval_progression_jepa.py`` —
     "best match is determined through cos(ẑ_cur, z_cur)" — so the
     training objective matches what's actually being measured at test
-    time.
+    time. Supports optional per-class weights (Cui et al. 2019
+    "Class-Balanced Loss Based on Effective Number of Samples") so the
+    minority silver classes (``resolved`` ≈ 1 % of silver) get a
+    proportionally larger gradient than the majority ``stable`` class.
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
 already-unit-norm patches is a no-op.
 """
+
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -58,6 +63,7 @@ def progression_classification_loss(
     silver_labels: torch.Tensor,             # (B,) long, values in [0, C)
     temperature: float = 0.1,
     eps: float = 1e-8,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """5-way image-image cross-entropy on the predictor's candidate latents.
 
@@ -96,6 +102,14 @@ def progression_classification_loss(
         — peaky enough to be discriminative without saturating.
     eps
         L2-normalization numeric stability epsilon.
+    class_weights
+        Optional ``(C,)`` float tensor of per-class weights forwarded to
+        ``F.cross_entropy(..., weight=class_weights)``. Intended for
+        class-balanced re-weighting of the CE — e.g. the effective-
+        number-of-samples scheme (Cui et al. 2019) that up-weights rare
+        silver classes (``resolved`` at 1 % of silver would otherwise
+        contribute negligible gradient). When ``None`` (default) the
+        loss reduces to standard unweighted CE.
 
     Returns
     -------
@@ -116,4 +130,4 @@ def progression_classification_loss(
     logits = cos_per_patch.mean(dim=-1)                        # (B, C)
     logits = logits / temperature
 
-    return F.cross_entropy(logits, silver_labels)
+    return F.cross_entropy(logits, silver_labels, weight=class_weights)
