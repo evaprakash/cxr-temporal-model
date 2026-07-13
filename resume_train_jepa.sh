@@ -31,10 +31,16 @@
 # schedule) is untouched, so this is a clean single-variable ablation
 # vs the unweighted-CE baseline.
 #
-# All data paths (CheXTemporal parquets, image roots) resolve relative
-# to ``$PROJECT_DIR`` by default, so each branch clone can own its own
-# ``all_data/`` and ``CheXTemporal/`` symlinks. If the bulk data lives
-# somewhere non-standard, override with:
+# Bulk image data defaults to the shared cluster path
+# ``/scratch/m000081/eprakash/all_data`` (not per-project) so multiple
+# branch clones can point at the same DICOM store without duplicating
+# it. Override per-run by exporting ``JEPA_IMAGE_ROOTS_DIR`` before
+# ``sbatch``; both this script's reachability check and the Python
+# trainer read the same env var.
+#
+# ``CheXTemporal/`` still defaults to ``$PROJECT_DIR/CheXTemporal`` so
+# each branch can pin its own silver / gold parquets snapshot; override
+# via ``CHEXTEMPORAL_DIR`` if the parquets also live in a shared path.
 #
 #     export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
 #     export JEPA_IMAGE_ROOTS_DIR=/path/to/all_data
@@ -92,23 +98,24 @@ echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n
 # Bulk image data (mimic / chexpert / rexgradient).
 #
 # ``resume_train_jepa.py`` resolves image roots relative to
-# ``$JEPA_IMAGE_ROOTS_DIR`` (default ``$PROJECT_DIR/all_data``), so
-# the recommended layout is:
+# ``$JEPA_IMAGE_ROOTS_DIR``. Default is the shared cluster location
+# ``/scratch/m000081/eprakash/all_data`` so this doesn't need to be
+# duplicated / symlinked into every branch clone. Layout under that
+# root must match:
 #
-#     $PROJECT_DIR/
-#         all_data/               (symlink or directory of symlinks)
-#             mimic         -> /path/to/real/mimic
-#             chexpert/train -> /path/to/real/chexpert/train
-#             rexgradient/deid_png -> /path/to/real/rexgradient/deid_png
+#     $JEPA_IMAGE_ROOTS_DIR/
+#         mimic/                 (or symlink to real mimic root)
+#         chexpert/train/        (or symlink)
+#         rexgradient/deid_png/  (or symlink)
 #
-# Sanity-check that everything is reachable from the compute node
-# before burning time launching DDP.
+# ``export`` (not just assign) so the Python trainer sees the same
+# value the shell just verified.
 # ============================================================
-IMAGE_ROOTS_DIR="${JEPA_IMAGE_ROOTS_DIR:-$PROJECT_DIR/all_data}"
-echo "[slurm] IMAGE_ROOTS_DIR = $IMAGE_ROOTS_DIR"
-for d in "$IMAGE_ROOTS_DIR/mimic" \
-         "$IMAGE_ROOTS_DIR/chexpert/train" \
-         "$IMAGE_ROOTS_DIR/rexgradient/deid_png"; do
+export JEPA_IMAGE_ROOTS_DIR="${JEPA_IMAGE_ROOTS_DIR:-/scratch/m000081/eprakash/all_data}"
+echo "[slurm] JEPA_IMAGE_ROOTS_DIR = $JEPA_IMAGE_ROOTS_DIR"
+for d in "$JEPA_IMAGE_ROOTS_DIR/mimic" \
+         "$JEPA_IMAGE_ROOTS_DIR/chexpert/train" \
+         "$JEPA_IMAGE_ROOTS_DIR/rexgradient/deid_png"; do
   if [ ! -d "$d" ]; then
     echo "[slurm] ERROR: image root not found: $d" >&2
     echo "[slurm]   symlink or populate it before submitting." >&2
@@ -118,15 +125,21 @@ done
 echo "[slurm] image roots OK"
 
 # ============================================================
-# CheXTemporal reachability check (same idea as image roots).
+# CheXTemporal reachability check.
+#
+# Same ``export`` pattern as the image roots so the Python loader
+# sees the value the shell just verified. Default is
+# ``$PROJECT_DIR/CheXTemporal`` since each branch clone typically
+# pins its own parquet snapshot; override with ``CHEXTEMPORAL_DIR``
+# if you keep the parquets in a shared cluster path.
 # ============================================================
-CHEXTEMPORAL_DIR_RESOLVED="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
-if [ ! -f "$CHEXTEMPORAL_DIR_RESOLVED/silver_findings.parquet" ]; then
-  echo "[slurm] ERROR: silver_findings.parquet not found under $CHEXTEMPORAL_DIR_RESOLVED" >&2
+export CHEXTEMPORAL_DIR="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
+if [ ! -f "$CHEXTEMPORAL_DIR/silver_findings.parquet" ]; then
+  echo "[slurm] ERROR: silver_findings.parquet not found under $CHEXTEMPORAL_DIR" >&2
   echo "[slurm]   symlink CheXTemporal into the project root or set CHEXTEMPORAL_DIR." >&2
   exit 1
 fi
-echo "[slurm] CheXTemporal OK ($CHEXTEMPORAL_DIR_RESOLVED)"
+echo "[slurm] CheXTemporal OK ($CHEXTEMPORAL_DIR)"
 
 # ============================================================
 # Launch training (4 GPUs, DDP). run_jepa.py auto-detects the
