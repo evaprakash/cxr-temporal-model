@@ -8,7 +8,7 @@
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.99999 by default) — see the
+#                 (Cui et al. 2019, β=0.9999 by default) — see the
 #                 ``CBW_*`` constants below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -111,17 +111,32 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 
 # Cui et al. 2019 "Class-Balanced Loss" hyperparameter for the 4th
 # (progression) loss. Beta close to 1 approaches inverse-frequency
-# weighting; closer to 0 approaches uniform weights. β=0.99999
-# saturates the effective-count formula around ~100k samples, giving
-# the middle three silver classes (improving / worsening / new,
-# 32k–65k) a real ~2× boost vs the majority ``stable`` class and the
-# rare ``resolved`` class (3.1k) roughly a 25× boost. See the summary
-# comment above and ``_compute_cui_class_weights`` below.
-CBW_BETA = 0.99999
+# weighting; closer to 0 approaches uniform weights.
+#
+# Previous run used β=0.99999 which saturates around ~100k samples,
+# giving ``resolved`` (3.1k) roughly a 25× boost. On the 5-way gold
+# eval that fixed the majority-``stable`` collapse (macro F1 +25%
+# rel., kappa +41% rel.), but on MS-CXR-T 3-way cosine argmax it
+# nuked the previously-strong stable representation — stable recall
+# dropped from 0.60 → 0.03 because the 25× resolved weight (and 2.5×
+# directional-class weights) sharpened the four non-stable candidate
+# predictions much more than the stable one, so cosine argmax on
+# subtle-signal stable pairs stopped choosing stable at all.
+#
+# β=0.9999 is a milder rebalancing: it saturates around ~10k
+# samples, so ``resolved`` gets only ~3.7× vs stable and the middle
+# three classes drop from ~2.5× to ~1.5×. Expected outcome: keep
+# most of the gold macro-F1 gain (resolved recall likely 0.05–0.15
+# vs the ε it was without any weighting, still a big jump) while
+# leaving the stable candidate specialization mostly intact on
+# MS-CXR-T. See the summary comment above and
+# ``_compute_cui_class_weights`` below.
+CBW_BETA = 0.9999
 
 # Encode the setting in the ckpt / log dir names so this ablation
-# never clobbers earlier unweighted-CE runs. For CBW_BETA=0.99999 the
-# tag is ``cbw99999`` (five 9s = five decimal places of ``0.99999``).
+# never clobbers earlier unweighted-CE runs. For CBW_BETA=0.9999 the
+# tag is ``cbw9999`` (four 9s = four decimal places of ``0.9999``);
+# the earlier β=0.99999 run lives under ``cbw99999``.
 _beta_tag = str(CBW_BETA).replace("0.", "").replace(".", "")
 _SETTING_TAG = f"cbw{_beta_tag}"
 
@@ -220,7 +235,11 @@ def gather_with_grad(tensor):
 # ============================================================
 LR = 2e-5
 WEIGHT_DECAY = 0.01
-BATCH_SIZE = 32
+# Batch size was 32 before; dropped to 24 to fit under the A100-40GB
+# memory ceiling with ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``.
+# All 4 losses scale the same way, so this doesn't change the loss
+# balance — only the number of pairs per gradient step.
+BATCH_SIZE = 24
 EPOCHS = 50
 WARMUP_RATIO = 0.03
 
