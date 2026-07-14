@@ -76,7 +76,14 @@ def load_jepa_model(ckpt_path: str, device: torch.device) -> TempCXRJEPA:
 
     The checkpoint dict is the one produced by ``resume_train_jepa.py``:
     ``ckpt["model"]`` is the full state dict (online + EMA target image
-    encoders, text encoder, predictor).
+    encoders, text encoder, predictor). Because the JEPA state dict
+    covers every parameter in the model, we construct with
+    ``mode="biovilt_no_pretrained"`` to skip the pretrained BioViL-T
+    image-encoder download that would otherwise happen inside
+    ``BioViLTImageEncoderJEPA.__init__`` — those weights would be
+    overwritten by ``load_state_dict`` immediately anyway, and skipping
+    the fetch keeps eval runnable when Microsoft's blob CDN is
+    unreachable (occasional 403s).
     """
     print(f"[infer] loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -87,7 +94,7 @@ def load_jepa_model(ckpt_path: str, device: torch.device) -> TempCXRJEPA:
         )
     print(f"[infer]   epoch={ckpt.get('epoch', '?')}  "
           f"best_val_loss={ckpt.get('best_val_loss', '?')}")
-    model = TempCXRJEPA()
+    model = TempCXRJEPA(mode="biovilt_no_pretrained")
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     if missing:
         print(f"[infer] WARNING: {len(missing)} missing keys "

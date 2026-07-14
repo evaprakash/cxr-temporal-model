@@ -230,6 +230,15 @@ class TempCXRJEPA(nn.Module):
 
     Returns a dict of representations; losses live in ``losses.py`` and
     ``losses_jepa.py``.
+
+    ``mode`` is forwarded to both encoders. Use ``"biovilt"`` for training
+    (fetches the official BioViL-T image weights from Microsoft's CDN
+    and the CXR-BERT text weights from the local ``pretrained/`` dir).
+    Use ``"biovilt_no_pretrained"`` for inference / eval when the caller
+    is about to overwrite every parameter via ``load_state_dict`` from a
+    saved JEPA checkpoint — this skips the image-encoder download
+    entirely and leaves the network unreachable-safe (see
+    ``infer_jepa.load_jepa_model``).
     """
 
     def __init__(

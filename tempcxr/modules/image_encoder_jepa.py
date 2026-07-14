@@ -69,6 +69,16 @@ class BioViLTImageEncoderJEPA(nn.Module):
 
     mode="biovilt_finetuned":
         - BioViL-T initialized from a user-trained checkpoint
+
+    mode="biovilt_no_pretrained":
+        - BioViL-T architecture, randomly initialized. No network fetch
+          and no local checkpoint load — every parameter is left at
+          ``MultiImageModel``'s default random init. Intended for
+          callers (e.g. ``infer_jepa.load_jepa_model``) that immediately
+          overwrite the whole state dict from a saved JEPA checkpoint,
+          where downloading the pretrained BioViL-T image weights just
+          to have them replaced microseconds later is wasted work — and
+          brittle when Microsoft's blob CDN is flaky.
     """
 
     def __init__(
@@ -77,7 +87,12 @@ class BioViLTImageEncoderJEPA(nn.Module):
         checkpoint_path: str | None = None,
     ):
         super().__init__()
-        assert mode in {"biovil", "biovilt", "biovilt_finetuned"}
+        assert mode in {
+            "biovil",
+            "biovilt",
+            "biovilt_finetuned",
+            "biovilt_no_pretrained",
+        }
         self.mode = mode
         self.embed_dim = 128
 
@@ -100,6 +115,19 @@ class BioViLTImageEncoderJEPA(nn.Module):
             self.model.load_state_dict(state, strict=True)
             if DEBUG:
                 print("[ImageEncoderJEPA] Mode = BioViL-T (official pretrained)")
+
+        elif mode == "biovilt_no_pretrained":
+            # Architecture only — MultiImageModel above is already at its
+            # random init from ``pretrained_model_path=None``. Whoever
+            # constructed us is expected to overwrite the state dict via
+            # ``load_state_dict`` immediately (typical in eval, where the
+            # JEPA checkpoint carries every image-encoder parameter and
+            # would clobber a fresh download anyway).
+            if DEBUG:
+                print(
+                    "[ImageEncoderJEPA] Mode = BioViL-T "
+                    "(no pretrained init — caller must overwrite state)"
+                )
 
         else:  # biovilt_finetuned
             assert checkpoint_path is not None, \

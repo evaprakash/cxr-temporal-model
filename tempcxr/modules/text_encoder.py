@@ -69,15 +69,26 @@ class BioViLTTextEncoder(nn.Module):
         mlm_prob: float = 0.45,
     ):
         super().__init__()
-        assert mode in {"biovil", "biovilt", "biovilt_finetuned"}
+        assert mode in {
+            "biovil",
+            "biovilt",
+            "biovilt_finetuned",
+            "biovilt_no_pretrained",
+        }
         self.mlm_prob = mlm_prob
 
         # ------------------------------------------------------------
         # Select model
         # ------------------------------------------------------------
+        # The text encoder always loads from the local ``pretrained/``
+        # directory (no network), so ``biovilt_no_pretrained`` behaves
+        # exactly like ``biovilt`` here — it's the image encoder half
+        # that actually skips a fetch under this mode. We still accept
+        # the mode string so ``TempCXRJEPA(mode=...)`` can pass a single
+        # value through to both encoders without special-casing.
         if mode == "biovil":
             model_name = BIOVIL_TEXT_MODEL
-        elif mode == "biovilt":
+        elif mode in ("biovilt", "biovilt_no_pretrained"):
             model_name = BIOVILT_TEXT_MODEL
         else:
             assert checkpoint_path is not None
@@ -98,7 +109,7 @@ class BioViLTTextEncoder(nn.Module):
         # ------------------------------------------------------------
         # Load CXR-BERT
         # ------------------------------------------------------------
-        if mode == "biovilt":
+        if mode in ("biovilt", "biovilt_no_pretrained"):
             self.model = CXRBertModel.from_pretrained(model_name)
         else:
             config = CXRBertConfig.from_pretrained(model_name)
