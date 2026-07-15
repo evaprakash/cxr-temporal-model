@@ -8,7 +8,7 @@
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.9999 by default) — see the
+#                 (Cui et al. 2019, β=0.99997 by default) — see the
 #                 ``CBW_*`` constants below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -113,30 +113,36 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 # (progression) loss. Beta close to 1 approaches inverse-frequency
 # weighting; closer to 0 approaches uniform weights.
 #
-# Previous run used β=0.99999 which saturates around ~100k samples,
-# giving ``resolved`` (3.1k) roughly a 25× boost. On the 5-way gold
-# eval that fixed the majority-``stable`` collapse (macro F1 +25%
-# rel., kappa +41% rel.), but on MS-CXR-T 3-way cosine argmax it
-# nuked the previously-strong stable representation — stable recall
-# dropped from 0.60 → 0.03 because the 25× resolved weight (and 2.5×
-# directional-class weights) sharpened the four non-stable candidate
-# predictions much more than the stable one, so cosine argmax on
-# subtle-signal stable pairs stopped choosing stable at all.
+# Sweep history and per-benchmark behavior we observed:
 #
-# β=0.9999 is a milder rebalancing: it saturates around ~10k
-# samples, so ``resolved`` gets only ~3.7× vs stable and the middle
-# three classes drop from ~2.5× to ~1.5×. Expected outcome: keep
-# most of the gold macro-F1 gain (resolved recall likely 0.05–0.15
-# vs the ε it was without any weighting, still a big jump) while
-# leaving the stable candidate specialization mostly intact on
-# MS-CXR-T. See the summary comment above and
-# ``_compute_cui_class_weights`` below.
-CBW_BETA = 0.9999
+#   β = 0.99999 → resolved boost ~25×, middle-class boost ~2.5×
+#       Gold macro F1: 0.34 (best), MS-CXR-T stable recall: 0.03
+#       (COLLAPSED — the 2.5× directional-class boost sharpened the
+#        four non-stable candidate predictions so aggressively that
+#        cosine argmax on subtle stable pairs stopped picking stable).
+#
+#   β = 0.9999  → resolved boost ~4.3×, middle-class boost ~1.05×
+#       Gold macro F1: 0.28 (basically = unweighted), MS-CXR-T
+#       stable: 0.62 (Pareto-preserved). The stable-collapse
+#       mechanism is untouched, but middle-class ratios are so mild
+#       that gold barely moves either.
+#
+# The two failure modes:
+#   * Gold "resolved collapse":   fires when resolved weight  < ~4× stable.
+#   * MS-CXR-T "stable collapse": fires when middle-class weight > ~2× stable.
+#
+# β = 0.99997 sits between the two β we've run so it satisfies both
+# thresholds: resolved boost ~12.7× (well above the gold-resolved
+# floor), middle-class boost ~1.2–1.8× (well below the MS-CXR-T
+# stable-collapse ceiling). Expected: modest gold macro F1 bump
+# (~0.30–0.33) with MS-CXR-T stable preserved at ≥ 0.40 recall.
+# See the summary comment above and ``_compute_cui_class_weights``.
+CBW_BETA = 0.99997
 
 # Encode the setting in the ckpt / log dir names so this ablation
-# never clobbers earlier unweighted-CE runs. For CBW_BETA=0.9999 the
-# tag is ``cbw9999`` (four 9s = four decimal places of ``0.9999``);
-# the earlier β=0.99999 run lives under ``cbw99999``.
+# never clobbers earlier unweighted-CE runs. For CBW_BETA=0.99997 the
+# tag is ``cbw99997``. The two prior sweep points from this branch
+# live under ``cbw9999`` and ``cbw99999`` (four vs five nines).
 _beta_tag = str(CBW_BETA).replace("0.", "").replace(".", "")
 _SETTING_TAG = f"cbw{_beta_tag}"
 

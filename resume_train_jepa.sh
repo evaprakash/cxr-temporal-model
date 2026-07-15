@@ -20,14 +20,16 @@
 #     tensor and forwards it to ``F.cross_entropy``. The tensor is
 #     computed at trainer startup from the actual silver-train split
 #     using the Cui et al. 2019 effective-number-of-samples formula
-#     with β = 0.9999 (``CBW_BETA`` in ``resume_train_jepa.py``).
-#     Milder than the initial β=0.99999 run (whose 25× ``resolved``
-#     weight destroyed MS-CXR-T stable recall); β=0.9999 gives
-#     ``resolved`` only ~3.7× vs stable.
+#     with β = 0.99997 (``CBW_BETA`` in ``resume_train_jepa.py``).
+#     Middle setting between the earlier β=0.9999 (too mild — gold
+#     macro F1 stayed near unweighted) and β=0.99999 (too aggressive
+#     — killed MS-CXR-T stable recall). β=0.99997 gives ``resolved``
+#     ~12.7× vs stable and directional classes ~1.2–1.8× vs stable,
+#     satisfying both anti-collapse thresholds.
 #   * Checkpoints / logs are namespaced with a ``cbw<β_digits>``
 #     suffix so this ablation never clobbers the earlier unweighted-CE
 #     ``checkpoints_jepa_dynamic/`` / ``logs_dynamic/`` runs or the
-#     ``cbw99999`` variant.
+#     ``cbw9999`` / ``cbw99999`` β-sweep variants.
 #
 # Same 50-epoch, save-every-5 schedule as before; ``best.pt`` is
 # still overwritten whenever ``val_total`` improves. Everything else
