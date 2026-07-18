@@ -8,7 +8,7 @@
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.99997 by default) — see the
+#                 (Cui et al. 2019, β=0.9999 by default) — see the
 #                 ``CBW_*`` constants below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -116,48 +116,27 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 # Sweep history and per-benchmark behavior we observed:
 #
 #   β = 0.99999 → resolved boost ~25×, middle-class boost ~2.5×
-#       Gold macro F1: 0.34 (best), MS-CXR-T stable recall: 0.03
+#       Gold macro F1: 0.34, MS-CXR-T stable recall: 0.03
 #       (COLLAPSED — the 2.5× directional-class boost sharpened the
 #        four non-stable candidate predictions so aggressively that
 #        cosine argmax on subtle stable pairs stopped picking stable).
 #
-#   β = 0.9999  → resolved boost ~4.3×, middle-class boost ~1.05×
-#       Gold macro F1: 0.28 (basically = unweighted), MS-CXR-T
-#       stable: 0.62 (Pareto-preserved). The stable-collapse
-#       mechanism is untouched, but middle-class ratios are so mild
-#       that gold barely moves either.
+#   β = 0.99997 → resolved boost ~12.7×, middle-class boost ~1.2–1.8×
+#       Middle ground on paper, but in practice gold macro F1 stayed
+#       ~0.30 and did not clearly beat β=0.9999 on headline metrics.
 #
-# The two failure modes:
+#   β = 0.9999  → resolved boost ~4.3×, middle-class boost ~1.05×
+#       Gold macro F1: ~0.40 top-line, MS-CXR-T stable: 0.62
+#       (Pareto-preserved). Current best headline setting; we anchor
+#       here and instead sweep the CONTRASTIVE loss weights (see
+#       ``W_REPORT_PRIOR`` / ``W_REPORT_PRED`` below) to try to lift
+#       disease-classification metrics without disturbing progression.
+#
+# The two failure modes CBW alone runs into:
 #   * Gold "resolved collapse":   fires when resolved weight  < ~4× stable.
 #   * MS-CXR-T "stable collapse": fires when middle-class weight > ~2× stable.
-#
-# β = 0.99997 sits between the two β we've run so it satisfies both
-# thresholds: resolved boost ~12.7× (well above the gold-resolved
-# floor), middle-class boost ~1.2–1.8× (well below the MS-CXR-T
-# stable-collapse ceiling). Expected: modest gold macro F1 bump
-# (~0.30–0.33) with MS-CXR-T stable preserved at ≥ 0.40 recall.
-# See the summary comment above and ``_compute_cui_class_weights``.
-CBW_BETA = 0.99997
-
-# Encode the setting in the ckpt / log dir names so this ablation
-# never clobbers earlier unweighted-CE runs. For CBW_BETA=0.99997 the
-# tag is ``cbw99997``. The two prior sweep points from this branch
-# live under ``cbw9999`` and ``cbw99999`` (four vs five nines).
-_beta_tag = str(CBW_BETA).replace("0.", "").replace(".", "")
-_SETTING_TAG = f"cbw{_beta_tag}"
-
-# Always namespace checkpoints / logs by condition mode + setting tag
-# so nothing clobbers earlier runs and legacy ``checkpoints_jepa/`` /
-# ``logs/`` dirs from older (pre-4-loss / pre-CBW) runs are left
-# untouched as archives.
-_DEFAULT_CKPT_DIR = os.path.join(
-    _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
-)
-_DEFAULT_LOG_DIR = os.path.join(
-    _HERE, f"logs_{CONDITION_MODE}_{_SETTING_TAG}"
-)
-CHECKPOINT_DIR = os.environ.get("JEPA_CHECKPOINT_DIR", _DEFAULT_CKPT_DIR)
-LOG_DIR = os.environ.get("JEPA_LOG_DIR", _DEFAULT_LOG_DIR)
+# β = 0.9999 keeps us safely on the good side of both.
+CBW_BETA = 0.9999
 
 # Image roots resolve relative to this script's directory by default,
 # so ``all_data/`` is a peer of ``CheXTemporal/`` inside the project
@@ -174,11 +153,6 @@ IMAGE_ROOTS = {
     "chexpert":    os.path.join(_IMAGE_ROOTS_DIR, "chexpert", "train"),
     "rexgradient": os.path.join(_IMAGE_ROOTS_DIR, "rexgradient", "deid_png"),
 }
-
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
-CSV_LOG = os.path.join(LOG_DIR, "val_metrics_jepa.csv")
 
 
 # ============================================================
@@ -253,10 +227,23 @@ WARMUP_RATIO = 0.03
 # plus best.pt whenever val total improves.
 SAVE_EVERY_N_EPOCHS = 5
 
-# Loss weights (matching the smoke-test defaults in the old jepa.py)
+# Loss weights.
+#
+# Historical baseline had ``W_REPORT_PRIOR = W_REPORT_PRED = 0.1`` (the
+# smoke-test default from the old jepa.py). Under CBW_BETA=0.9999 we've
+# seen JEPA fine-tuning tilt the image-text alignment away from
+# diffuse-opacity findings on disease classification (pleural effusion,
+# lung opacity → recall ~0). We're sweeping the two GLoRIA contrastive
+# weights UP to try to preserve/repair that alignment while leaving the
+# JEPA and progression losses untouched, so gold / MS-CXR-T progression
+# numbers should be largely unaffected.
+#
+# This run: report weights ``0.15`` (smallest bump — 1.5× the baseline).
+# If disease-class recall improves without hurting progression we can
+# push higher (0.2, then 0.3); if progression regresses we back off.
 W_JEPA = 1.0
-W_REPORT_PRIOR = 0.1
-W_REPORT_PRED = 0.1
+W_REPORT_PRIOR = 0.15
+W_REPORT_PRED = 0.15
 # 4th loss: 5-way image-image CE on the predictor's class-conditioned
 # ẑ_cur. Same magnitude bracket as the two contrastive heads; sweep if
 # it dominates or under-shoots at later epochs.
@@ -271,6 +258,61 @@ N_CLS = len(CLS_ORDER)
 # is identical across train/val DataLoaders and across re-runs.
 VAL_FRACTION = 0.1
 SPLIT_SEED = 42
+
+
+# ============================================================
+# CHECKPOINT / LOG DIR NAMING
+# ============================================================
+# Encode BOTH the CBW β and any non-default GLoRIA contrastive
+# reweighting in the ckpt / log dir names so ablations never clobber
+# each other. Baseline convention:
+#   * ``cbw{beta_tag}``               — β sweep only
+#                                       (W_REPORT_PRIOR = W_REPORT_PRED = 0.1)
+#   * ``cbw{beta_tag}_rp{ww}``        — both report weights bumped to
+#                                       the same non-default value
+#                                       (e.g. rp15 = 0.15)
+#   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
+# Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
+# (pre-4-loss / pre-CBW) runs are left untouched as archives.
+_beta_tag = str(CBW_BETA).replace("0.", "").replace(".", "")
+_SETTING_TAG = f"cbw{_beta_tag}"
+
+
+def _report_weight_tag(w: float) -> str:
+    """Format a report contrastive weight as a zero-padded percent tag.
+
+    ``0.10`` → ``"10"``, ``0.15`` → ``"15"``, ``0.2`` → ``"20"``.
+    Falls back to a stripped ``str`` for weights that don't land on
+    integer-percent so we never silently collapse two distinct sweep
+    points into the same directory.
+    """
+    scaled = w * 100.0
+    if abs(scaled - round(scaled)) < 1e-9:
+        return f"{int(round(scaled)):02d}"
+    return str(w).replace("0.", "").replace(".", "")
+
+
+if W_REPORT_PRIOR != 0.1 or W_REPORT_PRED != 0.1:
+    _rprior_tag = _report_weight_tag(W_REPORT_PRIOR)
+    _rpred_tag = _report_weight_tag(W_REPORT_PRED)
+    if _rprior_tag == _rpred_tag:
+        _SETTING_TAG = f"{_SETTING_TAG}_rp{_rprior_tag}"
+    else:
+        _SETTING_TAG = f"{_SETTING_TAG}_rpri{_rprior_tag}_rpred{_rpred_tag}"
+
+_DEFAULT_CKPT_DIR = os.path.join(
+    _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
+)
+_DEFAULT_LOG_DIR = os.path.join(
+    _HERE, f"logs_{CONDITION_MODE}_{_SETTING_TAG}"
+)
+CHECKPOINT_DIR = os.environ.get("JEPA_CHECKPOINT_DIR", _DEFAULT_CKPT_DIR)
+LOG_DIR = os.environ.get("JEPA_LOG_DIR", _DEFAULT_LOG_DIR)
+
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+CSV_LOG = os.path.join(LOG_DIR, "val_metrics_jepa.csv")
 
 
 # ============================================================

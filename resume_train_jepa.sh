@@ -13,29 +13,37 @@
 
 # ============================================================
 # SLURM launcher for the ``main`` branch's class-balanced-weighting
-# variant of the 4th (progression) loss.
+# variant of the 4th (progression) loss, with an additional GLoRIA
+# contrastive-loss reweighting sweep on top.
 #
 # What this run does that ``main`` did NOT do before:
-#   * ``progression_classification_loss`` now takes a ``weight=``
-#     tensor and forwards it to ``F.cross_entropy``. The tensor is
-#     computed at trainer startup from the actual silver-train split
-#     using the Cui et al. 2019 effective-number-of-samples formula
-#     with β = 0.99997 (``CBW_BETA`` in ``resume_train_jepa.py``).
-#     Middle setting between the earlier β=0.9999 (too mild — gold
-#     macro F1 stayed near unweighted) and β=0.99999 (too aggressive
-#     — killed MS-CXR-T stable recall). β=0.99997 gives ``resolved``
-#     ~12.7× vs stable and directional classes ~1.2–1.8× vs stable,
-#     satisfying both anti-collapse thresholds.
-#   * Checkpoints / logs are namespaced with a ``cbw<β_digits>``
-#     suffix so this ablation never clobbers the earlier unweighted-CE
-#     ``checkpoints_jepa_dynamic/`` / ``logs_dynamic/`` runs or the
-#     ``cbw9999`` / ``cbw99999`` β-sweep variants.
+#   * ``progression_classification_loss`` takes a ``weight=`` tensor
+#     forwarded to ``F.cross_entropy``. The tensor is computed at
+#     trainer startup from the actual silver-train split using the
+#     Cui et al. 2019 effective-number-of-samples formula with
+#     β = 0.9999 (``CBW_BETA`` in ``resume_train_jepa.py``). β=0.9999
+#     is the best headline setting from our earlier β-sweep:
+#     resolved boost ~4.3× vs stable, directional-class boost ~1.05×,
+#     preserving MS-CXR-T stable recall (Pareto-clean vs unweighted).
+#   * The two GLoRIA report-contrastive weights are bumped from the
+#     historical 0.1 to 0.15 (``W_REPORT_PRIOR`` / ``W_REPORT_PRED``
+#     in ``resume_train_jepa.py``). Motivation: JEPA fine-tuning has
+#     been degrading image-text alignment for diffuse-opacity findings
+#     on the disease-classification eval; strengthening the two
+#     GLoRIA losses should slow that drift. Smallest bump first
+#     (1.5× baseline) — push higher only if progression metrics
+#     survive.
+#   * Checkpoints / logs are namespaced with
+#     ``cbw<β_digits>[_rp<ww>]`` so this ablation never clobbers the
+#     earlier β-sweep variants (``cbw9999`` / ``cbw99997`` /
+#     ``cbw99999``) or the unweighted-CE archives
+#     (``checkpoints_jepa_dynamic/`` / ``logs_dynamic/``). For this
+#     run the tag resolves to ``cbw9999_rp15``.
 #
 # Same 50-epoch, save-every-5 schedule as before; ``best.pt`` is
 # still overwritten whenever ``val_total`` improves. Everything else
-# (LR, batch size, warmup, JEPA + report-contrastive weights, EMA
-# schedule) is untouched, so this is a clean single-variable ablation
-# vs the unweighted-CE baseline.
+# (LR, batch size, warmup, W_JEPA, W_PROG, EMA schedule) is untouched,
+# so this is still a clean two-knob ablation: β + report weights.
 #
 # Bulk image data defaults to the shared cluster path
 # ``/scratch/m000081/eprakash/all_data`` (not per-project) so multiple
