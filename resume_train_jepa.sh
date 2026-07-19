@@ -42,7 +42,7 @@
 #     to lift disease-class alignment; it slightly helped disease but
 #     shaved gold minority-class F1, so we reset it for this β sweep.
 #   * Checkpoints / logs are namespaced with
-#     ``cbw{base}to{cur}`` for two-stage warm-ups (this run resolves
+#     ``cbw{stage1}to{cur}`` for two-stage runs (this run resolves
 #     to ``cbw9999to99999``), so they never clobber the single-stage
 #     β-sweep variants (``cbw9999`` / ``cbw99997`` / ``cbw99999`` from
 #     scratch) or the earlier report-reweighted runs
@@ -123,7 +123,7 @@ echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n
 # export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
 
 # ============================================================
-# Stage-1 checkpoint we warm-start from.
+# Stage-1 checkpoint we ``--resume`` from.
 #
 # The trainer's auto-resume looks inside the ``main``-configured
 # stage-2 ``CHECKPOINT_DIR`` first (currently
@@ -147,7 +147,7 @@ else
     echo "[slurm]   set JEPA_RESUME_CKPT to a valid β=0.9999 epoch_N.pt path." >&2
     exit 1
   fi
-  echo "[slurm] warm-starting stage 2 from $JEPA_RESUME_CKPT"
+  echo "[slurm] initializing stage 2 from $JEPA_RESUME_CKPT"
   RESUME_ARG="--resume $JEPA_RESUME_CKPT"
 fi
 

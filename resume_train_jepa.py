@@ -172,12 +172,15 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 # a from-scratch cbw99999 run but applied to that feature space.
 CBW_BETA = 0.99999
 
-# Optional annotation used for ckpt / log dir naming. If set, indicates
-# that this run is intended to resume from a checkpoint trained at
-# ``CBW_BETA_WARMUP_BASE`` — the tag becomes ``cbw{base}to{cur}`` so
-# stage-1 and stage-2 dirs never collide. Leave as ``None`` for the
-# usual single-stage runs.
-CBW_BETA_WARMUP_BASE = 0.9999
+# Purely a dir-naming annotation, NOT a training knob. Set this to
+# the β value of the checkpoint you plan to ``--resume`` from; the
+# ckpt / log dir tag will become ``cbw{stage1_beta}to{CBW_BETA}`` so
+# a from-a-different-β restart doesn't clobber the from-scratch
+# β=CBW_BETA run's dirs. Set to ``None`` when launching from scratch
+# (or when resuming from a same-β checkpoint into the same dir).
+# Nothing in training reads this variable — the loss only sees
+# ``CBW_BETA`` above.
+CBW_BETA_STAGE1 = 0.9999
 
 # Image roots resolve relative to this script's directory by default,
 # so ``all_data/`` is a peer of ``CheXTemporal/`` inside the project
@@ -267,10 +270,10 @@ WARMUP_RATIO = 0.03
 # Checkpoint schedule: always save epoch 1 + every SAVE_EVERY_N_EPOCHS,
 # plus best.pt whenever val total improves.
 #
-# Set to 1 for this two-stage warm-up run because the interesting
-# window (stage-2 epochs 6, 7, 8, 9, 10) is short and we want to
-# be able to pick the best stage-2 epoch per benchmark. Bump back
-# to 5 for a normal single-stage sweep.
+# Set to 1 for this two-stage run because the interesting window
+# (stage-2 epochs 6, 7, 8, 9, 10) is short and we want to be able
+# to pick the best stage-2 epoch per benchmark. Bump back to 5 for
+# a normal from-scratch β sweep.
 SAVE_EVERY_N_EPOCHS = 1
 
 # Loss weights.
@@ -306,12 +309,15 @@ SPLIT_SEED = 42
 # Encode BOTH the CBW β and any non-default GLoRIA contrastive
 # reweighting in the ckpt / log dir names so ablations never clobber
 # each other. Baseline convention:
-#   * ``cbw{beta_tag}``               — single-stage β sweep
+#   * ``cbw{beta_tag}``               — from-scratch β run
 #                                       (W_REPORT_PRIOR = W_REPORT_PRED = 0.1)
-#   * ``cbw{base}to{cur}``            — two-stage warm-up: resumed from
-#                                       a stage-1 ``cbw{base}`` checkpoint,
-#                                       trained further at β=``{cur}``
-#                                       (see ``CBW_BETA_WARMUP_BASE``)
+#   * ``cbw{stage1}to{cur}``          — hard-β=``{cur}`` run that
+#                                       ``--resume``-s from a checkpoint
+#                                       previously trained at β=``{stage1}``
+#                                       (see ``CBW_BETA_STAGE1``). Only
+#                                       affects the dir name — training
+#                                       runs at a hard ``CBW_BETA`` the
+#                                       whole time, no β schedule.
 #   * ``cbw{beta_tag}_rp{ww}``        — both report weights bumped to
 #                                       the same non-default value
 #                                       (e.g. rp15 = 0.15)
@@ -324,9 +330,9 @@ def _cbw_beta_tag(beta: float) -> str:
 
 
 _beta_tag = _cbw_beta_tag(CBW_BETA)
-if CBW_BETA_WARMUP_BASE is not None:
-    _base_tag = _cbw_beta_tag(CBW_BETA_WARMUP_BASE)
-    _SETTING_TAG = f"cbw{_base_tag}to{_beta_tag}"
+if CBW_BETA_STAGE1 is not None:
+    _stage1_tag = _cbw_beta_tag(CBW_BETA_STAGE1)
+    _SETTING_TAG = f"cbw{_stage1_tag}to{_beta_tag}"
 else:
     _SETTING_TAG = f"cbw{_beta_tag}"
 
