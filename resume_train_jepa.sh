@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw
+#SBATCH --job-name=jepa_cbw9999to99999
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,42 +8,53 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw9999to99999_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw9999to99999_%j.err
 
 # ============================================================
-# SLURM launcher for the ``main`` branch's class-balanced-weighting
-# variant of the 4th (progression) loss, with an additional GLoRIA
-# contrastive-loss reweighting sweep on top.
+# SLURM launcher for the ``main`` branch's two-stage class-balanced
+# warm-up variant of the 4th (progression) loss.
 #
 # What this run does that ``main`` did NOT do before:
 #   * ``progression_classification_loss`` takes a ``weight=`` tensor
 #     forwarded to ``F.cross_entropy``. The tensor is computed at
 #     trainer startup from the actual silver-train split using the
-#     Cui et al. 2019 effective-number-of-samples formula with
-#     β = 0.9999 (``CBW_BETA`` in ``resume_train_jepa.py``). β=0.9999
-#     is the best headline setting from our earlier β-sweep:
-#     resolved boost ~4.3× vs stable, directional-class boost ~1.05×,
-#     preserving MS-CXR-T stable recall (Pareto-clean vs unweighted).
-#   * The two GLoRIA report-contrastive weights are bumped from the
-#     historical 0.1 to 0.15 (``W_REPORT_PRIOR`` / ``W_REPORT_PRED``
-#     in ``resume_train_jepa.py``). Motivation: JEPA fine-tuning has
-#     been degrading image-text alignment for diffuse-opacity findings
-#     on the disease-classification eval; strengthening the two
-#     GLoRIA losses should slow that drift. Smallest bump first
-#     (1.5× baseline) — push higher only if progression metrics
-#     survive.
+#     Cui et al. 2019 effective-number-of-samples formula.
+#   * Two-stage β schedule:
+#       - Stage 1 (already trained separately):
+#           β = 0.9999. Best single-stage headline (resolved boost
+#           ~4.3× stable, directional-class boost ~1.05×), preserves
+#           MS-CXR-T stable recall. Checkpoint we resume FROM:
+#           ``checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``.
+#       - Stage 2 (THIS run):
+#           β = 0.99999 (``CBW_BETA`` in ``resume_train_jepa.py``).
+#           From scratch, β=0.99999 collapses MS-CXR-T stable
+#           because the 2.5× directional-class boost sharpens
+#           non-stable candidates too aggressively. Warm-starting
+#           from the β=0.9999 checkpoint applies the aggressive
+#           weights as a gentle fine-tune — the LR schedule is
+#           inherited from stage 1 (already past warmup, decaying),
+#           so the effective gradient magnitude is much smaller
+#           than a from-scratch β=0.99999 run at the same nominal
+#           epoch.
+#   * GLoRIA report-contrastive weights are back at the 0.10 baseline
+#     (``W_REPORT_PRIOR`` / ``W_REPORT_PRED``). We briefly tried 0.15
+#     to lift disease-class alignment; it slightly helped disease but
+#     shaved gold minority-class F1, so we reset it for this β sweep.
 #   * Checkpoints / logs are namespaced with
-#     ``cbw<β_digits>[_rp<ww>]`` so this ablation never clobbers the
-#     earlier β-sweep variants (``cbw9999`` / ``cbw99997`` /
-#     ``cbw99999``) or the unweighted-CE archives
-#     (``checkpoints_jepa_dynamic/`` / ``logs_dynamic/``). For this
-#     run the tag resolves to ``cbw9999_rp15``.
+#     ``cbw{base}to{cur}`` for two-stage warm-ups (this run resolves
+#     to ``cbw9999to99999``), so they never clobber the single-stage
+#     β-sweep variants (``cbw9999`` / ``cbw99997`` / ``cbw99999`` from
+#     scratch) or the earlier report-reweighted runs
+#     (``cbw9999_rp15``) or the unweighted-CE archives
+#     (``checkpoints_jepa_dynamic/`` / ``logs_dynamic/``).
+#   * ``SAVE_EVERY_N_EPOCHS`` is 1 in the trainer for this config so
+#     each stage-2 epoch (6, 7, 8, 9, 10, ...) is captured for the
+#     per-benchmark best-checkpoint pick.
 #
-# Same 50-epoch, save-every-5 schedule as before; ``best.pt`` is
-# still overwritten whenever ``val_total`` improves. Everything else
-# (LR, batch size, warmup, W_JEPA, W_PROG, EMA schedule) is untouched,
-# so this is still a clean two-knob ablation: β + report weights.
+# Everything else (LR, batch size, warmup, W_JEPA, W_PROG, EMA
+# schedule) is untouched, so the ONLY variable versus stage 1 is the
+# CBW β. ``best.pt`` is still overwritten whenever ``val_total`` improves.
 #
 # Bulk image data defaults to the shared cluster path
 # ``/scratch/m000081/eprakash/all_data`` (not per-project) so multiple
@@ -58,11 +69,14 @@
 #
 #     export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
 #     export JEPA_IMAGE_ROOTS_DIR=/path/to/all_data
+#     export JEPA_RESUME_CKPT=/path/to/checkpoints_jepa_dynamic_cbw9999/epoch_5.pt
 #     sbatch resume_train_jepa.sh
 #
-# Auto-resume from the latest epoch checkpoint kicks in automatically
-# if the run is preempted and re-queued, so ``sbatch resume_train_jepa.sh``
-# just picks up where it left off.
+# Auto-resume from the latest stage-2 epoch checkpoint kicks in
+# automatically if the run is preempted and re-queued (as long as
+# the stage-2 CHECKPOINT_DIR already has an ``epoch_*.pt``), so
+# ``sbatch resume_train_jepa.sh`` just picks up where it left off
+# without re-winding to the stage-1 starting point.
 # ============================================================
 
 # ============================================================
@@ -107,6 +121,35 @@ echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n
 # {silver,gold}_*.parquet without any code edits.
 # ============================================================
 # export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
+
+# ============================================================
+# Stage-1 checkpoint we warm-start from.
+#
+# The trainer's auto-resume looks inside the ``main``-configured
+# stage-2 ``CHECKPOINT_DIR`` first (currently
+# ``checkpoints_jepa_dynamic_cbw9999to99999``). If that dir is empty
+# (fresh two-stage launch), we point ``--resume`` at the stage-1
+# checkpoint via ``JEPA_RESUME_CKPT`` so weights + optimizer + LR
+# scheduler state transfer over. On preemption re-queues, the
+# stage-2 dir now contains ``epoch_*.pt`` so auto-resume kicks in
+# and we do NOT pass ``--resume`` (otherwise we'd repeatedly wind
+# training back to the stage-1 starting point).
+# ============================================================
+JEPA_RESUME_CKPT="${JEPA_RESUME_CKPT:-/scratch/m000081/eprakash/temporal/final/cxr-temporal-model-cbw/cxr-temporal-model/checkpoints_jepa_dynamic_cbw9999/epoch_5.pt}"
+STAGE2_CKPT_DIR="${JEPA_CHECKPOINT_DIR:-$PROJECT_DIR/checkpoints_jepa_dynamic_cbw9999to99999}"
+if compgen -G "$STAGE2_CKPT_DIR/epoch_*.pt" > /dev/null; then
+  echo "[slurm] stage-2 checkpoints already exist under $STAGE2_CKPT_DIR"
+  echo "[slurm]   → auto-resume from latest stage-2 epoch (no --resume passed)"
+  RESUME_ARG=""
+else
+  if [ ! -f "$JEPA_RESUME_CKPT" ]; then
+    echo "[slurm] ERROR: stage-1 checkpoint not found: $JEPA_RESUME_CKPT" >&2
+    echo "[slurm]   set JEPA_RESUME_CKPT to a valid β=0.9999 epoch_N.pt path." >&2
+    exit 1
+  fi
+  echo "[slurm] warm-starting stage 2 from $JEPA_RESUME_CKPT"
+  RESUME_ARG="--resume $JEPA_RESUME_CKPT"
+fi
 
 # ============================================================
 # Bulk image data (mimic / chexpert / rexgradient).
@@ -159,5 +202,9 @@ echo "[slurm] CheXTemporal OK ($CHEXTEMPORAL_DIR)"
 # Launch training (4 GPUs, DDP). run_jepa.py auto-detects the
 # visible GPU count via torch.cuda.device_count(), so we don't
 # have to keep --nproc_per_node in sync with --gres.
+#
+# ``$RESUME_ARG`` is empty on preemption re-queues (auto-resume
+# from stage-2 dir), and ``--resume /path/to/stage-1/epoch_5.pt``
+# on the initial launch.
 # ============================================================
-python run_jepa.py
+python run_jepa.py $RESUME_ARG

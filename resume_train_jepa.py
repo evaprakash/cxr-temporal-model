@@ -8,7 +8,7 @@
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.9999 by default) — see the
+#                 (Cui et al. 2019, β=0.99999 in this run) — see the
 #                 ``CBW_*`` constants below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -17,6 +17,21 @@
 #               ``silver_sentences.parquet``. Override via
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
+#
+# Current run: two-stage class-balanced warm-up.
+#   Stage 1 (already trained, saved as
+#            ``checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``):
+#       CBW β=0.9999, W_REPORT_*=0.1.
+#   Stage 2 (this file, launched with
+#            ``--resume .../checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``):
+#       CBW β=0.99999, W_REPORT_*=0.1.
+#   Rationale: β=0.99999 from scratch collapses stable on MS-CXR-T
+#   because the 2.5× directional-class boost sharpens the non-stable
+#   candidates too aggressively too early. Warm-starting from a
+#   β=0.9999 checkpoint means the LR schedule is already past warmup
+#   and decaying, so the aggressive weights are applied as a gentle
+#   fine-tune rather than a from-scratch objective — the model should
+#   pick up the resolved boost without destroying stable geometry.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -115,7 +130,7 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 #
 # Sweep history and per-benchmark behavior we observed:
 #
-#   β = 0.99999 → resolved boost ~25×, middle-class boost ~2.5×
+#   β = 0.99999 (from scratch) → resolved boost ~25×, middle-class ~2.5×
 #       Gold macro F1: 0.34, MS-CXR-T stable recall: 0.03
 #       (COLLAPSED — the 2.5× directional-class boost sharpened the
 #        four non-stable candidate predictions so aggressively that
@@ -127,16 +142,31 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 #
 #   β = 0.9999  → resolved boost ~4.3×, middle-class boost ~1.05×
 #       Gold macro F1: ~0.40 top-line, MS-CXR-T stable: 0.62
-#       (Pareto-preserved). Current best headline setting; we anchor
-#       here and instead sweep the CONTRASTIVE loss weights (see
-#       ``W_REPORT_PRIOR`` / ``W_REPORT_PRED`` below) to try to lift
-#       disease-classification metrics without disturbing progression.
+#       (Pareto-preserved). This is our stage-1 checkpoint — good
+#       stable geometry but resolved recall on gold still low.
 #
-# The two failure modes CBW alone runs into:
+#   β = 0.99999 (WARM-STARTED from β=0.9999 epoch 5) → this run.
+#       Rationale: apply the aggressive weights as a gentle fine-tune
+#       on top of a well-shaped feature space, so the resolved boost
+#       lifts minority recall without destroying stable. LR schedule
+#       inherits the stage-1 state (already past warmup, decaying), so
+#       the effective β=0.99999 gradient magnitude is much smaller
+#       than a from-scratch β=0.99999 run at the same nominal epoch.
+#
+# The two failure modes β alone runs into (from-scratch):
 #   * Gold "resolved collapse":   fires when resolved weight  < ~4× stable.
 #   * MS-CXR-T "stable collapse": fires when middle-class weight > ~2× stable.
-# β = 0.9999 keeps us safely on the good side of both.
-CBW_BETA = 0.9999
+# Warm-starting is the escape hatch: stage 1 (β=0.9999) fixes the
+# resolved-collapse failure, stage 2 (β=0.99999) adds a small nudge
+# toward resolved without ruining stable.
+CBW_BETA = 0.99999
+
+# Optional annotation used for ckpt / log dir naming. If set, indicates
+# that this run is intended to resume from a checkpoint trained at
+# ``CBW_BETA_WARMUP_BASE`` — the tag becomes ``cbw{base}to{cur}`` so
+# stage-1 and stage-2 dirs never collide. Leave as ``None`` for the
+# usual single-stage runs.
+CBW_BETA_WARMUP_BASE = 0.9999
 
 # Image roots resolve relative to this script's directory by default,
 # so ``all_data/`` is a peer of ``CheXTemporal/`` inside the project
@@ -225,25 +255,24 @@ WARMUP_RATIO = 0.03
 
 # Checkpoint schedule: always save epoch 1 + every SAVE_EVERY_N_EPOCHS,
 # plus best.pt whenever val total improves.
-SAVE_EVERY_N_EPOCHS = 5
+#
+# Set to 1 for this two-stage warm-up run because the interesting
+# window (stage-2 epochs 6, 7, 8, 9, 10) is short and we want to
+# be able to pick the best stage-2 epoch per benchmark. Bump back
+# to 5 for a normal single-stage sweep.
+SAVE_EVERY_N_EPOCHS = 1
 
 # Loss weights.
 #
-# Historical baseline had ``W_REPORT_PRIOR = W_REPORT_PRED = 0.1`` (the
-# smoke-test default from the old jepa.py). Under CBW_BETA=0.9999 we've
-# seen JEPA fine-tuning tilt the image-text alignment away from
-# diffuse-opacity findings on disease classification (pleural effusion,
-# lung opacity → recall ~0). We're sweeping the two GLoRIA contrastive
-# weights UP to try to preserve/repair that alignment while leaving the
-# JEPA and progression losses untouched, so gold / MS-CXR-T progression
-# numbers should be largely unaffected.
-#
-# This run: report weights ``0.15`` (smallest bump — 1.5× the baseline).
-# If disease-class recall improves without hurting progression we can
-# push higher (0.2, then 0.3); if progression regresses we back off.
+# Historical baseline: ``W_REPORT_PRIOR = W_REPORT_PRED = 0.1``. We
+# briefly tried bumping both to 0.15 to lift image-text alignment on
+# disease classification; it slightly helped disease per-class recall
+# but shaved gold macro F1 on the minority classes and left MS-CXR-T
+# neutral. For this two-stage β run we revert to the 0.1 baseline so
+# the ONLY variable versus stage 1 is the progression-CE class weights.
 W_JEPA = 1.0
-W_REPORT_PRIOR = 0.15
-W_REPORT_PRED = 0.15
+W_REPORT_PRIOR = 0.1
+W_REPORT_PRED = 0.1
 # 4th loss: 5-way image-image CE on the predictor's class-conditioned
 # ẑ_cur. Same magnitude bracket as the two contrastive heads; sweep if
 # it dominates or under-shoots at later epochs.
@@ -266,16 +295,29 @@ SPLIT_SEED = 42
 # Encode BOTH the CBW β and any non-default GLoRIA contrastive
 # reweighting in the ckpt / log dir names so ablations never clobber
 # each other. Baseline convention:
-#   * ``cbw{beta_tag}``               — β sweep only
+#   * ``cbw{beta_tag}``               — single-stage β sweep
 #                                       (W_REPORT_PRIOR = W_REPORT_PRED = 0.1)
+#   * ``cbw{base}to{cur}``            — two-stage warm-up: resumed from
+#                                       a stage-1 ``cbw{base}`` checkpoint,
+#                                       trained further at β=``{cur}``
+#                                       (see ``CBW_BETA_WARMUP_BASE``)
 #   * ``cbw{beta_tag}_rp{ww}``        — both report weights bumped to
 #                                       the same non-default value
 #                                       (e.g. rp15 = 0.15)
 #   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
 # (pre-4-loss / pre-CBW) runs are left untouched as archives.
-_beta_tag = str(CBW_BETA).replace("0.", "").replace(".", "")
-_SETTING_TAG = f"cbw{_beta_tag}"
+def _cbw_beta_tag(beta: float) -> str:
+    """``0.9999`` → ``"9999"``, ``0.99999`` → ``"99999"``, etc."""
+    return str(beta).replace("0.", "").replace(".", "")
+
+
+_beta_tag = _cbw_beta_tag(CBW_BETA)
+if CBW_BETA_WARMUP_BASE is not None:
+    _base_tag = _cbw_beta_tag(CBW_BETA_WARMUP_BASE)
+    _SETTING_TAG = f"cbw{_base_tag}to{_beta_tag}"
+else:
+    _SETTING_TAG = f"cbw{_beta_tag}"
 
 
 def _report_weight_tag(w: float) -> str:
