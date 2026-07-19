@@ -8,7 +8,7 @@
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.99999 in this run) — see the
+#                 (Cui et al. 2019, β=0.99998 in this run) — see the
 #                 ``CBW_*`` constants below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -18,28 +18,11 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: two-stage class-balanced protocol. Not β-annealing —
-# β is a hard 0.99999 for every step of this file; the class weights
-# are computed once at trainer startup and never touched again.
-#   Stage 1 (already trained, saved as
-#            ``checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``):
-#       CBW β=0.9999, W_REPORT_*=0.1.
-#   Stage 2 (this file, launched with
-#            ``--resume .../checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``):
-#       CBW β=0.99999, W_REPORT_*=0.1.
-#   What ``--resume`` gives us over a from-scratch β=0.99999 run:
-#     * model weights initialized from a checkpoint that already has
-#       well-shaped stable/directional geometry;
-#     * optimizer + LR scheduler state carried over, so stage 2 starts
-#       at the decayed LR from stage-1's epoch-5 step (NOT the peak
-#       warmup LR that a from-scratch launch would see).
-#   Hypothesis: β=0.99999 from scratch collapses stable on MS-CXR-T
-#   because the 2.5× directional-class boost fires while the features
-#   are still random-ish and the LR is at its peak, so early updates
-#   overshoot. Starting from the β=0.9999 checkpoint puts the aggressive
-#   weights on top of already-good features at already-decayed LR, so
-#   the model should be able to lift resolved recall without wiping
-#   out stable.
+# Current run: from-scratch β=0.99998 (single-stage, no resume).
+# Sits between β=0.99997 (MS-CXR-T stable ~0.46, gold minorities
+# still soft) and β=0.99999 (gold more balanced but MS-CXR-T stable
+# collapses). Goal: better gold per-class balance than β=0.9999
+# without falling off the MS-CXR-T stable cliff.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -138,39 +121,27 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 #
 # Sweep history and per-benchmark behavior we observed:
 #
-#   β = 0.99999 (from scratch) → resolved boost ~25×, middle-class ~2.5×
-#       Gold macro F1: 0.34, MS-CXR-T stable recall: 0.03
-#       (COLLAPSED — the 2.5× directional-class boost sharpened the
-#        four non-stable candidate predictions so aggressively that
-#        cosine argmax on subtle stable pairs stopped picking stable).
+#   β = 0.9999  → resolved boost ~4.3×, middle-class boost ~1.05×
+#       Gold overall ~0.41 but stable-magnet (stable ~0.84,
+#       improving/new/resolved ~0.11–0.14). Best MS-CXR-T
+#       (stable ~0.62).
 #
 #   β = 0.99997 → resolved boost ~12.7×, middle-class boost ~1.2–1.8×
-#       Middle ground on paper, but in practice gold macro F1 stayed
-#       ~0.30 and did not clearly beat β=0.9999 on headline metrics.
+#       Gold a bit more balanced; MS-CXR-T stable ~0.46.
 #
-#   β = 0.9999  → resolved boost ~4.3×, middle-class boost ~1.05×
-#       Gold macro F1: ~0.40 top-line, MS-CXR-T stable: 0.62
-#       (Pareto-preserved). This is our stage-1 checkpoint — good
-#       stable geometry but resolved recall on gold still low.
+#   β = 0.99999 (from scratch) → resolved boost ~25×, middle ~2.5×
+#       Gold per-class much stronger vs lit baselines, but MS-CXR-T
+#       stable collapses (~0.06). Two-stage resume 0.9999→0.99999
+#       also collapsed MS-CXR-T stable (~0.09).
 #
-#   β = 0.99999 (resumed from β=0.9999 epoch 5) → this run.
-#       Same class weights as from-scratch β=0.99999 (resolved ~25×,
-#       middle ~2.5×). The difference is only the starting point:
-#       model weights come from a β=0.9999 checkpoint (well-shaped
-#       features) and the LR schedule is inherited (already decaying,
-#       not at peak warmup). If the collapse-under-β=0.99999 failure
-#       mode is driven by early large updates on immature features,
-#       skipping that early window should let β=0.99999 lift resolved
-#       without wiping out stable.
+#   β = 0.99998 (THIS RUN, from scratch) → between 0.99997 and
+#       0.99999. Probe whether the MS-CXR-T cliff is above or below
+#       this point while lifting gold minorities vs β=0.9999.
 #
 # The two failure modes β alone runs into (from-scratch):
 #   * Gold "resolved collapse":   fires when resolved weight  < ~4× stable.
 #   * MS-CXR-T "stable collapse": fires when middle-class weight > ~2× stable.
-# Starting from a β=0.9999 checkpoint is the escape hatch: stage 1
-# (β=0.9999) fixes the resolved-collapse failure and delivers a decent
-# feature space; stage 2 (β=0.99999) is the same hard-β objective as
-# a from-scratch cbw99999 run but applied to that feature space.
-CBW_BETA = 0.99999
+CBW_BETA = 0.99998
 
 # Purely a dir-naming annotation, NOT a training knob. Set this to
 # the β value of the checkpoint you plan to ``--resume`` from; the
@@ -180,7 +151,7 @@ CBW_BETA = 0.99999
 # (or when resuming from a same-β checkpoint into the same dir).
 # Nothing in training reads this variable — the loss only sees
 # ``CBW_BETA`` above.
-CBW_BETA_STAGE1 = 0.9999
+CBW_BETA_STAGE1 = None
 
 # Image roots resolve relative to this script's directory by default,
 # so ``all_data/`` is a peer of ``CheXTemporal/`` inside the project
@@ -268,22 +239,11 @@ EPOCHS = 50
 WARMUP_RATIO = 0.03
 
 # Checkpoint schedule: always save epoch 1 + every SAVE_EVERY_N_EPOCHS,
-# plus best.pt whenever val total improves.
-#
-# Set to 1 for this two-stage run because the interesting window
-# (stage-2 epochs 6, 7, 8, 9, 10) is short and we want to be able
-# to pick the best stage-2 epoch per benchmark. Bump back to 5 for
-# a normal from-scratch β sweep.
-SAVE_EVERY_N_EPOCHS = 1
+# plus best.pt whenever val total improves. From-scratch β sweeps use 5.
+SAVE_EVERY_N_EPOCHS = 5
 
-# Loss weights.
-#
-# Historical baseline: ``W_REPORT_PRIOR = W_REPORT_PRED = 0.1``. We
-# briefly tried bumping both to 0.15 to lift image-text alignment on
-# disease classification; it slightly helped disease per-class recall
-# but shaved gold macro F1 on the minority classes and left MS-CXR-T
-# neutral. For this two-stage β run we revert to the 0.1 baseline so
-# the ONLY variable versus stage 1 is the progression-CE class weights.
+# Loss weights. Baseline GLoRIA weights (0.10); only CBW β varies
+# versus the earlier from-scratch β sweeps.
 W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1

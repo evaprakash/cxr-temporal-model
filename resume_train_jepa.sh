@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw9999to99999
+#SBATCH --job-name=jepa_cbw99998
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,53 +8,29 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw9999to99999_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw9999to99999_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99998_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99998_%j.err
 
 # ============================================================
-# SLURM launcher for the ``main`` branch's two-stage class-balanced
-# variant of the 4th (progression) loss. NOT β-annealing — β is a
-# hard 0.99999 for every step of this run; only the starting point
-# is different from a from-scratch β=0.99999 launch.
+# SLURM launcher for the ``main`` branch's from-scratch β=0.99998
+# class-balanced variant of the 4th (progression) loss.
 #
-# What this run does that ``main`` did NOT do before:
+# What this run does:
 #   * ``progression_classification_loss`` takes a ``weight=`` tensor
-#     forwarded to ``F.cross_entropy``. The tensor is computed at
-#     trainer startup from the actual silver-train split using the
-#     Cui et al. 2019 effective-number-of-samples formula.
-#   * Two stages, hard β at each:
-#       - Stage 1 (already trained separately):
-#           β = 0.9999. Best single-stage headline (resolved boost
-#           ~4.3× stable, directional-class boost ~1.05×), preserves
-#           MS-CXR-T stable recall. Checkpoint we resume FROM:
-#           ``checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``.
-#       - Stage 2 (THIS run):
-#           β = 0.99999 (``CBW_BETA`` in ``resume_train_jepa.py``).
-#           From scratch, β=0.99999 collapses MS-CXR-T stable because
-#           the 2.5× directional-class boost fires while features are
-#           still immature and the LR is at its peak. Here the model
-#           starts from stage 1's well-shaped features and the LR
-#           schedule is inherited from stage 1 (already past warmup,
-#           decaying), so the same β=0.99999 objective lands on a
-#           different starting condition than a from-scratch launch.
-#   * GLoRIA report-contrastive weights are back at the 0.10 baseline
-#     (``W_REPORT_PRIOR`` / ``W_REPORT_PRED``). We briefly tried 0.15
-#     to lift disease-class alignment; it slightly helped disease but
-#     shaved gold minority-class F1, so we reset it for this β sweep.
-#   * Checkpoints / logs are namespaced with
-#     ``cbw{stage1}to{cur}`` for two-stage runs (this run resolves
-#     to ``cbw9999to99999``), so they never clobber the single-stage
-#     β-sweep variants (``cbw9999`` / ``cbw99997`` / ``cbw99999`` from
-#     scratch) or the earlier report-reweighted runs
-#     (``cbw9999_rp15``) or the unweighted-CE archives
-#     (``checkpoints_jepa_dynamic/`` / ``logs_dynamic/``).
-#   * ``SAVE_EVERY_N_EPOCHS`` is 1 in the trainer for this config so
-#     each stage-2 epoch (6, 7, 8, 9, 10, ...) is captured for the
-#     per-benchmark best-checkpoint pick.
+#     forwarded to ``F.cross_entropy``. Weights are computed at
+#     trainer startup from the silver-train split via Cui et al.
+#     2019 effective-number-of-samples with β = 0.99998
+#     (``CBW_BETA`` in ``resume_train_jepa.py``).
+#   * β=0.99998 sits between β=0.99997 (MS-CXR-T stable ~0.46) and
+#     β=0.99999 (MS-CXR-T stable collapses ~0.06). Probe the cliff
+#     while aiming for better gold per-class balance than β=0.9999.
+#   * GLoRIA report-contrastive weights stay at 0.10.
+#   * Checkpoints / logs land under ``cbw99998`` so they never
+#     clobber ``cbw9999`` / ``cbw99997`` / ``cbw99999`` /
+#     ``cbw9999to99999`` / ``cbw9999_rp15``.
 #
-# Everything else (LR, batch size, warmup, W_JEPA, W_PROG, EMA
-# schedule) is untouched, so the ONLY variable versus stage 1 is the
-# CBW β. ``best.pt`` is still overwritten whenever ``val_total`` improves.
+# Same 50-epoch, save-every-5 schedule as the other from-scratch
+# β sweeps. ``best.pt`` is overwritten whenever ``val_total`` improves.
 #
 # Bulk image data defaults to the shared cluster path
 # ``/scratch/m000081/eprakash/all_data`` (not per-project) so multiple
@@ -69,14 +45,11 @@
 #
 #     export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
 #     export JEPA_IMAGE_ROOTS_DIR=/path/to/all_data
-#     export JEPA_RESUME_CKPT=/path/to/checkpoints_jepa_dynamic_cbw9999/epoch_5.pt
 #     sbatch resume_train_jepa.sh
 #
-# Auto-resume from the latest stage-2 epoch checkpoint kicks in
-# automatically if the run is preempted and re-queued (as long as
-# the stage-2 CHECKPOINT_DIR already has an ``epoch_*.pt``), so
-# ``sbatch resume_train_jepa.sh`` just picks up where it left off
-# without re-winding to the stage-1 starting point.
+# Auto-resume from the latest epoch checkpoint kicks in automatically
+# if the run is preempted and re-queued, so ``sbatch resume_train_jepa.sh``
+# just picks up where it left off.
 # ============================================================
 
 # ============================================================
@@ -121,35 +94,6 @@ echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n
 # {silver,gold}_*.parquet without any code edits.
 # ============================================================
 # export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
-
-# ============================================================
-# Stage-1 checkpoint we ``--resume`` from.
-#
-# The trainer's auto-resume looks inside the ``main``-configured
-# stage-2 ``CHECKPOINT_DIR`` first (currently
-# ``checkpoints_jepa_dynamic_cbw9999to99999``). If that dir is empty
-# (fresh two-stage launch), we point ``--resume`` at the stage-1
-# checkpoint via ``JEPA_RESUME_CKPT`` so weights + optimizer + LR
-# scheduler state transfer over. On preemption re-queues, the
-# stage-2 dir now contains ``epoch_*.pt`` so auto-resume kicks in
-# and we do NOT pass ``--resume`` (otherwise we'd repeatedly wind
-# training back to the stage-1 starting point).
-# ============================================================
-JEPA_RESUME_CKPT="${JEPA_RESUME_CKPT:-/scratch/m000081/eprakash/temporal/final/cxr-temporal-model-cbw/cxr-temporal-model/checkpoints_jepa_dynamic_cbw9999/epoch_5.pt}"
-STAGE2_CKPT_DIR="${JEPA_CHECKPOINT_DIR:-$PROJECT_DIR/checkpoints_jepa_dynamic_cbw9999to99999}"
-if compgen -G "$STAGE2_CKPT_DIR/epoch_*.pt" > /dev/null; then
-  echo "[slurm] stage-2 checkpoints already exist under $STAGE2_CKPT_DIR"
-  echo "[slurm]   → auto-resume from latest stage-2 epoch (no --resume passed)"
-  RESUME_ARG=""
-else
-  if [ ! -f "$JEPA_RESUME_CKPT" ]; then
-    echo "[slurm] ERROR: stage-1 checkpoint not found: $JEPA_RESUME_CKPT" >&2
-    echo "[slurm]   set JEPA_RESUME_CKPT to a valid β=0.9999 epoch_N.pt path." >&2
-    exit 1
-  fi
-  echo "[slurm] initializing stage 2 from $JEPA_RESUME_CKPT"
-  RESUME_ARG="--resume $JEPA_RESUME_CKPT"
-fi
 
 # ============================================================
 # Bulk image data (mimic / chexpert / rexgradient).
@@ -202,9 +146,5 @@ echo "[slurm] CheXTemporal OK ($CHEXTEMPORAL_DIR)"
 # Launch training (4 GPUs, DDP). run_jepa.py auto-detects the
 # visible GPU count via torch.cuda.device_count(), so we don't
 # have to keep --nproc_per_node in sync with --gres.
-#
-# ``$RESUME_ARG`` is empty on preemption re-queues (auto-resume
-# from stage-2 dir), and ``--resume /path/to/stage-1/epoch_5.pt``
-# on the initial launch.
 # ============================================================
-python run_jepa.py $RESUME_ARG
+python run_jepa.py
