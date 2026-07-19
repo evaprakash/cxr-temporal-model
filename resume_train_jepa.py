@@ -18,20 +18,28 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: two-stage class-balanced warm-up.
+# Current run: two-stage class-balanced protocol. Not β-annealing —
+# β is a hard 0.99999 for every step of this file; the class weights
+# are computed once at trainer startup and never touched again.
 #   Stage 1 (already trained, saved as
 #            ``checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``):
 #       CBW β=0.9999, W_REPORT_*=0.1.
 #   Stage 2 (this file, launched with
 #            ``--resume .../checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``):
 #       CBW β=0.99999, W_REPORT_*=0.1.
-#   Rationale: β=0.99999 from scratch collapses stable on MS-CXR-T
-#   because the 2.5× directional-class boost sharpens the non-stable
-#   candidates too aggressively too early. Warm-starting from a
-#   β=0.9999 checkpoint means the LR schedule is already past warmup
-#   and decaying, so the aggressive weights are applied as a gentle
-#   fine-tune rather than a from-scratch objective — the model should
-#   pick up the resolved boost without destroying stable geometry.
+#   What ``--resume`` gives us over a from-scratch β=0.99999 run:
+#     * model weights initialized from a checkpoint that already has
+#       well-shaped stable/directional geometry;
+#     * optimizer + LR scheduler state carried over, so stage 2 starts
+#       at the decayed LR from stage-1's epoch-5 step (NOT the peak
+#       warmup LR that a from-scratch launch would see).
+#   Hypothesis: β=0.99999 from scratch collapses stable on MS-CXR-T
+#   because the 2.5× directional-class boost fires while the features
+#   are still random-ish and the LR is at its peak, so early updates
+#   overshoot. Starting from the β=0.9999 checkpoint puts the aggressive
+#   weights on top of already-good features at already-decayed LR, so
+#   the model should be able to lift resolved recall without wiping
+#   out stable.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -145,20 +153,23 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 #       (Pareto-preserved). This is our stage-1 checkpoint — good
 #       stable geometry but resolved recall on gold still low.
 #
-#   β = 0.99999 (WARM-STARTED from β=0.9999 epoch 5) → this run.
-#       Rationale: apply the aggressive weights as a gentle fine-tune
-#       on top of a well-shaped feature space, so the resolved boost
-#       lifts minority recall without destroying stable. LR schedule
-#       inherits the stage-1 state (already past warmup, decaying), so
-#       the effective β=0.99999 gradient magnitude is much smaller
-#       than a from-scratch β=0.99999 run at the same nominal epoch.
+#   β = 0.99999 (resumed from β=0.9999 epoch 5) → this run.
+#       Same class weights as from-scratch β=0.99999 (resolved ~25×,
+#       middle ~2.5×). The difference is only the starting point:
+#       model weights come from a β=0.9999 checkpoint (well-shaped
+#       features) and the LR schedule is inherited (already decaying,
+#       not at peak warmup). If the collapse-under-β=0.99999 failure
+#       mode is driven by early large updates on immature features,
+#       skipping that early window should let β=0.99999 lift resolved
+#       without wiping out stable.
 #
 # The two failure modes β alone runs into (from-scratch):
 #   * Gold "resolved collapse":   fires when resolved weight  < ~4× stable.
 #   * MS-CXR-T "stable collapse": fires when middle-class weight > ~2× stable.
-# Warm-starting is the escape hatch: stage 1 (β=0.9999) fixes the
-# resolved-collapse failure, stage 2 (β=0.99999) adds a small nudge
-# toward resolved without ruining stable.
+# Starting from a β=0.9999 checkpoint is the escape hatch: stage 1
+# (β=0.9999) fixes the resolved-collapse failure and delivers a decent
+# feature space; stage 2 (β=0.99999) is the same hard-β objective as
+# a from-scratch cbw99999 run but applied to that feature space.
 CBW_BETA = 0.99999
 
 # Optional annotation used for ckpt / log dir naming. If set, indicates

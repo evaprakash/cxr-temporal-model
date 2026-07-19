@@ -13,14 +13,16 @@
 
 # ============================================================
 # SLURM launcher for the ``main`` branch's two-stage class-balanced
-# warm-up variant of the 4th (progression) loss.
+# variant of the 4th (progression) loss. NOT β-annealing — β is a
+# hard 0.99999 for every step of this run; only the starting point
+# is different from a from-scratch β=0.99999 launch.
 #
 # What this run does that ``main`` did NOT do before:
 #   * ``progression_classification_loss`` takes a ``weight=`` tensor
 #     forwarded to ``F.cross_entropy``. The tensor is computed at
 #     trainer startup from the actual silver-train split using the
 #     Cui et al. 2019 effective-number-of-samples formula.
-#   * Two-stage β schedule:
+#   * Two stages, hard β at each:
 #       - Stage 1 (already trained separately):
 #           β = 0.9999. Best single-stage headline (resolved boost
 #           ~4.3× stable, directional-class boost ~1.05×), preserves
@@ -28,15 +30,13 @@
 #           ``checkpoints_jepa_dynamic_cbw9999/epoch_5.pt``.
 #       - Stage 2 (THIS run):
 #           β = 0.99999 (``CBW_BETA`` in ``resume_train_jepa.py``).
-#           From scratch, β=0.99999 collapses MS-CXR-T stable
-#           because the 2.5× directional-class boost sharpens
-#           non-stable candidates too aggressively. Warm-starting
-#           from the β=0.9999 checkpoint applies the aggressive
-#           weights as a gentle fine-tune — the LR schedule is
-#           inherited from stage 1 (already past warmup, decaying),
-#           so the effective gradient magnitude is much smaller
-#           than a from-scratch β=0.99999 run at the same nominal
-#           epoch.
+#           From scratch, β=0.99999 collapses MS-CXR-T stable because
+#           the 2.5× directional-class boost fires while features are
+#           still immature and the LR is at its peak. Here the model
+#           starts from stage 1's well-shaped features and the LR
+#           schedule is inherited from stage 1 (already past warmup,
+#           decaying), so the same β=0.99999 objective lands on a
+#           different starting condition than a from-scratch launch.
 #   * GLoRIA report-contrastive weights are back at the 0.10 baseline
 #     (``W_REPORT_PRIOR`` / ``W_REPORT_PRED``). We briefly tried 0.15
 #     to lift disease-class alignment; it slightly helped disease but
