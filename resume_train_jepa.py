@@ -262,11 +262,11 @@ def gather_with_grad(tensor):
 # ============================================================
 LR = 2e-5
 WEIGHT_DECAY = 0.01
-# Batch size was 32 before; dropped to 24 to fit under the A100-40GB
-# memory ceiling with ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``.
-# All 4 losses scale the same way, so this doesn't change the loss
-# balance — only the number of pairs per gradient step.
-BATCH_SIZE = 24
+# Batch size was 32 → 24 for the 4-loss setup; dropped again to 16
+# after adding disease multi-label BCE (peak mem on A100-40GB with
+# ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``). Loss balance
+# is unchanged — only pairs per step.
+BATCH_SIZE = 16
 EPOCHS = 50
 WARMUP_RATIO = 0.03
 

@@ -355,11 +355,10 @@ class TempCXRJEPA(nn.Module):
         _, prior_patches = self.image_encoder(prior_imgs)
 
         # ---- Text encoder on all reports + optional extras ----
-        # Concatenate the text lists and run the encoder once. This
-        # costs roughly (B + B + B + B*C + K) tokenized strings of
-        # CXR-BERT, but it's still a single forward pass — required
-        # under DDP so text-encoder params are not used outside
-        # ``forward``.
+        # Concatenate report / condition / progression texts and run
+        # the encoder once. Disease finding-name prompts are encoded
+        # separately under ``no_grad`` below (still inside ``forward``
+        # for DDP) so they do not inflate this activation graph.
         B = prior_imgs.size(0)
         all_reports = (
             list(prior_reports) + list(current_reports) + list(condition_texts)
@@ -385,26 +384,34 @@ class TempCXRJEPA(nn.Module):
         disease_active = (
             disease_prompts is not None and len(disease_prompts) > 0
         )
-        n_disease = len(disease_prompts) if disease_active else 0
-        if disease_active:
-            all_reports = all_reports + list(disease_prompts)
 
         all_txt_global, all_txt_local, all_token_mask = (
             self.text_encoder.forward_contrastive(all_reports)
         )
+        del all_txt_global  # unused here; disease globals encoded separately
         prior_txt_local = all_txt_local[:B]
         current_txt_local = all_txt_local[B:2 * B]
         condition_txt_local = all_txt_local[2 * B:3 * B]
         prior_token_mask = all_token_mask[:B]
         current_token_mask = all_token_mask[B:2 * B]
         condition_token_mask = all_token_mask[2 * B:3 * B]
-        cursor = 3 * B
         if prog_active:
-            prog_txt_local = all_txt_local[cursor:cursor + n_prog]
-            prog_token_mask = all_token_mask[cursor:cursor + n_prog]
-            cursor += n_prog
+            prog_txt_local = all_txt_local[3 * B:3 * B + n_prog]
+            prog_token_mask = all_token_mask[3 * B:3 * B + n_prog]
+
+        # Finding-name embeddings for the disease loss. Encoded in a
+        # separate no-grad text pass so (a) we don't inflate the main
+        # report/progression activation graph and (b) disease BCE only
+        # pulls on image / ẑ_cur (report contrastive still trains the
+        # text encoder). Still inside ``forward`` for DDP correctness.
         if disease_active:
-            disease_txt_global = all_txt_global[cursor:cursor + n_disease]
+            with torch.no_grad():
+                disease_txt_global, _, _ = (
+                    self.text_encoder.forward_contrastive(
+                        list(disease_prompts)
+                    )
+                )
+            disease_txt_global = disease_txt_global.detach()
 
         # ---- Target encoder on current image: stop-gradient ----
         # The target encoder is a frozen EMA copy of the online encoder
