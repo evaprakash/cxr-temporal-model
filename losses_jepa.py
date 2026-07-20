@@ -18,6 +18,13 @@ scale-invariant — so this module exposes:
     "Class-Balanced Loss Based on Effective Number of Samples") so the
     minority silver classes (``resolved`` ≈ 1 % of silver) get a
     proportionally larger gradient than the majority ``stable`` class.
+  * ``disease_multilabel_loss`` for the finding-level add-on: multi-label
+    BCE on image–text cosine logits between a patch bank (prior or
+    predicted-current) and K finding-name embeddings. All findings
+    present on a pair are positives at once (no random single-finding
+    sampling). Optional per-finding Cui weights fight rare-disease
+    collapse. No progression-template predictor pass — uses the same
+    ``ẑ_cur`` as report local contrastive (dynamic-conditioned).
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
@@ -131,3 +138,56 @@ def progression_classification_loss(
     logits = logits / temperature
 
     return F.cross_entropy(logits, silver_labels, weight=class_weights)
+
+
+# =========================================================
+# DISEASE MULTI-LABEL LOSS (IMAGE–TEXT, NO PROG PREDICTOR)
+# =========================================================
+def disease_multilabel_loss(
+    img_patches: torch.Tensor,          # (B, N, D)
+    finding_txt_global: torch.Tensor,   # (K, D)
+    multi_hot: torch.Tensor,            # (B, K) float {0,1}
+    temperature: float = 0.1,
+    eps: float = 1e-8,
+    class_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Multi-label BCE on image–text cosine logits over findings.
+
+    For each pair ``b`` and finding ``f``::
+
+        logit[b, f] = mean_n cos(img_patches[b, n], finding_txt[f])
+
+    then ``binary_cross_entropy_with_logits(logit / τ, y[b, f])`` where
+    ``y`` is the multi-hot of all findings listed on that silver pair.
+    Samples with no in-vocab findings are skipped (no all-negative
+    batches). Optional ``class_weights`` (K,) scale each finding's
+    contribution (Cui et al. disease CBW).
+
+    ``img_patches`` is typically ``prior_patches`` or dynamic-conditioned
+    ``pred_current_patches`` — not the progression-class ``ẑ_cur^c``.
+    """
+    if img_patches.numel() == 0 or finding_txt_global.numel() == 0:
+        return img_patches.new_zeros(())
+
+    img = F.normalize(img_patches, dim=-1, eps=eps)            # (B, N, D)
+    txt = F.normalize(finding_txt_global, dim=-1, eps=eps)     # (K, D)
+    # (B, K, N) → mean over patches → (B, K)
+    logits = torch.einsum("bnd,kd->bkn", img, txt).mean(dim=-1)
+    logits = logits / temperature
+
+    valid = multi_hot.sum(dim=-1) > 0
+    if not bool(valid.any()):
+        return img_patches.new_zeros(())
+
+    logits = logits[valid]
+    targets = multi_hot[valid]
+
+    if class_weights is None:
+        weight = None
+    else:
+        weight = class_weights.to(dtype=logits.dtype, device=logits.device)
+        weight = weight.unsqueeze(0).expand_as(targets)
+
+    return F.binary_cross_entropy_with_logits(
+        logits, targets, weight=weight, reduction="mean"
+    )
