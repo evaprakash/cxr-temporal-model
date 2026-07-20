@@ -281,6 +281,7 @@ class TempCXRJEPA(nn.Module):
         current_reports,
         condition_texts,
         progression_prompts_flat=None,
+        disease_prompts=None,
     ):
         """
         prior_imgs       : (B, 3, H, W)
@@ -310,6 +311,15 @@ class TempCXRJEPA(nn.Module):
                            ``(B, C, N, D)`` in the output dict. When
                            ``None`` (e.g. inference / smoke test),
                            ``pred_progression_patches`` is omitted.
+        disease_prompts
+                           Optional ``list[str]`` of length ``K`` — shared
+                           finding-name prompts for the disease multi-label
+                           loss. Encoded in the **same** text-encoder
+                           forward as the reports (required under DDP;
+                           do not call ``text_encoder`` outside this
+                           ``forward``). When provided, the output dict
+                           includes ``disease_txt_global`` of shape
+                           ``(K, D)``.
 
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, unit-norm,
@@ -334,6 +344,9 @@ class TempCXRJEPA(nn.Module):
                                                 entry (only present when
                                                 ``progression_prompts_flat
                                                 is not None``).
+          - disease_txt_global       (K, D)     finding-name globals
+                                                (only when ``disease_prompts``
+                                                is provided).
         """
 
         # ---- Online encoder on prior (gradients flow) ----
@@ -341,11 +354,12 @@ class TempCXRJEPA(nn.Module):
         # ``prior_patches`` arrives on the unit sphere.
         _, prior_patches = self.image_encoder(prior_imgs)
 
-        # ---- Text encoder on all reports + (optional) progression prompts ----
+        # ---- Text encoder on all reports + optional extras ----
         # Concatenate the text lists and run the encoder once. This
-        # costs roughly (B + B + B + B*C) tokenized strings of CXR-BERT,
-        # but it's still a single forward pass, which is cheaper than 4
-        # separate calls for the same total work.
+        # costs roughly (B + B + B + B*C + K) tokenized strings of
+        # CXR-BERT, but it's still a single forward pass — required
+        # under DDP so text-encoder params are not used outside
+        # ``forward``.
         B = prior_imgs.size(0)
         all_reports = (
             list(prior_reports) + list(current_reports) + list(condition_texts)
@@ -368,7 +382,14 @@ class TempCXRJEPA(nn.Module):
             n_prog = 0
             C = 0
 
-        _, all_txt_local, all_token_mask = (
+        disease_active = (
+            disease_prompts is not None and len(disease_prompts) > 0
+        )
+        n_disease = len(disease_prompts) if disease_active else 0
+        if disease_active:
+            all_reports = all_reports + list(disease_prompts)
+
+        all_txt_global, all_txt_local, all_token_mask = (
             self.text_encoder.forward_contrastive(all_reports)
         )
         prior_txt_local = all_txt_local[:B]
@@ -377,9 +398,13 @@ class TempCXRJEPA(nn.Module):
         prior_token_mask = all_token_mask[:B]
         current_token_mask = all_token_mask[B:2 * B]
         condition_token_mask = all_token_mask[2 * B:3 * B]
+        cursor = 3 * B
         if prog_active:
-            prog_txt_local = all_txt_local[3 * B:3 * B + n_prog]
-            prog_token_mask = all_token_mask[3 * B:3 * B + n_prog]
+            prog_txt_local = all_txt_local[cursor:cursor + n_prog]
+            prog_token_mask = all_token_mask[cursor:cursor + n_prog]
+            cursor += n_prog
+        if disease_active:
+            disease_txt_global = all_txt_global[cursor:cursor + n_disease]
 
         # ---- Target encoder on current image: stop-gradient ----
         # The target encoder is a frozen EMA copy of the online encoder
@@ -408,6 +433,8 @@ class TempCXRJEPA(nn.Module):
             "condition_txt_local": condition_txt_local,
             "condition_token_mask": condition_token_mask,
         }
+        if disease_active:
+            out["disease_txt_global"] = disease_txt_global
 
         # ---- Predictor pass #2 (optional): one ẑ_cur^c per class ----
         # Broadcast the same z_prior across the C progression prompts so

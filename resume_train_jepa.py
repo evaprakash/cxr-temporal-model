@@ -735,13 +735,12 @@ def compute_jepa_losses(out, prog_cls_idx, findings_lists, gather: bool):
 
     # Disease multi-label image–text BCE on prior patches and on the
     # dynamic-conditioned ẑ_cur (same latent as report local contrastive
-    # — NOT the progression-template ẑ_cur^c). Encode the K finding-name
-    # prompts through the text encoder each step so gradients update
-    # finding embeddings. All findings on the pair are multi-hot positives.
-    finding_txt_global, _, _ = model.module.text_encoder.forward_contrastive(
-        FINDING_PROMPTS
-    )
+    # — NOT the progression-template ẑ_cur^c). Finding-name embeddings
+    # come from the same DDP ``forward`` text-encoder pass
+    # (``out["disease_txt_global"]``) — do NOT call text_encoder outside
+    # ``forward`` or DDP marks params ready twice.
     multi_hot = findings_to_multihot(findings_lists, DEVICE)
+    finding_txt_global = out["disease_txt_global"]
     dis_prior = disease_multilabel_loss(
         out["prior_patches"].float(),
         finding_txt_global.float(),
@@ -808,6 +807,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 current_reports,
                 condition_texts,
                 progression_prompts_flat=prog_prompts,
+                disease_prompts=FINDING_PROMPTS,
             )
 
             loss, jepa_l, prior_l, pred_l, prog_l, dis_pri_l, dis_pred_l = (
@@ -878,6 +878,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     current_reports,
                     condition_texts,
                     progression_prompts_flat=prog_prompts,
+                    disease_prompts=FINDING_PROMPTS,
                 )
 
                 (
