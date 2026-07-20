@@ -8,10 +8,8 @@
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.99999) — see ``CBW_BETA``
-#               + Disease multi-label image–text BCE on prior patches
-#                 and on dynamic-conditioned ẑ_cur (not progression
-#                 templates), class-balanced with disease β=0.9999
+#                 (Cui et al. 2019, β=0.99999 in this run) — see the
+#                 ``CBW_*`` constants below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
@@ -20,11 +18,8 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10,
-# plus disease multi-label losses (W=0.05 prior + 0.05 pred) with
-# disease CBW β=0.9999. Disease loss uses the same ẑ_cur as report
-# local contrastive (dynamic condition), with ALL findings on a pair
-# as multi-hot positives.
+# Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10.
+# No disease multi-label loss — progression + grounding first.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -65,11 +60,7 @@ from tempcxr.modules.jepa import (
     EMA_END,
 )
 from losses import local_contrastive_loss
-from losses_jepa import (
-    jepa_cosine_loss,
-    progression_classification_loss,
-    disease_multilabel_loss,
-)
+from losses_jepa import jepa_cosine_loss, progression_classification_loss
 
 
 # ============================================================
@@ -141,39 +132,13 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 #
 #   β = 0.99999 (from scratch) → resolved boost ~25×, middle ~2.5×
 #       Best gold per-class balance vs lit baselines; MS-CXR-T
-#       stable collapses (~0.06). FROZEN as the progression β.
+#       stable collapses (~0.06). FROZEN as the progression β for
+#       this run; we now sweep W_REPORT_* on top.
 #
 # The two failure modes β alone runs into (from-scratch):
 #   * Gold "resolved collapse":   fires when resolved weight  < ~4× stable.
 #   * MS-CXR-T "stable collapse": fires when middle-class weight > ~2× stable.
 CBW_BETA = 0.99999
-
-# Disease-finding CBW (separate from progression β). Gentler than
-# 0.99999 so rare findings get a boost without dominating the new
-# multi-label BCE terms.
-DISEASE_CBW_BETA = 0.9999
-
-# Canonical 11-way finding vocab (matches disease eval / CheXpert-style
-# labels). Silver findings outside this list are ignored for the
-# disease loss multi-hot.
-FINDING_ORDER = [
-    "atelectasis",
-    "cardiomegaly",
-    "consolidation",
-    "edema",
-    "enlarged cardiomediastinum",
-    "lung lesion",
-    "lung opacity",
-    "pleural effusion",
-    "pleural other",
-    "pneumonia",
-    "pneumothorax",
-]
-N_FINDINGS = len(FINDING_ORDER)
-FINDING_PROMPTS = [
-    (f[:1].upper() + f[1:]) if f else "" for f in FINDING_ORDER
-]
-FINDING_TO_IDX = {name: i for i, name in enumerate(FINDING_ORDER)}
 
 # Purely a dir-naming annotation, NOT a training knob. Set this to
 # the β value of the checkpoint you plan to ``--resume`` from; the
@@ -262,11 +227,11 @@ def gather_with_grad(tensor):
 # ============================================================
 LR = 2e-5
 WEIGHT_DECAY = 0.01
-# Batch size was 32 → 24 for the 4-loss setup; dropped again to 16
-# after adding disease multi-label BCE (peak mem on A100-40GB with
-# ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``). Loss balance
-# is unchanged — only pairs per step.
-BATCH_SIZE = 16
+# Batch size was 32 before; dropped to 24 to fit under the A100-40GB
+# memory ceiling with ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``.
+# All 4 losses scale the same way, so this doesn't change the loss
+# balance — only the number of pairs per gradient step.
+BATCH_SIZE = 24
 EPOCHS = 50
 WARMUP_RATIO = 0.03
 
@@ -274,12 +239,7 @@ WARMUP_RATIO = 0.03
 # plus best.pt whenever val total improves. From-scratch β sweeps use 5.
 SAVE_EVERY_N_EPOCHS = 5
 
-# Loss weights.
-#
-# Report contrastive back at the 0.10 baseline. Disease multi-label
-# BCE is the dedicated finding-alignment knob (not W_REPORT bumps).
-# Prior + pred disease each at 0.05 → total disease mass 0.10, same
-# ballpark as W_PROG, so the new terms don't drown JEPA/progression.
+# Loss weights (baseline report contrastive = 0.10).
 W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
@@ -290,10 +250,6 @@ W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
 N_CLS = len(CLS_ORDER)
-# Disease multi-label image–text BCE (prior patches + dynamic ẑ_cur).
-W_DISEASE_PRIOR = 0.05
-W_DISEASE_PRED = 0.05
-DISEASE_TEMP = 0.1
 
 # Stratified train/val split when the studies parquet has no 'split'
 # column. Both datasets read/write the same cached splits CSV
@@ -306,28 +262,27 @@ SPLIT_SEED = 42
 # ============================================================
 # CHECKPOINT / LOG DIR NAMING
 # ============================================================
-# Encode CBW β, report reweighting, and disease-loss settings in the
-# ckpt / log dir names so ablations never clobber each other.
-#   * ``cbw{beta_tag}``               — from-scratch progression β
-#   * ``cbw{stage1}to{cur}``          — resume-from-different-β tag
-#   * ``_rp{ww}``                     — non-default report weights
-#   * ``_dw{ww}``                     — disease prior=pred weight
-#   * ``_dcw{beta}``                  — disease CBW β tag
-# Legacy dirs from older runs are left untouched as archives.
+# Encode BOTH the CBW β and any non-default GLoRIA contrastive
+# reweighting in the ckpt / log dir names so ablations never clobber
+# each other. Baseline convention:
+#   * ``cbw{beta_tag}``               — from-scratch β run
+#                                       (W_REPORT_PRIOR = W_REPORT_PRED = 0.1)
+#   * ``cbw{stage1}to{cur}``          — hard-β=``{cur}`` run that
+#                                       ``--resume``-s from a checkpoint
+#                                       previously trained at β=``{stage1}``
+#                                       (see ``CBW_BETA_STAGE1``). Only
+#                                       affects the dir name — training
+#                                       runs at a hard ``CBW_BETA`` the
+#                                       whole time, no β schedule.
+#   * ``cbw{beta_tag}_rp{ww}``        — both report weights bumped to
+#                                       the same non-default value
+#                                       (e.g. rp15 = 0.15)
+#   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
+# Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
+# (pre-4-loss / pre-CBW) runs are left untouched as archives.
 def _cbw_beta_tag(beta: float) -> str:
     """``0.9999`` → ``"9999"``, ``0.99999`` → ``"99999"``, etc."""
     return str(beta).replace("0.", "").replace(".", "")
-
-
-def _report_weight_tag(w: float) -> str:
-    """Format a weight as a zero-padded percent tag.
-
-    ``0.10`` → ``"10"``, ``0.15`` → ``"15"``, ``0.05`` → ``"05"``.
-    """
-    scaled = w * 100.0
-    if abs(scaled - round(scaled)) < 1e-9:
-        return f"{int(round(scaled)):02d}"
-    return str(w).replace("0.", "").replace(".", "")
 
 
 _beta_tag = _cbw_beta_tag(CBW_BETA)
@@ -337,31 +292,28 @@ if CBW_BETA_STAGE1 is not None:
 else:
     _SETTING_TAG = f"cbw{_beta_tag}"
 
+
+def _report_weight_tag(w: float) -> str:
+    """Format a report contrastive weight as a zero-padded percent tag.
+
+    ``0.10`` → ``"10"``, ``0.15`` → ``"15"``, ``0.2`` → ``"20"``.
+    Falls back to a stripped ``str`` for weights that don't land on
+    integer-percent so we never silently collapse two distinct sweep
+    points into the same directory.
+    """
+    scaled = w * 100.0
+    if abs(scaled - round(scaled)) < 1e-9:
+        return f"{int(round(scaled)):02d}"
+    return str(w).replace("0.", "").replace(".", "")
+
+
 if W_REPORT_PRIOR != 0.1 or W_REPORT_PRED != 0.1:
     _rprior_tag = _report_weight_tag(W_REPORT_PRIOR)
     _rpred_tag = _report_weight_tag(W_REPORT_PRED)
     if _rprior_tag == _rpred_tag:
         _SETTING_TAG = f"{_SETTING_TAG}_rp{_rprior_tag}"
     else:
-        _SETTING_TAG = (
-            f"{_SETTING_TAG}_rpri{_rprior_tag}_rpred{_rpred_tag}"
-        )
-
-# Disease loss is always tagged when enabled (W > 0) so disease runs
-# never land in a plain ``cbw99999`` directory.
-if W_DISEASE_PRIOR > 0 or W_DISEASE_PRED > 0:
-    if W_DISEASE_PRIOR == W_DISEASE_PRED:
-        _SETTING_TAG = (
-            f"{_SETTING_TAG}_dw{_report_weight_tag(W_DISEASE_PRIOR)}"
-        )
-    else:
-        _SETTING_TAG = (
-            f"{_SETTING_TAG}_dpri{_report_weight_tag(W_DISEASE_PRIOR)}"
-            f"_dpred{_report_weight_tag(W_DISEASE_PRED)}"
-        )
-    _SETTING_TAG = (
-        f"{_SETTING_TAG}_dcw{_cbw_beta_tag(DISEASE_CBW_BETA)}"
-    )
+        _SETTING_TAG = f"{_SETTING_TAG}_rpri{_rprior_tag}_rpred{_rpred_tag}"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -411,42 +363,10 @@ def _compute_cui_class_weights(dataset, beta: float) -> torch.Tensor:
             counts[CLS_ORDER.index(name)] = float(c)
 
     beta_t = torch.tensor(beta, dtype=torch.float64)
-    # Guard zero-count classes (shouldn't happen for progression).
-    counts_safe = counts.clamp(min=1.0)
-    effective_num = (1.0 - torch.pow(beta_t, counts_safe)) / (1.0 - beta_t)
+    effective_num = (1.0 - torch.pow(beta_t, counts)) / (1.0 - beta_t)
     weights = 1.0 / effective_num
     weights = weights * N_CLS / weights.sum()
     return weights.float(), counts.long()
-
-
-def _compute_disease_cui_weights(dataset, beta: float):
-    """Cui weights over FINDING_ORDER from silver-train finding lists."""
-    exploded = dataset.df["finding"].explode()
-    exploded = exploded.astype(str).str.strip().str.lower()
-    counts_by_name = exploded.value_counts()
-
-    counts = torch.zeros(N_FINDINGS, dtype=torch.float64)
-    for i, name in enumerate(FINDING_ORDER):
-        counts[i] = float(counts_by_name.get(name, 0))
-
-    beta_t = torch.tensor(beta, dtype=torch.float64)
-    counts_safe = counts.clamp(min=1.0)
-    effective_num = (1.0 - torch.pow(beta_t, counts_safe)) / (1.0 - beta_t)
-    weights = 1.0 / effective_num
-    weights = weights * N_FINDINGS / weights.sum()
-    return weights.float(), counts.long()
-
-
-def findings_to_multihot(findings_lists, device):
-    """Convert per-pair finding name lists → (B, K) multi-hot float."""
-    B = len(findings_lists)
-    y = torch.zeros(B, N_FINDINGS, device=device, dtype=torch.float32)
-    for b, flist in enumerate(findings_lists):
-        for f in flist:
-            f_norm = str(f).strip().lower()
-            if f_norm in FINDING_TO_IDX:
-                y[b, FINDING_TO_IDX[f_norm]] = 1.0
-    return y
 
 
 # ============================================================
@@ -479,11 +399,6 @@ _prog_class_weights_cpu, _prog_class_counts = _compute_cui_class_weights(
 )
 PROG_CLASS_WEIGHTS = _prog_class_weights_cpu.to(DEVICE)
 
-_dis_class_weights_cpu, _dis_class_counts = _compute_disease_cui_weights(
-    train_dataset, beta=DISEASE_CBW_BETA
-)
-DISEASE_CLASS_WEIGHTS = _dis_class_weights_cpu.to(DEVICE)
-
 if local_rank == 0:
     print(f"[train] condition_mode={CONDITION_MODE}")
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
@@ -499,18 +414,6 @@ if local_rank == 0:
     ):
         print(
             f"[train]   {cls:<10} n_train={n:>7d}  weight={w:.4f}"
-        )
-    print(
-        f"[train] disease-class CBW: β={DISEASE_CBW_BETA} "
-        f"W_prior={W_DISEASE_PRIOR} W_pred={W_DISEASE_PRED}"
-    )
-    for name, n, w in zip(
-        FINDING_ORDER,
-        _dis_class_counts.tolist(),
-        _dis_class_weights_cpu.tolist(),
-    ):
-        print(
-            f"[train]   {name:<28} n_train={n:>7d}  weight={w:.4f}"
         )
 
 train_sampler = DistributedSampler(
@@ -630,7 +533,7 @@ if local_rank == 0 and not os.path.exists(CSV_LOG):
     with open(CSV_LOG, "w") as f:
         f.write(
             "epoch,val_total,val_jepa,val_report_prior,val_report_pred,"
-            "val_prog,val_disease_prior,val_disease_pred\n"
+            "val_prog\n"
         )
 
 
@@ -663,17 +566,15 @@ def build_progression_prompts(prog_findings):
 # ============================================================
 # LOSS COMPUTATION (shared by train + val)
 # ============================================================
-def compute_jepa_losses(out, prog_cls_idx, findings_lists, gather: bool):
+def compute_jepa_losses(out, prog_cls_idx, gather: bool):
     """
-    out            : dict returned by TempCXRJEPA.forward
-    prog_cls_idx   : (B,) long tensor — silver class for the 4th loss
-    findings_lists : list[list[str]] — all findings on each pair (disease)
-    gather         : if True, gather contrastive features across ranks
-                     for cross-rank negatives (training). If False, use
-                     local features only (validation).
+    out          : dict returned by TempCXRJEPA.forward
+    prog_cls_idx : (B,) long tensor — silver class for the 4th loss
+    gather       : if True, gather contrastive features across ranks
+                   for cross-rank negatives (training). If False, use
+                   local features only (validation).
 
-    Returns:
-        (total, jepa, prior, pred, prog, dis_prior, dis_pred) scalars.
+    Returns: (total, jepa, prior, pred, prog) as scalar tensors.
     """
 
     # JEPA loss is per-patch cosine; cross-rank gathering doesn't add
@@ -733,38 +634,13 @@ def compute_jepa_losses(out, prog_cls_idx, findings_lists, gather: bool):
         class_weights=PROG_CLASS_WEIGHTS,
     )
 
-    # Disease multi-label image–text BCE on prior patches and on the
-    # dynamic-conditioned ẑ_cur (same latent as report local contrastive
-    # — NOT the progression-template ẑ_cur^c). Finding-name embeddings
-    # come from the same DDP ``forward`` text-encoder pass
-    # (``out["disease_txt_global"]``) — do NOT call text_encoder outside
-    # ``forward`` or DDP marks params ready twice.
-    multi_hot = findings_to_multihot(findings_lists, DEVICE)
-    finding_txt_global = out["disease_txt_global"]
-    dis_prior = disease_multilabel_loss(
-        out["prior_patches"].float(),
-        finding_txt_global.float(),
-        multi_hot,
-        temperature=DISEASE_TEMP,
-        class_weights=DISEASE_CLASS_WEIGHTS,
-    )
-    dis_pred = disease_multilabel_loss(
-        out["pred_current_patches"].float(),
-        finding_txt_global.float(),
-        multi_hot,
-        temperature=DISEASE_TEMP,
-        class_weights=DISEASE_CLASS_WEIGHTS,
-    )
-
     total = (
         W_JEPA * jepa
         + W_REPORT_PRIOR * prior
         + W_REPORT_PRED * pred
         + W_PROG * prog
-        + W_DISEASE_PRIOR * dis_prior
-        + W_DISEASE_PRED * dis_pred
     )
-    return total, jepa, prior, pred, prog, dis_prior, dis_pred
+    return total, jepa, prior, pred, prog
 
 
 # ============================================================
@@ -795,7 +671,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         prog_prompts = build_progression_prompts(batch["prog_finding"])
         prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
-        findings_lists = batch["findings"]
 
         optimizer.zero_grad()
 
@@ -807,13 +682,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 current_reports,
                 condition_texts,
                 progression_prompts_flat=prog_prompts,
-                disease_prompts=FINDING_PROMPTS,
             )
 
-            loss, jepa_l, prior_l, pred_l, prog_l, dis_pri_l, dis_pred_l = (
-                compute_jepa_losses(
-                    out, prog_cls_idx, findings_lists, gather=True
-                )
+            loss, jepa_l, prior_l, pred_l, prog_l = compute_jepa_losses(
+                out, prog_cls_idx, gather=True
             )
 
         scaler.scale(loss).backward()
@@ -836,7 +708,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "loss": f"{loss.item():.4f}",
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
-                "dis": f"{(dis_pri_l + dis_pred_l).item():.4f}",
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
             })
@@ -853,7 +724,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # ============================================================
     model.eval()
     val_total = val_jepa = val_prior = val_pred = val_prog = 0.0
-    val_dis_prior = val_dis_pred = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -868,7 +738,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             prog_prompts = build_progression_prompts(batch["prog_finding"])
             prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
-            findings_lists = batch["findings"]
 
             with torch.amp.autocast("cuda"):
                 out = model(
@@ -878,14 +747,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     current_reports,
                     condition_texts,
                     progression_prompts_flat=prog_prompts,
-                    disease_prompts=FINDING_PROMPTS,
                 )
 
-                (
-                    total, jepa_l, prior_l, pred_l, prog_l,
-                    dis_pri_l, dis_pred_l,
-                ) = compute_jepa_losses(
-                    out, prog_cls_idx, findings_lists, gather=False
+                total, jepa_l, prior_l, pred_l, prog_l = (
+                    compute_jepa_losses(
+                        out, prog_cls_idx, gather=False
+                    )
                 )
 
             val_total += total.item()
@@ -893,8 +760,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
             val_prior += prior_l.item()
             val_pred += pred_l.item()
             val_prog += prog_l.item()
-            val_dis_prior += dis_pri_l.item()
-            val_dis_pred += dis_pred_l.item()
             val_batches += 1
 
     val_total /= max(val_batches, 1)
@@ -902,16 +767,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
     val_prior /= max(val_batches, 1)
     val_pred /= max(val_batches, 1)
     val_prog /= max(val_batches, 1)
-    val_dis_prior /= max(val_batches, 1)
-    val_dis_pred /= max(val_batches, 1)
 
     val_total = ddp_reduce(val_total)
     val_jepa = ddp_reduce(val_jepa)
     val_prior = ddp_reduce(val_prior)
     val_pred = ddp_reduce(val_pred)
     val_prog = ddp_reduce(val_prog)
-    val_dis_prior = ddp_reduce(val_dis_prior)
-    val_dis_pred = ddp_reduce(val_dis_pred)
 
     if local_rank == 0:
 
@@ -921,15 +782,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"JEPA={val_jepa:.4f} | "
             f"PriorReport={val_prior:.4f} | "
             f"PredReport={val_pred:.4f} | "
-            f"Prog={val_prog:.4f} | "
-            f"DisPrior={val_dis_prior:.4f} | "
-            f"DisPred={val_dis_pred:.4f}"
+            f"Prog={val_prog:.4f}"
         )
 
         with open(CSV_LOG, "a") as f:
             f.write(
                 f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred},"
-                f"{val_prog},{val_dis_prior},{val_dis_pred}\n"
+                f"{val_prog}\n"
             )
 
         ckpt = {
