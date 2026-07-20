@@ -8,7 +8,7 @@
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.99998 in this run) — see the
+#                 (Cui et al. 2019, β=0.99999 in this run) — see the
 #                 ``CBW_*`` constants below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -18,11 +18,11 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: from-scratch β=0.99998 (single-stage, no resume).
-# Sits between β=0.99997 (MS-CXR-T stable ~0.46, gold minorities
-# still soft) and β=0.99999 (gold more balanced but MS-CXR-T stable
-# collapses). Goal: better gold per-class balance than β=0.9999
-# without falling off the MS-CXR-T stable cliff.
+# Current run: from-scratch β=0.99999 + W_REPORT_*=0.15.
+# Progression β is frozen at 0.99999 (best gold per-class balance
+# in the β sweep). This run only bumps the two GLoRIA contrastive
+# weights from 0.10 → 0.15 to try to lift disease / image-text
+# alignment without adding a disease-CE loss yet.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -129,19 +129,19 @@ CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 #   β = 0.99997 → resolved boost ~12.7×, middle-class boost ~1.2–1.8×
 #       Gold a bit more balanced; MS-CXR-T stable ~0.46.
 #
-#   β = 0.99999 (from scratch) → resolved boost ~25×, middle ~2.5×
-#       Gold per-class much stronger vs lit baselines, but MS-CXR-T
-#       stable collapses (~0.06). Two-stage resume 0.9999→0.99999
-#       also collapsed MS-CXR-T stable (~0.09).
+#   β = 0.99998 → between 0.99997 and 0.99999; already on the
+#       MS-CXR-T cliff (stable ~0.15) without matching 0.99999's
+#       gold minorities. Not used going forward.
 #
-#   β = 0.99998 (THIS RUN, from scratch) → between 0.99997 and
-#       0.99999. Probe whether the MS-CXR-T cliff is above or below
-#       this point while lifting gold minorities vs β=0.9999.
+#   β = 0.99999 (from scratch) → resolved boost ~25×, middle ~2.5×
+#       Best gold per-class balance vs lit baselines; MS-CXR-T
+#       stable collapses (~0.06). FROZEN as the progression β for
+#       this run; we now sweep W_REPORT_* on top.
 #
 # The two failure modes β alone runs into (from-scratch):
 #   * Gold "resolved collapse":   fires when resolved weight  < ~4× stable.
 #   * MS-CXR-T "stable collapse": fires when middle-class weight > ~2× stable.
-CBW_BETA = 0.99998
+CBW_BETA = 0.99999
 
 # Purely a dir-naming annotation, NOT a training knob. Set this to
 # the β value of the checkpoint you plan to ``--resume`` from; the
@@ -242,11 +242,17 @@ WARMUP_RATIO = 0.03
 # plus best.pt whenever val total improves. From-scratch β sweeps use 5.
 SAVE_EVERY_N_EPOCHS = 5
 
-# Loss weights. Baseline GLoRIA weights (0.10); only CBW β varies
-# versus the earlier from-scratch β sweeps.
+# Loss weights.
+#
+# Progression β is frozen at 0.99999. This run bumps both GLoRIA
+# contrastive weights from the historical 0.10 baseline to 0.15
+# (smallest step) to try to preserve / repair image-text alignment
+# for disease classification. Compare against the existing
+# ``cbw99999`` (W_REPORT=0.10) checkpoints for an apples-to-apples
+# contrastive-weight ablation.
 W_JEPA = 1.0
-W_REPORT_PRIOR = 0.1
-W_REPORT_PRED = 0.1
+W_REPORT_PRIOR = 0.15
+W_REPORT_PRED = 0.15
 # 4th loss: 5-way image-image CE on the predictor's class-conditioned
 # ẑ_cur. Same magnitude bracket as the two contrastive heads; sweep if
 # it dominates or under-shoots at later epochs.

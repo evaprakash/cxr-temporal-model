@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99998
+#SBATCH --job-name=jepa_cbw99999_rp15
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,29 +8,24 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99998_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99998_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_rp15_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_rp15_%j.err
 
 # ============================================================
-# SLURM launcher for the ``main`` branch's from-scratch β=0.99998
-# class-balanced variant of the 4th (progression) loss.
+# SLURM launcher for the ``main`` branch's from-scratch β=0.99999
+# + GLoRIA contrastive reweight (W_REPORT_*=0.15) run.
 #
 # What this run does:
-#   * ``progression_classification_loss`` takes a ``weight=`` tensor
-#     forwarded to ``F.cross_entropy``. Weights are computed at
-#     trainer startup from the silver-train split via Cui et al.
-#     2019 effective-number-of-samples with β = 0.99998
-#     (``CBW_BETA`` in ``resume_train_jepa.py``).
-#   * β=0.99998 sits between β=0.99997 (MS-CXR-T stable ~0.46) and
-#     β=0.99999 (MS-CXR-T stable collapses ~0.06). Probe the cliff
-#     while aiming for better gold per-class balance than β=0.9999.
-#   * GLoRIA report-contrastive weights stay at 0.10.
-#   * Checkpoints / logs land under ``cbw99998`` so they never
-#     clobber ``cbw9999`` / ``cbw99997`` / ``cbw99999`` /
-#     ``cbw9999to99999`` / ``cbw9999_rp15``.
+#   * Progression CBW β = 0.99999 (frozen after the β sweep —
+#     best gold per-class balance; MS-CXR-T stable known to be weak).
+#   * W_REPORT_PRIOR = W_REPORT_PRED = 0.15 (was 0.10). Smallest
+#     contrastive bump to try to lift disease / image-text alignment
+#     before adding a dedicated disease-CE loss.
+#   * Checkpoints / logs land under ``cbw99999_rp15`` so they never
+#     clobber ``cbw99999`` (W=0.10) / ``cbw9999_rp15`` / other β dirs.
 #
-# Same 50-epoch, save-every-5 schedule as the other from-scratch
-# β sweeps. ``best.pt`` is overwritten whenever ``val_total`` improves.
+# Same 50-epoch, save-every-5 schedule. ``best.pt`` is overwritten
+# whenever ``val_total`` improves.
 #
 # Bulk image data defaults to the shared cluster path
 # ``/scratch/m000081/eprakash/all_data`` (not per-project) so multiple
