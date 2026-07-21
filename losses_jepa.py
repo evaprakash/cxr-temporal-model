@@ -18,19 +18,18 @@ scale-invariant — so this module exposes:
     "Class-Balanced Loss Based on Effective Number of Samples") so the
     minority silver classes (``resolved`` ≈ 1 % of silver) get a
     proportionally larger gradient than the majority ``stable`` class.
-  * ``masked_pool_jepa_loss`` for optional grounding: when filtered
-    segmentation masks exist for a pair, soft-pool dynamic-conditioned
-    ``ẑ_cur`` and EMA ``z_cur`` with the union mask's 14×14 float
-    weights, then apply JEPA cosine ``1 - cos(u, v)`` on those pooled
-    vectors. No-mask samples are omitted from the batch average. The
-    full-grid JEPA loss is unchanged.
+  * ``anatomy_region_contrastive_loss`` for optional grounding: learnable
+    anatomy tokens (BioViL-T text warm-start) attend over dynamic
+    ``ẑ_cur`` and EMA ``z_cur`` patch grids; InfoNCE matches the pooled
+    pred/actual region vectors. Multiple regions per pair are separate
+    rows so same-image different regions act as negatives.
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
 already-unit-norm patches is a no-op.
 """
 
-from typing import Optional
+from typing import List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -140,48 +139,48 @@ def progression_classification_loss(
 
 
 # =========================================================
-# MASKED-POOL JEPA (UNION SOFT MASK, ADD-ON)
+# ANATOMY-REGION CONTRASTIVE (TOKEN ATTENTION POOL + INFONCE)
 # =========================================================
-def masked_pool_jepa_loss(
-    pred_patches: torch.Tensor,    # (B, N, D) dynamic-conditioned ẑ_cur
-    target_patches: torch.Tensor,  # (B, N, D) z_cur (stop-grad)
-    patch_weights: torch.Tensor,   # (B, N) soft union-mask coverage
-    active: torch.Tensor,          # (B,) bool — True → contribute
+def anatomy_region_contrastive_loss(
+    pred_patches: torch.Tensor,          # (B, N, D) dynamic ẑ_cur
+    target_patches: torch.Tensor,        # (B, N, D) z_cur (stop-grad)
+    region_ids_per_sample: Sequence[Sequence[int]],
+    anatomy_tokens: torch.nn.Module,     # AnatomyTokenBank
+    temperature: float = 0.07,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """JEPA cosine on soft-mask-pooled region summaries.
+    """InfoNCE between anatomy-pooled pred and actual region vectors.
 
-    For each active sample::
+    For each ``(sample b, region r)`` in ``region_ids_per_sample``:
 
-        u = normalize( Σ_n w_n ẑ_n / Σ_n w_n )
-        v = normalize( Σ_n w_n z_n  / Σ_n w_n )
-        L = 1 - cos(u, v)
+      * token ``r`` attends over ``ẑ_cur[b]`` → pooled ``u``
+      * token ``r`` attends over ``z_cur[b]`` → pooled ``v``
 
-    ``w`` is the downsampled float union of filtered finding masks.
-    Inactive rows (no usable mask) are omitted from the mean. Returns 0
-    when no row is active. Full-grid ``jepa_cosine_loss`` is separate.
+    Symmetric InfoNCE on the stacked ``(u, v)`` rows: same row is the
+    positive; all other rows (including other regions of the same image)
+    are negatives. Returns 0 if no region rows are present.
     """
-    if pred_patches.numel() == 0 or not bool(active.any()):
+    us: List[torch.Tensor] = []
+    vs: List[torch.Tensor] = []
+    for b, region_ids in enumerate(region_ids_per_sample):
+        if b >= pred_patches.size(0):
+            break
+        for r in region_ids:
+            r = int(r)
+            if r < 0 or r >= anatomy_tokens.num_regions:
+                continue
+            u = anatomy_tokens.attend_pool(pred_patches[b], r)
+            v = anatomy_tokens.attend_pool(target_patches[b], r)
+            us.append(u)
+            vs.append(v.detach())  # target side stop-grad
+
+    if not us:
         return pred_patches.new_zeros(())
 
-    w = patch_weights.to(
-        device=pred_patches.device, dtype=pred_patches.dtype
-    ).clamp(min=0.0)
-    if w.shape[:2] != pred_patches.shape[:2]:
-        raise ValueError(
-            f"patch_weights shape {tuple(w.shape)} incompatible with "
-            f"pred_patches {tuple(pred_patches.shape)}"
-        )
-
-    active = active.to(device=pred_patches.device).bool()
-    pred = pred_patches[active]
-    target = target_patches[active]
-    w = w[active]
-    w_sum = w.sum(dim=-1, keepdim=True).clamp(min=eps)  # (B_act, 1)
-    w_norm = w / w_sum
-
-    u = (pred * w_norm.unsqueeze(-1)).sum(dim=1)     # (B_act, D)
-    v = (target * w_norm.unsqueeze(-1)).sum(dim=1)   # (B_act, D)
-    u = F.normalize(u, dim=-1, eps=eps)
-    v = F.normalize(v, dim=-1, eps=eps)
-    return (1.0 - (u * v).sum(dim=-1)).mean()
+    U = F.normalize(torch.stack(us, dim=0), dim=-1, eps=eps)
+    V = F.normalize(torch.stack(vs, dim=0), dim=-1, eps=eps)
+    logits = (U @ V.T) / temperature
+    labels = torch.arange(U.size(0), device=U.device)
+    return 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+    )

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_mskjepa05
+#SBATCH --job-name=jepa_cbw99999_anat05
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,22 +8,23 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_mskjepa05_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_mskjepa05_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_anat05_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_anat05_%j.err
 
 # ============================================================
 # SLURM launcher for the ``main`` branch's from-scratch β=0.99999
-# + soft-mask pooled JEPA add-on (``cbw99999_mskjepa05``).
+# + anatomy-embedding InfoNCE add-on (``cbw99999_anat05``).
 #
 # What this run does:
 #   * Progression CBW β = 0.99999 (frozen after the β sweep —
 #     best gold per-class balance; MS-CXR-T stable known to be weak).
 #   * W_REPORT_PRIOR = W_REPORT_PRED = 0.10 (baseline).
 #   * Progression CE + full-grid JEPA unchanged (global patch mean).
-#   * Soft-mask pooled JEPA add-on (W_MASK_JEPA=0.05): union of all
-#     findings' filtered_masks → 14×14 float weights → pool ẑ and z →
-#     1 - cos(u, v). No-mask samples omitted from that term.
-#   * Checkpoints / logs under ``cbw99999_mskjepa05``.
+#   * Anatomy tokens warm-started from BioViL-T text encodings of
+#     region phrases; InfoNCE on attended pred/actual region pools
+#     (W_ANAT=0.05). Soft-mask JEPA lives on branch
+#     ``experiment/soft-mask-pooled-jepa``, not here.
+#   * Checkpoints / logs under ``cbw99999_anat05``.
 #
 # Same 50-epoch, save-every-5 schedule. ``best.pt`` is overwritten
 # whenever ``val_total`` improves.

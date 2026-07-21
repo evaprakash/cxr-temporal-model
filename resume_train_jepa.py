@@ -19,7 +19,7 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10,
-# plus soft-mask pooled JEPA (``_mskjepa05`` dir tag).
+# plus anatomy-embedding InfoNCE (``_anat05`` dir tag).
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -33,12 +33,13 @@
 #   ``F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label,
 #                     weight=class_weights)`` — still a *global* patch mean.
 #
-# Soft-mask pooled JEPA add-on (5th loss, optional per sample):
-#   When ``filtered_masks`` has any usable RLEs for the pair's findings
-#   on the current image, build the union soft 14×14 float mask, pool
-#   dynamic-conditioned ``ẑ_cur`` and EMA ``z_cur``, and apply
-#   ``1 - cos(u, v)``. Full-grid JEPA is unchanged. No-mask samples are
-#   omitted from this term's batch average (not zero-filled).
+# Anatomy-embedding add-on (5th loss):
+#   Learnable region tokens are warm-started from BioViL-T text globals
+#   of anatomy phrases (e.g. ``"cardiac silhouette"``), then used as
+#   attention queries over dynamic ``ẑ_cur`` and EMA ``z_cur``. InfoNCE
+#   matches pooled pred/actual region vectors; multiple regions per pair
+#   are separate rows (same-image different regions = negatives).
+#   Full-grid JEPA unchanged. Inference / progression eval unchanged.
 
 import os
 import glob
@@ -54,6 +55,7 @@ from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 
+from anatomy_regions import findings_to_region_ids
 from dataset_combined_jepa import JEPACombinedDataset, jepa_collate_fn
 from progression_phrases import CLS_ORDER
 from tempcxr.modules.jepa import (
@@ -66,7 +68,7 @@ from losses import local_contrastive_loss
 from losses_jepa import (
     jepa_cosine_loss,
     progression_classification_loss,
-    masked_pool_jepa_loss,
+    anatomy_region_contrastive_loss,
 )
 
 
@@ -258,10 +260,11 @@ PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
 N_CLS = len(CLS_ORDER)
 
-# Soft-mask pooled JEPA add-on (union of all finding masks). Full-grid
-# JEPA and global progression CE are unchanged.
-W_MASK_JEPA = 0.05
-USE_MASKED_POOL_JEPA = True
+# Anatomy-embedding InfoNCE add-on. Full-grid JEPA and global
+# progression CE are unchanged.
+W_ANAT = 0.05
+USE_ANATOMY_LOSS = True
+ANAT_TEMP = 0.07
 
 # Stratified train/val split when the studies parquet has no 'split'
 # column. Both datasets read/write the same cached splits CSV
@@ -274,7 +277,7 @@ SPLIT_SEED = 42
 # ============================================================
 # CHECKPOINT / LOG DIR NAMING
 # ============================================================
-# Encode CBW β, report reweighting, and masked-pool JEPA in the ckpt /
+# Encode CBW β, report reweighting, and anatomy loss in the ckpt /
 # log dir names so ablations never clobber each other:
 #   * ``cbw{beta_tag}``               — from-scratch β run
 #                                       (W_REPORT_PRIOR = W_REPORT_PRED = 0.1)
@@ -289,7 +292,7 @@ SPLIT_SEED = 42
 #                                       the same non-default value
 #                                       (e.g. rp15 = 0.15)
 #   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
-#   * ``..._mskjepa{ww}``             — soft-mask pooled JEPA weight
+#   * ``..._anat{ww}``                — anatomy-embedding InfoNCE weight
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
 # (pre-4-loss / pre-CBW) runs are left untouched as archives.
 def _cbw_beta_tag(beta: float) -> str:
@@ -327,10 +330,8 @@ if W_REPORT_PRIOR != 0.1 or W_REPORT_PRED != 0.1:
     else:
         _SETTING_TAG = f"{_SETTING_TAG}_rpri{_rprior_tag}_rpred{_rpred_tag}"
 
-if USE_MASKED_POOL_JEPA and W_MASK_JEPA > 0:
-    _SETTING_TAG = (
-        f"{_SETTING_TAG}_mskjepa{_report_weight_tag(W_MASK_JEPA)}"
-    )
+if USE_ANATOMY_LOSS and W_ANAT > 0:
+    _SETTING_TAG = f"{_SETTING_TAG}_anat{_report_weight_tag(W_ANAT)}"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -421,9 +422,10 @@ if local_rank == 0:
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
     print(f"[train] log dir:        {LOG_DIR}")
     print(
-        f"[train] masked-pool JEPA: enabled={USE_MASKED_POOL_JEPA} "
-        f"W_MASK_JEPA={W_MASK_JEPA} "
-        f"(union soft masks of all findings; full-grid JEPA unchanged)"
+        f"[train] anatomy embeddings: enabled={USE_ANATOMY_LOSS} "
+        f"W_ANAT={W_ANAT} "
+        f"(BioViL-T text warm-start → InfoNCE on attended region pools; "
+        f"full-grid JEPA unchanged)"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -481,6 +483,16 @@ val_loader = DataLoader(
 # MODEL
 # ============================================================
 model = TempCXRJEPA().to(DEVICE)
+# Warm-start anatomy tokens from BioViL-T text globals of region names
+# before DDP. On resume, load_state_dict overwrites these with the
+# checkpointed tokens.
+if USE_ANATOMY_LOSS:
+    model.init_anatomy_tokens_from_text()
+    if local_rank == 0:
+        print(
+            f"[train] anatomy tokens warm-started from BioViL-T text "
+            f"({model.anatomy_tokens.num_regions} regions)"
+        )
 model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
 optimizer = AdamW(
@@ -555,7 +567,7 @@ if local_rank == 0 and not os.path.exists(CSV_LOG):
     with open(CSV_LOG, "w") as f:
         f.write(
             "epoch,val_total,val_jepa,val_report_prior,val_report_pred,"
-            "val_prog,val_mskjepa\n"
+            "val_prog,val_anat\n"
         )
 
 
@@ -592,19 +604,18 @@ def compute_jepa_losses(
     out,
     prog_cls_idx,
     gather: bool,
-    mask_patch_weights=None,
-    mask_pool_active=None,
+    findings_batch=None,
 ):
     """
-    out                : dict returned by TempCXRJEPA.forward
-    prog_cls_idx       : (B,) long tensor — silver class for the 4th loss
-    gather             : if True, gather contrastive features across ranks
-                         for cross-rank negatives (training). If False, use
-                         local features only (validation).
-    mask_patch_weights : optional (B, N) soft union-mask weights
-    mask_pool_active   : optional (B,) bool gate for masked-pool JEPA
+    out            : dict returned by TempCXRJEPA.forward
+    prog_cls_idx   : (B,) long tensor — silver class for the 4th loss
+    gather         : if True, gather contrastive features across ranks
+                     for cross-rank negatives (training). If False, use
+                     local features only (validation).
+    findings_batch : optional list[list[str]] — per-sample findings for
+                     anatomy region lookup
 
-    Returns: (total, jepa, prior, pred, prog, msk_jepa) as scalar tensors.
+    Returns: (total, jepa, prior, pred, prog, anat) as scalar tensors.
     """
 
     # JEPA loss is per-patch cosine; cross-rank gathering doesn't add
@@ -648,7 +659,7 @@ def compute_jepa_losses(
     )
 
     # 5-way image-image CE on the predictor's class-conditioned ẑ_cur.
-    # Global mean over patches (not masked). ``weight=`` uses Cui CBW.
+    # Global mean over patches. ``weight=`` uses Cui CBW.
     prog = progression_classification_loss(
         out["pred_progression_patches"].float(),
         out["current_patches_target"].float(),
@@ -657,31 +668,27 @@ def compute_jepa_losses(
         class_weights=PROG_CLASS_WEIGHTS,
     )
 
-    # Soft-mask pooled JEPA: 1 - cos(pooled ẑ, pooled z) using the union
-    # of all findings' filtered masks. Full-grid JEPA above is unchanged.
-    if (
-        USE_MASKED_POOL_JEPA
-        and W_MASK_JEPA > 0
-        and mask_patch_weights is not None
-        and mask_pool_active is not None
-    ):
-        msk_jepa = masked_pool_jepa_loss(
+    # Anatomy-embedding InfoNCE on token-attended region pools.
+    if USE_ANATOMY_LOSS and W_ANAT > 0 and findings_batch is not None:
+        region_ids = [findings_to_region_ids(f) for f in findings_batch]
+        anat = anatomy_region_contrastive_loss(
             out["pred_current_patches"].float(),
             out["current_patches_target"].float(),
-            mask_patch_weights.float(),
-            mask_pool_active,
+            region_ids,
+            model.module.anatomy_tokens,
+            temperature=ANAT_TEMP,
         )
     else:
-        msk_jepa = out["pred_current_patches"].new_zeros(())
+        anat = out["pred_current_patches"].new_zeros(())
 
     total = (
         W_JEPA * jepa
         + W_REPORT_PRIOR * prior
         + W_REPORT_PRED * pred
         + W_PROG * prog
-        + W_MASK_JEPA * msk_jepa
+        + W_ANAT * anat
     )
-    return total, jepa, prior, pred, prog, msk_jepa
+    return total, jepa, prior, pred, prog, anat
 
 
 # ============================================================
@@ -712,8 +719,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         prog_prompts = build_progression_prompts(batch["prog_finding"])
         prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
-        mask_w = batch["mask_patch_weights"].to(DEVICE)
-        mask_active = batch["mask_pool_active"].to(DEVICE)
 
         optimizer.zero_grad()
 
@@ -727,13 +732,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 progression_prompts_flat=prog_prompts,
             )
 
-            loss, jepa_l, prior_l, pred_l, prog_l, msk_l = (
+            loss, jepa_l, prior_l, pred_l, prog_l, anat_l = (
                 compute_jepa_losses(
                     out,
                     prog_cls_idx,
                     gather=True,
-                    mask_patch_weights=mask_w,
-                    mask_pool_active=mask_active,
+                    findings_batch=batch["findings"],
                 )
             )
 
@@ -757,8 +761,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "loss": f"{loss.item():.4f}",
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
-                "mskj": f"{msk_l.item():.4f}",
-                "mask": f"{mask_active.float().mean().item():.2f}",
+                "anat": f"{anat_l.item():.4f}",
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
             })
@@ -774,7 +777,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # VALIDATION
     # ============================================================
     model.eval()
-    val_total = val_jepa = val_prior = val_pred = val_prog = val_msk = 0.0
+    val_total = val_jepa = val_prior = val_pred = val_prog = val_anat = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -789,8 +792,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             prog_prompts = build_progression_prompts(batch["prog_finding"])
             prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
-            mask_w = batch["mask_patch_weights"].to(DEVICE)
-            mask_active = batch["mask_pool_active"].to(DEVICE)
 
             with torch.amp.autocast("cuda"):
                 out = model(
@@ -802,13 +803,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     progression_prompts_flat=prog_prompts,
                 )
 
-                total, jepa_l, prior_l, pred_l, prog_l, msk_l = (
+                total, jepa_l, prior_l, pred_l, prog_l, anat_l = (
                     compute_jepa_losses(
                         out,
                         prog_cls_idx,
                         gather=False,
-                        mask_patch_weights=mask_w,
-                        mask_pool_active=mask_active,
+                        findings_batch=batch["findings"],
                     )
                 )
 
@@ -817,7 +817,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             val_prior += prior_l.item()
             val_pred += pred_l.item()
             val_prog += prog_l.item()
-            val_msk += msk_l.item()
+            val_anat += anat_l.item()
             val_batches += 1
 
     val_total /= max(val_batches, 1)
@@ -825,14 +825,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
     val_prior /= max(val_batches, 1)
     val_pred /= max(val_batches, 1)
     val_prog /= max(val_batches, 1)
-    val_msk /= max(val_batches, 1)
+    val_anat /= max(val_batches, 1)
 
     val_total = ddp_reduce(val_total)
     val_jepa = ddp_reduce(val_jepa)
     val_prior = ddp_reduce(val_prior)
     val_pred = ddp_reduce(val_pred)
     val_prog = ddp_reduce(val_prog)
-    val_msk = ddp_reduce(val_msk)
+    val_anat = ddp_reduce(val_anat)
 
     if local_rank == 0:
 
@@ -843,13 +843,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"PriorReport={val_prior:.4f} | "
             f"PredReport={val_pred:.4f} | "
             f"Prog={val_prog:.4f} | "
-            f"MskJEPA={val_msk:.4f}"
+            f"Anat={val_anat:.4f}"
         )
 
         with open(CSV_LOG, "a") as f:
             f.write(
                 f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred},"
-                f"{val_prog},{val_msk}\n"
+                f"{val_prog},{val_anat}\n"
             )
 
         ckpt = {

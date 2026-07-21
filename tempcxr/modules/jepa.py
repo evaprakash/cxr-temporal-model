@@ -63,7 +63,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from .image_encoder_jepa import BioViLTImageEncoderJEPA
+from anatomy_regions import ANATOMY_REGIONS
 from .text_encoder import BioViLTTextEncoder
+from .anatomy_tokens import AnatomyTokenBank
 
 from losses import local_contrastive_loss
 from losses_jepa import jepa_cosine_loss, progression_classification_loss
@@ -269,6 +271,26 @@ class TempCXRJEPA(nn.Module):
             depth=predictor_depth,
             num_heads=predictor_heads,
         )
+
+        # Learnable anatomy region tokens (BioViL-T text warm-start via
+        # ``init_anatomy_tokens_from_text`` before training). Used only
+        # by the anatomy contrastive add-on — not consulted at eval.
+        self.anatomy_tokens = AnatomyTokenBank(
+            region_names=ANATOMY_REGIONS,
+            d_model=d_model,
+        )
+
+    @torch.no_grad()
+    def init_anatomy_tokens_from_text(self) -> None:
+        """Warm-start anatomy tokens from BioViL-T text encodings.
+
+        Each region name in ``AnatomyTokenBank.region_names`` is passed
+        through ``self.text_encoder.forward_contrastive``; the projected
+        global embedding becomes the initial token. Tokens remain
+        trainable afterward; the text encoder is not used on this path
+        during the anatomy loss.
+        """
+        self.anatomy_tokens.init_from_text_encoder(self.text_encoder)
 
     # --------------------------------------------------
     # FORWARD (NO LOSSES)
