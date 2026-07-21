@@ -68,7 +68,11 @@ from .text_encoder import BioViLTTextEncoder
 from .anatomy_tokens import AnatomyTokenBank
 
 from losses import local_contrastive_loss
-from losses_jepa import jepa_cosine_loss, progression_classification_loss
+from losses_jepa import (
+    anatomy_region_contrastive_loss,
+    jepa_cosine_loss,
+    progression_classification_loss,
+)
 
 
 # =========================================================
@@ -303,6 +307,8 @@ class TempCXRJEPA(nn.Module):
         current_reports,
         condition_texts,
         progression_prompts_flat=None,
+        region_ids_per_sample=None,
+        anatomy_temperature: float = 0.07,
     ):
         """
         prior_imgs       : (B, 3, H, W)
@@ -332,6 +338,15 @@ class TempCXRJEPA(nn.Module):
                            ``(B, C, N, D)`` in the output dict. When
                            ``None`` (e.g. inference / smoke test),
                            ``pred_progression_patches`` is omitted.
+        region_ids_per_sample
+                           Optional ``list[list[int]]`` of length ``B``.
+                           When provided, anatomy-token attention pooling
+                           + InfoNCE runs **inside** this forward (required
+                           for DDP — ``anatomy_tokens`` must not be used
+                           only from an external loss). Result is
+                           ``out["anatomy_loss"]``.
+        anatomy_temperature
+                           InfoNCE temperature for the anatomy loss.
 
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, unit-norm,
@@ -356,6 +371,9 @@ class TempCXRJEPA(nn.Module):
                                                 entry (only present when
                                                 ``progression_prompts_flat
                                                 is not None``).
+          - anatomy_loss             scalar     (only when
+                                                ``region_ids_per_sample``
+                                                is not None)
         """
 
         # ---- Online encoder on prior (gradients flow) ----
@@ -449,6 +467,18 @@ class TempCXRJEPA(nn.Module):
             )
             _, N, D = pred_prog_flat.shape
             out["pred_progression_patches"] = pred_prog_flat.view(B, C, N, D)
+
+        # Anatomy InfoNCE must run inside forward so DDP sees
+        # ``anatomy_tokens.tokens`` in the module graph (using the bank
+        # only from an external loss marks the param ready twice).
+        if region_ids_per_sample is not None:
+            out["anatomy_loss"] = anatomy_region_contrastive_loss(
+                pred_current_patches.float(),
+                current_patches_target.float(),
+                region_ids_per_sample,
+                self.anatomy_tokens,
+                temperature=anatomy_temperature,
+            )
 
         return out
 

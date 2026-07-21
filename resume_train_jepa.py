@@ -604,7 +604,6 @@ def compute_jepa_losses(
     out,
     prog_cls_idx,
     gather: bool,
-    findings_batch=None,
 ):
     """
     out            : dict returned by TempCXRJEPA.forward
@@ -612,8 +611,9 @@ def compute_jepa_losses(
     gather         : if True, gather contrastive features across ranks
                      for cross-rank negatives (training). If False, use
                      local features only (validation).
-    findings_batch : optional list[list[str]] — per-sample findings for
-                     anatomy region lookup
+
+    Anatomy InfoNCE is computed inside ``model.forward`` (DDP-safe) and
+    read from ``out["anatomy_loss"]`` when present.
 
     Returns: (total, jepa, prior, pred, prog, anat) as scalar tensors.
     """
@@ -668,16 +668,9 @@ def compute_jepa_losses(
         class_weights=PROG_CLASS_WEIGHTS,
     )
 
-    # Anatomy-embedding InfoNCE on token-attended region pools.
-    if USE_ANATOMY_LOSS and W_ANAT > 0 and findings_batch is not None:
-        region_ids = [findings_to_region_ids(f) for f in findings_batch]
-        anat = anatomy_region_contrastive_loss(
-            out["pred_current_patches"].float(),
-            out["current_patches_target"].float(),
-            region_ids,
-            model.module.anatomy_tokens,
-            temperature=ANAT_TEMP,
-        )
+    # Anatomy-embedding InfoNCE (pooled inside model.forward for DDP).
+    if "anatomy_loss" in out:
+        anat = out["anatomy_loss"]
     else:
         anat = out["pred_current_patches"].new_zeros(())
 
@@ -722,6 +715,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         optimizer.zero_grad()
 
+        region_ids = None
+        if USE_ANATOMY_LOSS and W_ANAT > 0:
+            region_ids = [
+                findings_to_region_ids(f) for f in batch["findings"]
+            ]
+
         with torch.amp.autocast("cuda"):
             out = model(
                 prior,
@@ -730,6 +729,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 current_reports,
                 condition_texts,
                 progression_prompts_flat=prog_prompts,
+                region_ids_per_sample=region_ids,
+                anatomy_temperature=ANAT_TEMP,
             )
 
             loss, jepa_l, prior_l, pred_l, prog_l, anat_l = (
@@ -737,7 +738,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     out,
                     prog_cls_idx,
                     gather=True,
-                    findings_batch=batch["findings"],
                 )
             )
 
@@ -793,6 +793,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
             prog_prompts = build_progression_prompts(batch["prog_finding"])
             prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
 
+            region_ids = None
+            if USE_ANATOMY_LOSS and W_ANAT > 0:
+                region_ids = [
+                    findings_to_region_ids(f) for f in batch["findings"]
+                ]
+
             with torch.amp.autocast("cuda"):
                 out = model(
                     prior,
@@ -801,6 +807,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     current_reports,
                     condition_texts,
                     progression_prompts_flat=prog_prompts,
+                    region_ids_per_sample=region_ids,
+                    anatomy_temperature=ANAT_TEMP,
                 )
 
                 total, jepa_l, prior_l, pred_l, prog_l, anat_l = (
@@ -808,7 +816,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
                         out,
                         prog_cls_idx,
                         gather=False,
-                        findings_batch=batch["findings"],
                     )
                 )
 
