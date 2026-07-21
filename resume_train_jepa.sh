@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_maskprog
+#SBATCH --job-name=jepa_cbw99999
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,23 +8,19 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_maskprog_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_maskprog_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_%j.err
 
 # ============================================================
 # SLURM launcher for the ``main`` branch's from-scratch β=0.99999
-# + sometimes-masked progression run (``cbw99999_maskprog``).
+# + GLoRIA contrastive reweight (W_REPORT_*=0.10) run.
 #
 # What this run does:
 #   * Progression CBW β = 0.99999 (frozen after the β sweep —
 #     best gold per-class balance; MS-CXR-T stable known to be weak).
 #   * W_REPORT_PRIOR = W_REPORT_PRED = 0.10 (baseline).
-#   * Sometimes-masked progression: when
-#     ``CheXTemporal/filtered_masks`` has an RLE for the sampled
-#     ``(current image, prog_finding)``, progression CE uses a
-#     masked mean over those 14×14 patches; otherwise falls back to
-#     the legacy global mean. Not an add-on — replace when present.
-#   * Checkpoints / logs under ``cbw99999_maskprog``.
+#   * No disease multi-label loss.
+#   * Checkpoints / logs under ``cbw99999``.
 #
 # Same 50-epoch, save-every-5 schedule. ``best.pt`` is overwritten
 # whenever ``val_total`` improves.

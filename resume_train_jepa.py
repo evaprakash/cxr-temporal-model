@@ -18,8 +18,8 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10,
-# with sometimes-masked progression scoring (``_maskprog`` dir tag).
+# Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10.
+# No disease multi-label loss — progression + grounding first.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -30,12 +30,12 @@
 #   and the model runs the predictor a second time on
 #   ``z_prior.repeat_interleave(5, dim=0)`` with these 5 text conditions
 #   to produce ``ẑ_cur^c`` for each class. The loss is
-#   ``F.cross_entropy(weighted_mean_patches(cos(ẑ_cur^c, z_cur)) / τ,
-#                     silver_label, weight=class_weights)``.
-#   When ``CheXTemporal/filtered_masks`` has a usable RLE for
-#   ``(parent_image_curr, prog_finding)``, patch weights concentrate on
-#   that finding region (replacing the global mean for that sample).
-#   Otherwise weights are uniform (= legacy behavior).
+#   ``F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label,
+#                     weight=class_weights)``
+#   — the train-time analog of the image-image eval rule in
+#   ``eval_progression_jepa.py``, class-balanced via effective-
+#   number-of-samples weights so rare silver classes (``resolved`` is
+#   only ~1 % of silver) contribute a meaningful gradient.
 
 import os
 import glob
@@ -262,8 +262,9 @@ SPLIT_SEED = 42
 # ============================================================
 # CHECKPOINT / LOG DIR NAMING
 # ============================================================
-# Encode CBW β, report reweighting, and masked-progression in the
-# ckpt / log dir names so ablations never clobber each other:
+# Encode BOTH the CBW β and any non-default GLoRIA contrastive
+# reweighting in the ckpt / log dir names so ablations never clobber
+# each other. Baseline convention:
 #   * ``cbw{beta_tag}``               — from-scratch β run
 #                                       (W_REPORT_PRIOR = W_REPORT_PRED = 0.1)
 #   * ``cbw{stage1}to{cur}``          — hard-β=``{cur}`` run that
@@ -277,16 +278,8 @@ SPLIT_SEED = 42
 #                                       the same non-default value
 #                                       (e.g. rp15 = 0.15)
 #   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
-#   * ``..._maskprog``                — sometimes-masked progression
-#                                       (filtered_masks when available)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
 # (pre-4-loss / pre-CBW) runs are left untouched as archives.
-
-# Always on for this run: replace global patch-mean with finding-mask
-# patch-mean when a filtered mask exists for the sampled finding.
-USE_MASKED_PROGRESSION = True
-
-
 def _cbw_beta_tag(beta: float) -> str:
     """``0.9999`` → ``"9999"``, ``0.99999`` → ``"99999"``, etc."""
     return str(beta).replace("0.", "").replace(".", "")
@@ -321,9 +314,6 @@ if W_REPORT_PRIOR != 0.1 or W_REPORT_PRED != 0.1:
         _SETTING_TAG = f"{_SETTING_TAG}_rp{_rprior_tag}"
     else:
         _SETTING_TAG = f"{_SETTING_TAG}_rpri{_rprior_tag}_rpred{_rpred_tag}"
-
-if USE_MASKED_PROGRESSION:
-    _SETTING_TAG = f"{_SETTING_TAG}_maskprog"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -413,10 +403,6 @@ if local_rank == 0:
     print(f"[train] condition_mode={CONDITION_MODE}")
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
     print(f"[train] log dir:        {LOG_DIR}")
-    print(
-        f"[train] masked progression: {USE_MASKED_PROGRESSION} "
-        f"(replace global mean when filtered_masks hit; else uniform)"
-    )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
         f"(Cui et al. 2019, effective-number-of-samples)"
@@ -580,15 +566,13 @@ def build_progression_prompts(prog_findings):
 # ============================================================
 # LOSS COMPUTATION (shared by train + val)
 # ============================================================
-def compute_jepa_losses(out, prog_cls_idx, gather: bool, patch_weights=None):
+def compute_jepa_losses(out, prog_cls_idx, gather: bool):
     """
-    out           : dict returned by TempCXRJEPA.forward
-    prog_cls_idx  : (B,) long tensor — silver class for the 4th loss
-    gather        : if True, gather contrastive features across ranks
-                    for cross-rank negatives (training). If False, use
-                    local features only (validation).
-    patch_weights : optional (B, N) float — per-sample progression patch
-                    weights (masked when a filtered mask exists).
+    out          : dict returned by TempCXRJEPA.forward
+    prog_cls_idx : (B,) long tensor — silver class for the 4th loss
+    gather       : if True, gather contrastive features across ranks
+                   for cross-rank negatives (training). If False, use
+                   local features only (validation).
 
     Returns: (total, jepa, prior, pred, prog) as scalar tensors.
     """
@@ -642,17 +626,12 @@ def compute_jepa_losses(out, prog_cls_idx, gather: bool, patch_weights=None):
     # uses the Cui et al. class-balanced weights so the rare silver
     # classes (``resolved``, ~1 % of silver) contribute a proportionally
     # larger gradient than the majority ``stable`` class.
-    # ``patch_weights`` replaces the global mean with a finding-mask
-    # mean when available (sometimes-masked progression).
     prog = progression_classification_loss(
         out["pred_progression_patches"].float(),
         out["current_patches_target"].float(),
         prog_cls_idx,
         temperature=PROG_TEMP,
         class_weights=PROG_CLASS_WEIGHTS,
-        patch_weights=(
-            patch_weights.float() if patch_weights is not None else None
-        ),
     )
 
     total = (
@@ -692,11 +671,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         prog_prompts = build_progression_prompts(batch["prog_finding"])
         prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
-        prog_patch_weights = (
-            batch["prog_patch_weights"].to(DEVICE)
-            if USE_MASKED_PROGRESSION
-            else None
-        )
 
         optimizer.zero_grad()
 
@@ -711,10 +685,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             )
 
             loss, jepa_l, prior_l, pred_l, prog_l = compute_jepa_losses(
-                out,
-                prog_cls_idx,
-                gather=True,
-                patch_weights=prog_patch_weights,
+                out, prog_cls_idx, gather=True
             )
 
         scaler.scale(loss).backward()
@@ -733,18 +704,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
         running_batches += 1
 
         if local_rank == 0:
-            postfix = {
+            pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
-            }
-            if USE_MASKED_PROGRESSION and "prog_mask_used" in batch:
-                postfix["mask"] = (
-                    f"{batch['prog_mask_used'].float().mean().item():.2f}"
-                )
-            pbar.set_postfix(postfix)
+            })
 
     if local_rank == 0:
         print(
@@ -772,11 +738,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             prog_prompts = build_progression_prompts(batch["prog_finding"])
             prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
-            prog_patch_weights = (
-                batch["prog_patch_weights"].to(DEVICE)
-                if USE_MASKED_PROGRESSION
-                else None
-            )
 
             with torch.amp.autocast("cuda"):
                 out = model(
@@ -790,10 +751,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
                 total, jepa_l, prior_l, pred_l, prog_l = (
                     compute_jepa_losses(
-                        out,
-                        prog_cls_idx,
-                        gather=False,
-                        patch_weights=prog_patch_weights,
+                        out, prog_cls_idx, gather=False
                     )
                 )
 
