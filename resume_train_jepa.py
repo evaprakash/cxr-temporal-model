@@ -68,7 +68,6 @@ from losses import local_contrastive_loss
 from losses_jepa import (
     jepa_cosine_loss,
     progression_classification_loss,
-    anatomy_region_contrastive_loss,
 )
 
 
