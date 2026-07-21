@@ -18,6 +18,11 @@ scale-invariant — so this module exposes:
     "Class-Balanced Loss Based on Effective Number of Samples") so the
     minority silver classes (``resolved`` ≈ 1 % of silver) get a
     proportionally larger gradient than the majority ``stable`` class.
+  * ``change_in_mask_loss`` for optional grounding: when a filtered
+    segmentation mask exists and the sampled progression is non-stable
+    (improving / worsening / new), push per-patch change
+    ``1 - cos(ẑ_cur, z_cur)`` to concentrate inside the mask. Stable /
+    resolved / no-mask samples are omitted from the batch average.
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
@@ -131,3 +136,48 @@ def progression_classification_loss(
     logits = logits / temperature
 
     return F.cross_entropy(logits, silver_labels, weight=class_weights)
+
+
+# =========================================================
+# CHANGE-IN-MASK LOSS (NON-STABLE + MASK ONLY)
+# =========================================================
+def change_in_mask_loss(
+    pred_patches: torch.Tensor,    # (B, N, D) dynamic-conditioned ẑ_cur
+    target_patches: torch.Tensor,  # (B, N, D) z_cur (stop-grad)
+    patch_weights: torch.Tensor,   # (B, N) soft mask coverage in [0, 1]
+    active: torch.Tensor,          # (B,) bool — True → contribute
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Concentrate change energy inside the finding mask (ratio form).
+
+    For each active sample::
+
+        s_n = 1 - cos(ẑ_n, z_n)
+        L   = -log( (Σ_n w_n s_n + ε) / (Σ_n s_n + ε) )
+
+    Inactive rows (no usable mask, or stable/resolved progression) are
+    excluded from the mean — they do **not** contribute zeros that would
+    dilute the average. Returns 0 when no row is active.
+    """
+    if pred_patches.numel() == 0 or not bool(active.any()):
+        return pred_patches.new_zeros(())
+
+    pred = F.normalize(pred_patches, dim=-1, eps=eps)
+    target = F.normalize(target_patches, dim=-1, eps=eps)
+    s = (1.0 - (pred * target).sum(dim=-1)).clamp(min=0.0)  # (B, N)
+
+    w = patch_weights.to(device=s.device, dtype=s.dtype).clamp(min=0.0)
+    if w.shape != s.shape:
+        raise ValueError(
+            f"patch_weights shape {tuple(w.shape)} != change map {tuple(s.shape)}"
+        )
+
+    active = active.to(device=s.device).bool()
+    s_act = s[active]
+    w_act = w[active]
+
+    numer = (w_act * s_act).sum(dim=-1) + eps
+    denom = s_act.sum(dim=-1) + eps
+    # Fraction of change mass inside the mask; maximize → minimize -log.
+    frac = (numer / denom).clamp(min=eps, max=1.0)
+    return (-torch.log(frac)).mean()

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999
+#SBATCH --job-name=jepa_cbw99999_chgmask05
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,19 +8,24 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_chgmask05_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_chgmask05_%j.err
 
 # ============================================================
 # SLURM launcher for the ``main`` branch's from-scratch β=0.99999
-# + GLoRIA contrastive reweight (W_REPORT_*=0.10) run.
+# + change-in-mask grounding add-on (``cbw99999_chgmask05``).
 #
 # What this run does:
 #   * Progression CBW β = 0.99999 (frozen after the β sweep —
 #     best gold per-class balance; MS-CXR-T stable known to be weak).
 #   * W_REPORT_PRIOR = W_REPORT_PRED = 0.10 (baseline).
-#   * No disease multi-label loss.
-#   * Checkpoints / logs under ``cbw99999``.
+#   * Progression CE stays on the *global* patch mean (the failed
+#     masked-progression ablation is NOT used).
+#   * Change-in-mask add-on (W_ANAT=0.05): when filtered_masks has an
+#     RLE for the sampled finding AND class ∈ {improving, worsening,
+#     new}, concentrate 1-cos(ẑ,z) change inside the mask. Stable /
+#     resolved / no-mask samples are omitted from that term.
+#   * Checkpoints / logs under ``cbw99999_chgmask05``.
 #
 # Same 50-epoch, save-every-5 schedule. ``best.pt`` is overwritten
 # whenever ``val_total`` improves.
