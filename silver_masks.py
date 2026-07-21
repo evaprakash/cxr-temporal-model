@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -210,6 +210,73 @@ def load_prog_patch_weights(
         mask_hw = load_union_mask_hw(path)
         weights = mask_hw_to_patch_weights(mask_hw, aug_params=aug_params)
     except Exception:
+        return zero_patch_weights(), False
+
+    if float(weights.sum()) <= min_weight_sum:
+        return zero_patch_weights(), False
+
+    return weights, True
+
+
+def load_union_findings_patch_weights(
+    masks_root: Union[str, Path],
+    dataset: str,
+    parent_image_curr: str,
+    findings: Sequence[str],
+    aug_params: Optional[Dict[str, float]] = None,
+    min_weight_sum: float = 1e-6,
+) -> tuple[torch.Tensor, bool]:
+    """Soft 14×14 weights from the **union** of all findings' masks.
+
+    Decodes each available ``filtered_masks`` JSON for ``findings`` on
+    ``parent_image_curr``, OR-merges pixel masks when shapes match (else
+    takes element-wise max of independently warped patch weights), then
+    average-pools to float coverage in ``[0, 1]`` per patch.
+    """
+    if not findings:
+        return zero_patch_weights(), False
+
+    union_hw = None
+    warped_fallback = []
+
+    for finding in findings:
+        if not finding:
+            continue
+        path = resolve_mask_json_path(
+            masks_root, dataset, parent_image_curr, finding
+        )
+        if path is None:
+            continue
+        try:
+            mask_hw = load_union_mask_hw(path)
+        except Exception:
+            continue
+
+        if union_hw is None:
+            union_hw = mask_hw.astype(bool)
+        elif mask_hw.shape == union_hw.shape:
+            union_hw = np.logical_or(union_hw, mask_hw)
+        else:
+            # Rare: inconsistent native sizes — warp each and max later.
+            try:
+                warped_fallback.append(
+                    mask_hw_to_patch_weights(mask_hw, aug_params=aug_params)
+                )
+            except Exception:
+                continue
+
+    if union_hw is not None:
+        try:
+            weights = mask_hw_to_patch_weights(union_hw, aug_params=aug_params)
+        except Exception:
+            weights = zero_patch_weights()
+        for w in warped_fallback:
+            weights = torch.maximum(weights, w)
+    elif warped_fallback:
+        weights = warped_fallback[0]
+        for w in warped_fallback[1:]:
+            weights = torch.maximum(weights, w)
+    else:
         return zero_patch_weights(), False
 
     if float(weights.sum()) <= min_weight_sum:

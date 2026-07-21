@@ -41,18 +41,11 @@ from dataset_combined import (
 from progression_phrases import CLS_ORDER, SILVER_TO_CLS
 from silver_masks import (
     default_masks_root,
-    load_prog_patch_weights,
+    load_union_findings_patch_weights,
     zero_patch_weights,
 )
 
 CLS_TO_IDX = {cls: i for i, cls in enumerate(CLS_ORDER)}
-
-# Change-in-mask loss fires only for these progression classes when a
-# filtered mask exists. Stable / resolved are excluded by design.
-CHANGE_IN_MASK_CLS = frozenset({"improving", "worsening", "new"})
-CHANGE_IN_MASK_CLS_IDX = frozenset(
-    CLS_TO_IDX[c] for c in CHANGE_IN_MASK_CLS if c in CLS_TO_IDX
-)
 
 
 # ============================================================
@@ -291,13 +284,13 @@ class JEPACombinedDataset(Dataset):
           ``prog_cls_idx``     : int
               Silver progression-class index (into ``CLS_ORDER``) for the
               ``prog_finding`` above.
-          ``chg_patch_weights`` : Tensor ``(N,)``
-              Soft 14×14 mask weights for change-in-mask loss (zeros if
-              no usable filtered mask).
-          ``chg_mask_active``  : bool
-              True iff a usable mask exists **and** ``prog_cls`` is in
-              {improving, worsening, new} — the gate for
-              ``change_in_mask_loss``.
+          ``mask_patch_weights`` : Tensor ``(N,)``
+              Soft 14×14 float weights from the **union** of all
+              findings' ``filtered_masks`` on the current image (zeros
+              if none available).
+          ``mask_pool_active`` : bool
+              True iff at least one usable mask contributed to the
+              union — gate for ``masked_pool_jepa_loss``.
 
         Training time uses these fields to build a per-pair 5-prompt
         bank (one ``"{prog_finding} is {class}."`` per class) and runs
@@ -335,7 +328,7 @@ class JEPACombinedDataset(Dataset):
         if not os.path.isdir(self.masks_root):
             print(
                 f"[JEPA dataset] WARNING: masks_root not found "
-                f"({self.masks_root}); change-in-mask loss will never fire."
+                f"({self.masks_root}); masked-pool JEPA will never fire."
             )
         else:
             print(f"[JEPA dataset] masks_root={self.masks_root}")
@@ -551,23 +544,22 @@ class JEPACombinedDataset(Dataset):
             # filter in __init__ is strict).
             prog_finding, prog_cls_idx = "", 0
 
-        # Change-in-mask grounding (add-on): load soft patch weights for
-        # the sampled finding when a filtered mask exists. The loss only
-        # activates for non-stable classes (improving / worsening / new).
-        if prog_finding:
-            chg_patch_weights, mask_ok = load_prog_patch_weights(
-                self.masks_root,
-                dataset,
-                str(row["parent_image_curr"]),
-                prog_finding,
-                aug_params=params,
+        # Soft-mask pooled JEPA (add-on): union of all findings' filtered
+        # masks on the current image → 14×14 float weights. Aligns with
+        # multi-finding dynamic sentence conditioning.
+        if findings:
+            mask_patch_weights, mask_pool_active = (
+                load_union_findings_patch_weights(
+                    self.masks_root,
+                    dataset,
+                    str(row["parent_image_curr"]),
+                    findings,
+                    aug_params=params,
+                )
             )
         else:
-            chg_patch_weights = zero_patch_weights()
-            mask_ok = False
-        chg_mask_active = bool(
-            mask_ok and int(prog_cls_idx) in CHANGE_IN_MASK_CLS_IDX
-        )
+            mask_patch_weights = zero_patch_weights()
+            mask_pool_active = False
 
         return {
             "prior_image": prior_img,
@@ -580,8 +572,8 @@ class JEPACombinedDataset(Dataset):
             "progression_cls_idx": progression_cls_idx,
             "prog_finding": prog_finding,
             "prog_cls_idx": int(prog_cls_idx),
-            "chg_patch_weights": chg_patch_weights,
-            "chg_mask_active": chg_mask_active,
+            "mask_patch_weights": mask_patch_weights,
+            "mask_pool_active": bool(mask_pool_active),
         }
 
 
@@ -604,8 +596,8 @@ def jepa_collate_fn(batch):
     pair — so the trainer can build a flat (B*5,) prompt list of
     ``"{Finding} is {class}."`` strings without any padding.
 
-    ``chg_patch_weights`` is ``(B, N)``; ``chg_mask_active`` is ``(B,)``
-    bool gating the change-in-mask add-on loss.
+    ``mask_patch_weights`` is ``(B, N)``; ``mask_pool_active`` is ``(B,)``
+    bool gating the soft-mask pooled JEPA add-on.
     """
     return {
         "prior_image": torch.stack([b["prior_image"] for b in batch]),
@@ -620,11 +612,11 @@ def jepa_collate_fn(batch):
         "prog_cls_idx": torch.tensor(
             [b["prog_cls_idx"] for b in batch], dtype=torch.long
         ),
-        "chg_patch_weights": torch.stack(
-            [b["chg_patch_weights"] for b in batch]
+        "mask_patch_weights": torch.stack(
+            [b["mask_patch_weights"] for b in batch]
         ),
-        "chg_mask_active": torch.tensor(
-            [b["chg_mask_active"] for b in batch], dtype=torch.bool
+        "mask_pool_active": torch.tensor(
+            [b["mask_pool_active"] for b in batch], dtype=torch.bool
         ),
     }
 
