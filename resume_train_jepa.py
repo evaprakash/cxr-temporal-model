@@ -244,9 +244,9 @@ BATCH_SIZE = 24
 EPOCHS = 50
 WARMUP_RATIO = 0.03
 
-# Checkpoint schedule: always save epoch 1 + every SAVE_EVERY_N_EPOCHS,
-# plus best.pt whenever val total improves. From-scratch β sweeps use 5.
-SAVE_EVERY_N_EPOCHS = 5
+# Checkpoint schedule: save epoch_N.pt every SAVE_EVERY_N_EPOCHS epochs
+# (1 = every epoch), plus best.pt whenever val total improves.
+SAVE_EVERY_N_EPOCHS = 1
 
 # Loss weights (baseline report contrastive = 0.10).
 W_JEPA = 1.0
