@@ -41,7 +41,7 @@ from dataset_combined import (
 from progression_phrases import CLS_ORDER, SILVER_TO_CLS
 from silver_masks import (
     default_masks_root,
-    load_dual_findings_patch_weights,
+    load_union_findings_patch_weights,
     zero_patch_weights,
 )
 
@@ -284,15 +284,12 @@ class JEPACombinedDataset(Dataset):
           ``prog_cls_idx``     : int
               Silver progression-class index (into ``CLS_ORDER``) for the
               ``prog_finding`` above.
-          ``mask_patch_weights_prior`` : Tensor ``(N,)``
+          ``mask_patch_weights`` : Tensor ``(N,)``
               Soft 14×14 float weights from the union of findings'
-              ``filtered_masks`` on the **prior** image (zeros if inactive).
-          ``mask_patch_weights_curr`` : Tensor ``(N,)``
-              Same for the **current** image.
+              ``filtered_masks`` on the **prior** image (zeros if none).
           ``mask_pool_active`` : bool
-              True iff prior and current expose the same non-empty set of
-              finding keys and anatomy category names — gate for
-              ``masked_pool_jepa_loss``.
+              True iff a usable prior finding mask was loaded — gate for
+              ``change_localization_loss``.
 
         Training time uses these fields to build a per-pair 5-prompt
         bank (one ``"{prog_finding} is {class}."`` per class) and runs
@@ -546,25 +543,20 @@ class JEPACombinedDataset(Dataset):
             # filter in __init__ is strict).
             prog_finding, prog_cls_idx = "", 0
 
-        # Soft-mask pooled JEPA (add-on): dual masks — prior weights for
-        # ẑ (prior-grid residual), current weights for z_cur. Inactive
-        # when finding keys or anatomy category sets disagree.
+        # Change-localization add-on: soft finding-mask union on the
+        # **prior** image (change map lives on the prior patch grid).
         if findings:
-            (
-                mask_patch_weights_prior,
-                mask_patch_weights_curr,
-                mask_pool_active,
-            ) = load_dual_findings_patch_weights(
-                self.masks_root,
-                dataset,
-                str(row["parent_image_prev"]),
-                str(row["parent_image_curr"]),
-                findings,
-                aug_params=params,
+            mask_patch_weights, mask_pool_active = (
+                load_union_findings_patch_weights(
+                    self.masks_root,
+                    dataset,
+                    str(row["parent_image_prev"]),
+                    findings,
+                    aug_params=params,
+                )
             )
         else:
-            mask_patch_weights_prior = zero_patch_weights()
-            mask_patch_weights_curr = zero_patch_weights()
+            mask_patch_weights = zero_patch_weights()
             mask_pool_active = False
 
         return {
@@ -578,8 +570,7 @@ class JEPACombinedDataset(Dataset):
             "progression_cls_idx": progression_cls_idx,
             "prog_finding": prog_finding,
             "prog_cls_idx": int(prog_cls_idx),
-            "mask_patch_weights_prior": mask_patch_weights_prior,
-            "mask_patch_weights_curr": mask_patch_weights_curr,
+            "mask_patch_weights": mask_patch_weights,
             "mask_pool_active": bool(mask_pool_active),
         }
 
@@ -603,9 +594,8 @@ def jepa_collate_fn(batch):
     pair — so the trainer can build a flat (B*5,) prompt list of
     ``"{Finding} is {class}."`` strings without any padding.
 
-    ``mask_patch_weights_prior`` / ``mask_patch_weights_curr`` are
-    ``(B, N)``; ``mask_pool_active`` is ``(B,)`` bool gating the dual
-    soft-mask pooled JEPA add-on.
+    ``mask_patch_weights`` is ``(B, N)``; ``mask_pool_active`` is ``(B,)``
+    bool gating the change-localization add-on.
     """
     return {
         "prior_image": torch.stack([b["prior_image"] for b in batch]),
@@ -620,11 +610,8 @@ def jepa_collate_fn(batch):
         "prog_cls_idx": torch.tensor(
             [b["prog_cls_idx"] for b in batch], dtype=torch.long
         ),
-        "mask_patch_weights_prior": torch.stack(
-            [b["mask_patch_weights_prior"] for b in batch]
-        ),
-        "mask_patch_weights_curr": torch.stack(
-            [b["mask_patch_weights_curr"] for b in batch]
+        "mask_patch_weights": torch.stack(
+            [b["mask_patch_weights"] for b in batch]
         ),
         "mask_pool_active": torch.tensor(
             [b["mask_pool_active"] for b in batch], dtype=torch.bool

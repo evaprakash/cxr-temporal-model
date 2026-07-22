@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_mskjepadual05
+#SBATCH --job-name=jepa_cbw99999_chgloc05
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,23 +8,23 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_mskjepadual05_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_mskjepadual05_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_chgloc05_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_chgloc05_%j.err
 
 # ============================================================
 # SLURM launcher for the ``main`` branch's from-scratch β=0.99999
-# + dual soft-mask pooled JEPA add-on (``cbw99999_mskjepadual05``).
+# + change-localization grounding add-on (``cbw99999_chgloc05``).
 #
 # What this run does:
 #   * Progression CBW β = 0.99999 (frozen after the β sweep —
 #     best gold per-class balance; MS-CXR-T stable known to be weak).
 #   * W_REPORT_PRIOR = W_REPORT_PRED = 0.10 (baseline).
 #   * Progression CE + full-grid JEPA unchanged (global patch mean).
-#   * Dual soft-mask pooled JEPA (W_MASK_JEPA=0.05): prior finding-mask
-#     union pools ẑ; current finding-mask union pools z_cur; then
-#     1 - cos(u, v). Pairs whose prior/current anatomy category sets
-#     (or finding keys) disagree are omitted from that term.
-#   * Checkpoints / logs under ``cbw99999_mskjepadual05``.
+#   * Change-localization add-on (W_CHANGE_LOC=0.05): soft-pool the
+#     prior-grid change map 1-cos(ẑ, z_prior) inside vs outside the
+#     prior finding-mask union; maximize s_in - s_out. Active only for
+#     improving / worsening / new when a prior mask exists.
+#   * Checkpoints / logs under ``cbw99999_chgloc05``.
 #
 # Same 50-epoch, save-every-5 schedule. ``best.pt`` is overwritten
 # whenever ``val_total`` improves.
@@ -99,49 +99,31 @@ echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n
 # ``$JEPA_IMAGE_ROOTS_DIR``. Default is the shared cluster location
 # ``/scratch/m000081/eprakash/all_data`` so this doesn't need to be
 # duplicated / symlinked into every branch clone. Layout under that
-# root must match:
-#
-#     $JEPA_IMAGE_ROOTS_DIR/
-#         mimic/                 (or symlink to real mimic root)
-#         chexpert/train/        (or symlink)
-#         rexgradient/deid_png/  (or symlink)
-#
-# ``export`` (not just assign) so the Python trainer sees the same
-# value the shell just verified.
+# directory must be:
+#   $JEPA_IMAGE_ROOTS_DIR/mimic/
+#   $JEPA_IMAGE_ROOTS_DIR/chexpert/train/
+#   $JEPA_IMAGE_ROOTS_DIR/rexgradient/deid_png/
 # ============================================================
 export JEPA_IMAGE_ROOTS_DIR="${JEPA_IMAGE_ROOTS_DIR:-/scratch/m000081/eprakash/all_data}"
 echo "[slurm] JEPA_IMAGE_ROOTS_DIR = $JEPA_IMAGE_ROOTS_DIR"
-for d in "$JEPA_IMAGE_ROOTS_DIR/mimic" \
-         "$JEPA_IMAGE_ROOTS_DIR/chexpert/train" \
-         "$JEPA_IMAGE_ROOTS_DIR/rexgradient/deid_png"; do
-  if [ ! -d "$d" ]; then
-    echo "[slurm] ERROR: image root not found: $d" >&2
-    echo "[slurm]   symlink or populate it before submitting." >&2
-    exit 1
-  fi
+for d in \
+    "$JEPA_IMAGE_ROOTS_DIR/mimic" \
+    "$JEPA_IMAGE_ROOTS_DIR/chexpert/train" \
+    "$JEPA_IMAGE_ROOTS_DIR/rexgradient/deid_png"
+do
+    if [ ! -d "$d" ]; then
+        echo "[slurm] WARNING: missing image root: $d" >&2
+    fi
 done
-echo "[slurm] image roots OK"
 
-# ============================================================
-# CheXTemporal reachability check.
-#
-# Same ``export`` pattern as the image roots so the Python loader
-# sees the value the shell just verified. Default is
-# ``$PROJECT_DIR/CheXTemporal`` since each branch clone typically
-# pins its own parquet snapshot; override with ``CHEXTEMPORAL_DIR``
-# if you keep the parquets in a shared cluster path.
-# ============================================================
-export CHEXTEMPORAL_DIR="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
-if [ ! -f "$CHEXTEMPORAL_DIR/silver_findings.parquet" ]; then
-  echo "[slurm] ERROR: silver_findings.parquet not found under $CHEXTEMPORAL_DIR" >&2
-  echo "[slurm]   symlink CheXTemporal into the project root or set CHEXTEMPORAL_DIR." >&2
-  exit 1
+# filtered_masks for change-localization (prior finding masks)
+if [ -d "${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}/filtered_masks" ]; then
+    echo "[slurm] filtered_masks OK under ${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
+else
+    echo "[slurm] WARNING: filtered_masks not found — change-localization will be inactive" >&2
 fi
-echo "[slurm] CheXTemporal OK ($CHEXTEMPORAL_DIR)"
 
 # ============================================================
-# Launch training (4 GPUs, DDP). run_jepa.py auto-detects the
-# visible GPU count via torch.cuda.device_count(), so we don't
-# have to keep --nproc_per_node in sync with --gres.
+# Launch
 # ============================================================
-python run_jepa.py
+torchrun --nproc_per_node=4 resume_train_jepa.py "$@"

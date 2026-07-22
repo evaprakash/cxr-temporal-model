@@ -18,12 +18,11 @@ scale-invariant — so this module exposes:
     "Class-Balanced Loss Based on Effective Number of Samples") so the
     minority silver classes (``resolved`` ≈ 1 % of silver) get a
     proportionally larger gradient than the majority ``stable`` class.
-  * ``masked_pool_jepa_loss`` for optional grounding: when prior and
-    current filtered masks expose the same anatomy-category set, soft-
-    pool ``ẑ_cur`` with the **prior** mask and EMA ``z_cur`` with the
-    **current** mask, then apply JEPA cosine ``1 - cos(u, v)`` on those
-    pooled vectors. Mismatched / missing pairs are omitted. The
-    full-grid JEPA loss is unchanged.
+  * ``change_localization_loss`` for optional grounding: build a per-patch
+    change map ``s = 1 - cos(ẑ_cur, z_prior)`` on the prior grid, soft-
+    pool inside vs outside the prior finding mask, and maximize
+    ``s_in - s_out`` so change energy concentrates on the finding.
+    No-mask / inactive rows are omitted. Full-grid JEPA is unchanged.
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
@@ -140,63 +139,50 @@ def progression_classification_loss(
 
 
 # =========================================================
-# MASKED-POOL JEPA (DUAL SOFT MASK, ADD-ON)
+# CHANGE LOCALIZATION (PRIOR FINDING MASK, ADD-ON)
 # =========================================================
-def masked_pool_jepa_loss(
-    pred_patches: torch.Tensor,          # (B, N, D) dynamic-conditioned ẑ_cur
-    target_patches: torch.Tensor,        # (B, N, D) z_cur (stop-grad)
-    pred_patch_weights: torch.Tensor,    # (B, N) prior-image soft mask
-    target_patch_weights: torch.Tensor,  # (B, N) current-image soft mask
-    active: torch.Tensor,                # (B,) bool — True → contribute
+def change_localization_loss(
+    pred_patches: torch.Tensor,    # (B, N, D) dynamic-conditioned ẑ_cur
+    prior_patches: torch.Tensor,   # (B, N, D) z_prior (same prior grid)
+    patch_weights: torch.Tensor,   # (B, N) prior-image soft finding mask
+    active: torch.Tensor,          # (B,) bool — True → contribute
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """JEPA cosine on soft-mask-pooled region summaries (dual masks).
+    """Concentrate predictor change energy inside the prior finding mask.
 
     For each active sample::
 
-        u = normalize( Σ_n w^prior_n  ẑ_n / Σ_n w^prior_n )
-        v = normalize( Σ_n w^curr_n   z_n / Σ_n w^curr_n )
-        L = 1 - cos(u, v)
+        s_n   = 1 - cos(ẑ_n, z_prior_n)          # per-patch change map
+        s_in  = Σ_n w_n s_n / Σ_n w_n            # soft float pool inside
+        s_out = Σ_n (1-w_n) s_n / Σ_n (1-w_n)    # soft float pool outside
+        L     = -(s_in - s_out)
 
-    ``ẑ`` is a residual on the prior patch grid, so it is pooled with the
-    **prior** finding-mask union. ``z_cur`` is pooled with the **current**
-    finding-mask union. Inactive rows (missing / mismatched anatomy sets)
-    are omitted from the mean. Returns 0 when no row is active.
-    Full-grid ``jepa_cosine_loss`` is separate.
+    ``w`` is the downsampled float finding-mask coverage on the **prior**
+    image (ẑ / z_prior live on the prior patch grid). Inactive rows are
+    omitted from the mean. Returns 0 when no row is active.
+    Full-grid ``jepa_cosine_loss`` is separate — this does **not** match
+    ẑ to z_cur appearance.
     """
     if pred_patches.numel() == 0 or not bool(active.any()):
         return pred_patches.new_zeros(())
 
-    w_pred = pred_patch_weights.to(
-        device=pred_patches.device, dtype=pred_patches.dtype
-    ).clamp(min=0.0)
-    w_tgt = target_patch_weights.to(
-        device=pred_patches.device, dtype=pred_patches.dtype
-    ).clamp(min=0.0)
-    if w_pred.shape[:2] != pred_patches.shape[:2]:
+    pred = F.normalize(pred_patches, dim=-1, eps=eps)
+    prior = F.normalize(prior_patches, dim=-1, eps=eps)
+    s = (1.0 - (pred * prior).sum(dim=-1)).clamp(min=0.0)  # (B, N)
+
+    w = patch_weights.to(device=s.device, dtype=s.dtype).clamp(0.0, 1.0)
+    if w.shape != s.shape:
         raise ValueError(
-            f"pred_patch_weights shape {tuple(w_pred.shape)} incompatible "
-            f"with pred_patches {tuple(pred_patches.shape)}"
-        )
-    if w_tgt.shape[:2] != target_patches.shape[:2]:
-        raise ValueError(
-            f"target_patch_weights shape {tuple(w_tgt.shape)} incompatible "
-            f"with target_patches {tuple(target_patches.shape)}"
+            f"patch_weights shape {tuple(w.shape)} != change map {tuple(s.shape)}"
         )
 
-    active = active.to(device=pred_patches.device).bool()
-    pred = pred_patches[active]
-    target = target_patches[active]
-    w_pred = w_pred[active]
-    w_tgt = w_tgt[active]
+    active = active.to(device=s.device).bool()
+    s = s[active]
+    w = w[active]
+    w_out = (1.0 - w).clamp(min=0.0)
 
-    w_pred_sum = w_pred.sum(dim=-1, keepdim=True).clamp(min=eps)
-    w_tgt_sum = w_tgt.sum(dim=-1, keepdim=True).clamp(min=eps)
-    w_pred_norm = w_pred / w_pred_sum
-    w_tgt_norm = w_tgt / w_tgt_sum
-
-    u = (pred * w_pred_norm.unsqueeze(-1)).sum(dim=1)     # (B_act, D)
-    v = (target * w_tgt_norm.unsqueeze(-1)).sum(dim=1)    # (B_act, D)
-    u = F.normalize(u, dim=-1, eps=eps)
-    v = F.normalize(v, dim=-1, eps=eps)
-    return (1.0 - (u * v).sum(dim=-1)).mean()
+    w_sum = w.sum(dim=-1).clamp(min=eps)
+    w_out_sum = w_out.sum(dim=-1).clamp(min=eps)
+    s_in = (w * s).sum(dim=-1) / w_sum
+    s_out = (w_out * s).sum(dim=-1) / w_out_sum
+    return (-(s_in - s_out)).mean()

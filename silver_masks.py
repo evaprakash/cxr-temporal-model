@@ -10,13 +10,12 @@ Each JSON is a tiny COCO-style document with RLE ``segmentation`` masks
 in **original image** resolution. Training images go through
 ``Resize(512) → CenterCrop(448) → synced affine aug``; masks follow the
 same *geometric* transforms (nearest-neighbor; no brightness/contrast)
-and are then average-pooled onto the BioViL-T 14×14 patch grid.
+and are then average-pooled onto the BioViL-T 14×14 patch grid as
+**float** coverage weights in ``[0, 1]``.
 
-Soft-mask pooled JEPA uses **dual** masks: prior-image weights pool the
-predicted current latents (ẑ lives on the prior patch grid), and
-current-image weights pool the EMA current target. Pairs whose prior and
-current finding JSONs do not expose the same anatomy-category set are
-skipped for that loss.
+Change-localization uses the **prior**-image finding-mask union to
+soft-pool the prior-grid change map ``1 - cos(ẑ, z_prior)`` inside vs
+outside the finding.
 """
 
 from __future__ import annotations
