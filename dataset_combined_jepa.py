@@ -39,6 +39,11 @@ from dataset_combined import (
     sample_augmentation,
 )
 from progression_phrases import CLS_ORDER, SILVER_TO_CLS
+from silver_masks import (
+    default_masks_root,
+    load_dual_findings_patch_weights,
+    zero_patch_weights,
+)
 
 CLS_TO_IDX = {cls: i for i, cls in enumerate(CLS_ORDER)}
 
@@ -279,13 +284,20 @@ class JEPACombinedDataset(Dataset):
           ``prog_cls_idx``     : int
               Silver progression-class index (into ``CLS_ORDER``) for the
               ``prog_finding`` above.
+          ``mask_patch_weights_prior`` : Tensor ``(N,)``
+              Soft 14×14 float weights from the union of findings'
+              ``filtered_masks`` on the **prior** image (zeros if inactive).
+          ``mask_patch_weights_curr`` : Tensor ``(N,)``
+              Same for the **current** image.
+          ``mask_pool_active`` : bool
+              True iff prior and current expose the same non-empty set of
+              finding keys and anatomy category names — gate for
+              ``masked_pool_jepa_loss``.
 
         Training time uses these fields to build a per-pair 5-prompt
         bank (one ``"{prog_finding} is {class}."`` per class) and runs
         the predictor 5 times to score image-image cosine for a 5-way CE
         — see ``progression_classification_loss`` in ``losses_jepa.py``.
-        Anatomy-region ids for the embedding add-on are derived in the
-        trainer from ``findings`` via ``anatomy_regions.findings_to_region_ids``.
     """
 
     def __init__(
@@ -300,6 +312,7 @@ class JEPACombinedDataset(Dataset):
         split_seed: int = 42,
         splits_file: Optional[str] = None,
         condition_mode: str = "dynamic",
+        masks_root: Optional[str] = None,
     ):
         if condition_mode not in CONDITION_MODES:
             raise ValueError(
@@ -313,6 +326,14 @@ class JEPACombinedDataset(Dataset):
         self.split_seed = split_seed
         self.splits_file = splits_file or DEFAULT_SPLITS_FILE
         self.condition_mode = condition_mode
+        self.masks_root = masks_root or default_masks_root()
+        if not os.path.isdir(self.masks_root):
+            print(
+                f"[JEPA dataset] WARNING: masks_root not found "
+                f"({self.masks_root}); masked-pool JEPA will never fire."
+            )
+        else:
+            print(f"[JEPA dataset] masks_root={self.masks_root}")
 
         # ------------------------------------------------------------
         # Load + filter
@@ -525,6 +546,27 @@ class JEPACombinedDataset(Dataset):
             # filter in __init__ is strict).
             prog_finding, prog_cls_idx = "", 0
 
+        # Soft-mask pooled JEPA (add-on): dual masks — prior weights for
+        # ẑ (prior-grid residual), current weights for z_cur. Inactive
+        # when finding keys or anatomy category sets disagree.
+        if findings:
+            (
+                mask_patch_weights_prior,
+                mask_patch_weights_curr,
+                mask_pool_active,
+            ) = load_dual_findings_patch_weights(
+                self.masks_root,
+                dataset,
+                str(row["parent_image_prev"]),
+                str(row["parent_image_curr"]),
+                findings,
+                aug_params=params,
+            )
+        else:
+            mask_patch_weights_prior = zero_patch_weights()
+            mask_patch_weights_curr = zero_patch_weights()
+            mask_pool_active = False
+
         return {
             "prior_image": prior_img,
             "current_image": curr_img,
@@ -536,6 +578,9 @@ class JEPACombinedDataset(Dataset):
             "progression_cls_idx": progression_cls_idx,
             "prog_finding": prog_finding,
             "prog_cls_idx": int(prog_cls_idx),
+            "mask_patch_weights_prior": mask_patch_weights_prior,
+            "mask_patch_weights_curr": mask_patch_weights_curr,
+            "mask_pool_active": bool(mask_pool_active),
         }
 
 
@@ -557,6 +602,10 @@ def jepa_collate_fn(batch):
     fixed-shape (B,) — one finding string per pair, one integer label per
     pair — so the trainer can build a flat (B*5,) prompt list of
     ``"{Finding} is {class}."`` strings without any padding.
+
+    ``mask_patch_weights_prior`` / ``mask_patch_weights_curr`` are
+    ``(B, N)``; ``mask_pool_active`` is ``(B,)`` bool gating the dual
+    soft-mask pooled JEPA add-on.
     """
     return {
         "prior_image": torch.stack([b["prior_image"] for b in batch]),
@@ -570,6 +619,15 @@ def jepa_collate_fn(batch):
         "prog_finding": [b["prog_finding"] for b in batch],
         "prog_cls_idx": torch.tensor(
             [b["prog_cls_idx"] for b in batch], dtype=torch.long
+        ),
+        "mask_patch_weights_prior": torch.stack(
+            [b["mask_patch_weights_prior"] for b in batch]
+        ),
+        "mask_patch_weights_curr": torch.stack(
+            [b["mask_patch_weights_curr"] for b in batch]
+        ),
+        "mask_pool_active": torch.tensor(
+            [b["mask_pool_active"] for b in batch], dtype=torch.bool
         ),
     }
 
