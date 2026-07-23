@@ -22,8 +22,9 @@
 #   * Progression CE + full-grid JEPA unchanged (global patch mean).
 #   * Change-localization add-on (W_CHANGE_LOC=0.05): soft-pool the
 #     prior-grid change map 1-cos(ẑ, z_prior) inside vs outside the
-#     prior finding-mask union; maximize s_in - s_out. Active only for
-#     improving / worsening / new when a prior mask exists.
+#     prior finding-mask union; maximize s_in - s_out. Active for
+#     improving / worsening / new / resolved when a prior mask exists
+#     (stable excluded).
 #   * Checkpoints / logs under ``cbw99999_chgloc05``.
 #
 # Same 50-epoch, save-every-5 schedule. ``best.pt`` is overwritten
@@ -40,13 +41,16 @@
 # each branch can pin its own silver / gold parquets snapshot; override
 # via ``CHEXTEMPORAL_DIR`` if the parquets also live in a shared path.
 #
-#     export CHEXTEMPORAL_DIR=/path/to/CheXTemporal
-#     export JEPA_IMAGE_ROOTS_DIR=/path/to/all_data
+#     export PROJECT_DIR=/scratch/m000081/eprakash/temporal/final/cxr-temporal-model
+#     export CHEXTEMPORAL_DIR=$PROJECT_DIR/CheXTemporal
+#     export JEPA_IMAGE_ROOTS_DIR=/scratch/m000081/eprakash/all_data
 #     sbatch resume_train_jepa.sh
 #
 # Auto-resume from the latest epoch checkpoint kicks in automatically
 # if the run is preempted and re-queued, so ``sbatch resume_train_jepa.sh``
-# just picks up where it left off.
+# just picks up where it left off. If you previously trained the older
+# chgloc (no resolved) into the same ckpt dir, move/rename that dir
+# first so this run starts fresh.
 # ============================================================
 
 # ============================================================
@@ -72,15 +76,32 @@ export PYTHONFAULTHANDLER=1
 
 # ============================================================
 # Project directory (override by exporting PROJECT_DIR before
-# ``sbatch``). Defaults to a ``main``-branch clone dedicated to
-# the class-balanced-weighting ablation so its checkpoint /log dirs
-# don't collide with any other ``main``-based experiment.
+# ``sbatch``). Defaults to the main cluster checkout.
 # ============================================================
-PROJECT_DIR="${PROJECT_DIR:-/scratch/m000081/eprakash/temporal/final/cxr-temporal-model-cbw/cxr-temporal-model}"
-cd "$PROJECT_DIR"
+PROJECT_DIR="${PROJECT_DIR:-/scratch/m000081/eprakash/temporal/final/cxr-temporal-model}"
+cd "$PROJECT_DIR" || {
+    echo "[slurm] ERROR: PROJECT_DIR not found: $PROJECT_DIR" >&2
+    exit 1
+}
 echo "[slurm] PROJECT_DIR = $PROJECT_DIR"
 echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<not a git checkout>')"
 echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n/a>')"
+
+# ============================================================
+# hi-ml-multimodal (provides ``health_multimodal``). Expected at:
+#   $PROJECT_DIR/tempcxr/modules/hi-ml/hi-ml-multimodal/src
+# Clone once if missing:
+#   cd $PROJECT_DIR/tempcxr/modules
+#   git clone https://github.com/microsoft/hi-ml.git
+# ============================================================
+HI_ML_SRC="$PROJECT_DIR/tempcxr/modules/hi-ml/hi-ml-multimodal/src"
+if [ ! -d "$HI_ML_SRC/health_multimodal" ]; then
+    echo "[slurm] ERROR: health_multimodal not found at $HI_ML_SRC" >&2
+    echo "[slurm]        Clone hi-ml under tempcxr/modules/ (see README)." >&2
+    exit 1
+fi
+echo "[slurm] hi-ml OK: $HI_ML_SRC"
+export PYTHONPATH="${HI_ML_SRC}${PYTHONPATH:+:$PYTHONPATH}"
 
 # ============================================================
 # CheXTemporal silver/gold parquets.
@@ -117,10 +138,11 @@ do
 done
 
 # filtered_masks for change-localization (prior finding masks)
-if [ -d "${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}/filtered_masks" ]; then
-    echo "[slurm] filtered_masks OK under ${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
+_CHEX="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
+if [ -d "$_CHEX/filtered_masks" ]; then
+    echo "[slurm] filtered_masks OK under $_CHEX"
 else
-    echo "[slurm] WARNING: filtered_masks not found — change-localization will be inactive" >&2
+    echo "[slurm] WARNING: filtered_masks not found under $_CHEX — change-localization will be inactive" >&2
 fi
 
 # ============================================================

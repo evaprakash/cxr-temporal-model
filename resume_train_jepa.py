@@ -19,7 +19,8 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10,
-# plus change-localization grounding (``_chgloc05`` dir tag).
+# plus change-localization grounding (``_chgloc05`` dir tag; active for
+# improving / worsening / new / resolved — not stable).
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -37,7 +38,7 @@
 #   Soft-pool the prior-grid change map ``1 - cos(ẑ, z_prior)`` inside vs
 #   outside the prior finding-mask union; maximize ``s_in - s_out``.
 #   Applied when a prior mask exists and the sampled silver progression
-#   is improving / worsening / new (not stable / resolved). Full-grid
+#   is improving / worsening / new / resolved (not stable). Full-grid
 #   JEPA / progression / GLoRIA paths stay unmasked.
 
 import os
@@ -263,12 +264,14 @@ N_CLS = len(CLS_ORDER)
 W_CHANGE_LOC = 0.05
 USE_CHANGE_LOCALIZATION = True
 # Silver progression classes that receive the grounding term (indices into
-# CLS_ORDER). Stable / resolved are omitted — we only push change onto the
-# finding when silver says something is actively changing.
+# CLS_ORDER). Stable is omitted (no change to localize). Resolved is
+# included: the finding was on the prior and is gone now, so the prior
+# finding mask is the right place to concentrate the change map.
 _CHANGE_LOC_ACTIVE_CLS = frozenset({
     CLS_ORDER.index("improving"),
     CLS_ORDER.index("worsening"),
     CLS_ORDER.index("new"),
+    CLS_ORDER.index("resolved"),
 })
 
 # Stratified train/val split when the studies parquet has no 'split'
@@ -674,7 +677,7 @@ def compute_jepa_losses(
         and mask_patch_weights is not None
         and mask_pool_active is not None
     ):
-        # Only non-stable / non-resolved silver classes contribute.
+        # Non-stable silver classes contribute (incl. resolved).
         cls_ok = torch.zeros_like(mask_pool_active)
         for cidx in _CHANGE_LOC_ACTIVE_CLS:
             cls_ok |= (prog_cls_idx == int(cidx))
