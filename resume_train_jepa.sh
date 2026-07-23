@@ -139,11 +139,24 @@ done
 
 # filtered_masks for change-localization (prior finding masks)
 _CHEX="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
-if [ -d "$_CHEX/filtered_masks" ]; then
-    echo "[slurm] filtered_masks OK under $_CHEX"
-else
-    echo "[slurm] WARNING: filtered_masks not found under $_CHEX — change-localization will be inactive" >&2
+if [ ! -d "$_CHEX/filtered_masks" ]; then
+    echo "[slurm] ERROR: filtered_masks not found under $_CHEX" >&2
+    exit 1
 fi
+_N_FINDING_JSON=$(find "$_CHEX/filtered_masks" -name '*__*.json' 2>/dev/null | head -5 | wc -l | tr -d ' ')
+if [ "${_N_FINDING_JSON}" -lt 1 ]; then
+    echo "[slurm] ERROR: no finding-mask JSONs (*__*.json) under $_CHEX/filtered_masks" >&2
+    exit 1
+fi
+echo "[slurm] filtered_masks OK under $_CHEX (sample *__*.json present)"
+
+# pycocotools required to decode compressed COCO RLEs
+if ! python -c "import pycocotools.mask" >/dev/null 2>&1; then
+    echo "[slurm] ERROR: pycocotools not importable in this env." >&2
+    echo "[slurm]        conda activate roentgen && pip install pycocotools" >&2
+    exit 1
+fi
+echo "[slurm] pycocotools OK"
 
 # ============================================================
 # Launch

@@ -45,6 +45,7 @@ import os
 import glob
 import random
 import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -69,6 +70,7 @@ from losses_jepa import (
     progression_classification_loss,
     change_localization_loss,
 )
+from silver_masks import default_masks_root
 
 
 # ============================================================
@@ -273,6 +275,42 @@ _CHANGE_LOC_ACTIVE_CLS = frozenset({
     CLS_ORDER.index("new"),
     CLS_ORDER.index("resolved"),
 })
+# Startup probe: how many train samples to touch before declaring masks dead.
+_MASK_PROBE_N = 64
+
+
+def _require_pycocotools_for_chgloc() -> None:
+    """Fail fast — without pycocotools, compressed RLEs never decode."""
+    try:
+        import pycocotools.mask  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "USE_CHANGE_LOCALIZATION requires pycocotools "
+            "(pip install pycocotools). Without it every mask decode "
+            "fails silently and val_chgloc stays 0.0."
+        ) from exc
+
+
+def _count_finding_mask_jsons(masks_root: str) -> int:
+    """Count ``*__*.json`` finding-mask files under ``masks_root``."""
+    root = Path(masks_root)
+    if not root.is_dir():
+        return 0
+    return sum(1 for _ in root.rglob("*__*.json"))
+
+
+def _probe_mask_hit_rate(dataset, n_probe: int = _MASK_PROBE_N):
+    """Return ``(hit_rate, n_active, n_probed)`` over strided train samples."""
+    n = min(int(n_probe), len(dataset))
+    if n <= 0:
+        return 0.0, 0, 0
+    n_active = 0
+    for i in range(n):
+        idx = int(i * len(dataset) / n)
+        if bool(dataset[idx]["mask_pool_active"]):
+            n_active += 1
+    return n_active / float(n), n_active, n
+
 
 # Stratified train/val split when the studies parquet has no 'split'
 # column. Both datasets read/write the same cached splits CSV
@@ -417,6 +455,36 @@ val_dataset = JEPACombinedDataset(
     split_seed=SPLIT_SEED,
     condition_mode=CONDITION_MODE,
 )
+
+# Fail fast if change-loc is on but masks cannot actually load (the
+# previous silent failure mode: dir exists, val_chgloc stays 0.0).
+if USE_CHANGE_LOCALIZATION and W_CHANGE_LOC > 0:
+    _require_pycocotools_for_chgloc()
+    _masks_root = getattr(train_dataset, "masks_root", None) or default_masks_root()
+    _n_mask_jsons = _count_finding_mask_jsons(_masks_root)
+    if _n_mask_jsons <= 0:
+        raise RuntimeError(
+            f"USE_CHANGE_LOCALIZATION is on but no finding-mask JSONs "
+            f"(*__*.json) were found under {_masks_root}. "
+            f"Populate CheXTemporal/filtered_masks or disable the loss."
+        )
+    _mask_hit, _mask_n_act, _mask_n = _probe_mask_hit_rate(
+        train_dataset, n_probe=_MASK_PROBE_N
+    )
+    if local_rank == 0:
+        print(
+            f"[train] mask preflight: masks_root={_masks_root} "
+            f"n_finding_jsons={_n_mask_jsons} "
+            f"probe_hit_rate={_mask_hit:.3f} "
+            f"({_mask_n_act}/{_mask_n} active)"
+        )
+    if _mask_hit <= 0.0:
+        raise RuntimeError(
+            f"USE_CHANGE_LOCALIZATION is on but 0/{_mask_n} probed train "
+            f"samples had mask_pool_active=True under {_masks_root}. "
+            f"Check pycocotools, finding__stem.json paths, and parent_image "
+            f"joins — otherwise val_chgloc will stay 0.0."
+        )
 
 # Compute Cui et al. class-balanced weights from the ACTUAL training
 # split (same numbers on every rank because the split is deterministic).
@@ -718,7 +786,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     else:
         pbar = train_loader
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
 
         prior = batch["prior_image"].to(DEVICE)
         curr = batch["current_image"].to(DEVICE)
@@ -731,6 +799,20 @@ for epoch in range(start_epoch, EPOCHS + 1):
         prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
         mask_w = batch["mask_patch_weights"].to(DEVICE)
         mask_active = batch["mask_pool_active"].to(DEVICE)
+
+        # One clear (non-tqdm) line so Slurm .out shows mask loading worked.
+        if (
+            epoch == start_epoch
+            and batch_idx == 0
+            and local_rank == 0
+            and USE_CHANGE_LOCALIZATION
+            and W_CHANGE_LOC > 0
+        ):
+            print(
+                f"[train] first-batch mask_active_frac="
+                f"{mask_active.float().mean().item():.3f} "
+                f"(n_active={int(mask_active.sum().item())}/{mask_active.numel()})"
+            )
 
         optimizer.zero_grad()
 
