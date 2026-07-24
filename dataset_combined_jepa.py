@@ -41,7 +41,7 @@ from dataset_combined import (
 from progression_phrases import CLS_ORDER, SILVER_TO_CLS
 from silver_masks import (
     default_masks_root,
-    load_union_findings_patch_weights,
+    load_prog_patch_weights,
     zero_patch_weights,
 )
 
@@ -284,12 +284,12 @@ class JEPACombinedDataset(Dataset):
           ``prog_cls_idx``     : int
               Silver progression-class index (into ``CLS_ORDER``) for the
               ``prog_finding`` above.
-          ``mask_patch_weights`` : Tensor ``(N,)``
-              Soft 14×14 float weights from the union of findings'
-              ``filtered_masks`` on the **prior** image (zeros if none).
-          ``mask_pool_active`` : bool
-              True iff a usable prior finding mask was loaded — gate for
-              ``change_localization_loss``.
+          ``mask_patch_weights`` / ``mask_patch_weights_curr`` : Tensor ``(N,)``
+              Soft 14×14 float weights for the sampled ``prog_finding`` on
+              the prior / current image (zeros if missing). Used by the
+              where + which-way change-localization add-on.
+          ``mask_pool_active`` / ``mask_pool_active_curr`` : bool
+              True iff a usable prior / current finding mask was loaded.
 
         Training time uses these fields to build a per-pair 5-prompt
         bank (one ``"{prog_finding} is {class}."`` per class) and runs
@@ -543,21 +543,31 @@ class JEPACombinedDataset(Dataset):
             # filter in __init__ is strict).
             prog_finding, prog_cls_idx = "", 0
 
-        # Change-localization add-on: soft finding-mask union on the
-        # **prior** image (change map lives on the prior patch grid).
-        if findings:
-            mask_patch_weights, mask_pool_active = (
-                load_union_findings_patch_weights(
+        # Change-localization add-on: dual soft masks for the sampled
+        # ``prog_finding`` (prior for where / ẑ pooling; current for
+        # which-way z_cur pooling). Same finding as the 4th-loss CE.
+        if prog_finding:
+            mask_patch_weights, mask_pool_active = load_prog_patch_weights(
+                self.masks_root,
+                dataset,
+                str(row["parent_image_prev"]),
+                prog_finding,
+                aug_params=params,
+            )
+            mask_patch_weights_curr, mask_pool_active_curr = (
+                load_prog_patch_weights(
                     self.masks_root,
                     dataset,
-                    str(row["parent_image_prev"]),
-                    findings,
+                    str(row["parent_image_curr"]),
+                    prog_finding,
                     aug_params=params,
                 )
             )
         else:
             mask_patch_weights = zero_patch_weights()
+            mask_patch_weights_curr = zero_patch_weights()
             mask_pool_active = False
+            mask_pool_active_curr = False
 
         return {
             "prior_image": prior_img,
@@ -571,7 +581,9 @@ class JEPACombinedDataset(Dataset):
             "prog_finding": prog_finding,
             "prog_cls_idx": int(prog_cls_idx),
             "mask_patch_weights": mask_patch_weights,
+            "mask_patch_weights_curr": mask_patch_weights_curr,
             "mask_pool_active": bool(mask_pool_active),
+            "mask_pool_active_curr": bool(mask_pool_active_curr),
         }
 
 
@@ -594,8 +606,8 @@ def jepa_collate_fn(batch):
     pair — so the trainer can build a flat (B*5,) prompt list of
     ``"{Finding} is {class}."`` strings without any padding.
 
-    ``mask_patch_weights`` is ``(B, N)``; ``mask_pool_active`` is ``(B,)``
-    bool gating the change-localization add-on.
+    ``mask_patch_weights{,_curr}`` are ``(B, N)``; ``mask_pool_active{,_curr}``
+    are ``(B,)`` bools gating the where / which-way change-loc add-on.
     """
     return {
         "prior_image": torch.stack([b["prior_image"] for b in batch]),
@@ -613,8 +625,14 @@ def jepa_collate_fn(batch):
         "mask_patch_weights": torch.stack(
             [b["mask_patch_weights"] for b in batch]
         ),
+        "mask_patch_weights_curr": torch.stack(
+            [b["mask_patch_weights_curr"] for b in batch]
+        ),
         "mask_pool_active": torch.tensor(
             [b["mask_pool_active"] for b in batch], dtype=torch.bool
+        ),
+        "mask_pool_active_curr": torch.tensor(
+            [b["mask_pool_active_curr"] for b in batch], dtype=torch.bool
         ),
     }
 

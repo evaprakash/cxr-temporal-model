@@ -19,8 +19,8 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10,
-# plus change-localization grounding (``_chgloc05`` dir tag; active for
-# improving / worsening / new / resolved — not stable).
+# plus where+which-way change-localization (``_chglocdir05`` dir tag;
+# active for improving / worsening / new / resolved — not stable).
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -35,11 +35,11 @@
 #                     weight=class_weights)`` — still a *global* patch mean.
 #
 # Change-localization add-on (5th loss, optional per sample):
-#   Soft-pool the prior-grid change map ``1 - cos(ẑ, z_prior)`` inside vs
-#   outside the prior finding-mask union; maximize ``s_in - s_out``.
-#   Applied when a prior mask exists and the sampled silver progression
-#   is improving / worsening / new / resolved (not stable). Full-grid
-#   JEPA / progression / GLoRIA paths stay unmasked.
+#   Dual soft masks for the sampled ``prog_finding``. (1) Where: soft-pool
+#   ``1 - cos(ẑ, z_prior)`` inside vs outside the prior mask; maximize
+#   ``s_in - s_out``. (2) Which way: soft-pool region summaries and push
+#   ẑ toward the progression-appropriate side of (z_prior, z_cur).
+#   Stable excluded. Full-grid JEPA / progression / GLoRIA stay unmasked.
 
 import os
 import glob
@@ -68,7 +68,7 @@ from losses import local_contrastive_loss
 from losses_jepa import (
     jepa_cosine_loss,
     progression_classification_loss,
-    change_localization_loss,
+    change_localization_directional_loss,
 )
 from silver_masks import default_masks_root
 
@@ -261,14 +261,12 @@ PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
 N_CLS = len(CLS_ORDER)
 
-# Change-localization add-on (prior finding mask on ẑ vs z_prior change map).
-# Full-grid JEPA and global progression CE are unchanged.
+# Change-localization add-on: where + which-way on sampled prog_finding
+# dual masks. Full-grid JEPA (W_JEPA=1) and global progression CE unchanged.
 W_CHANGE_LOC = 0.05
 USE_CHANGE_LOCALIZATION = True
 # Silver progression classes that receive the grounding term (indices into
-# CLS_ORDER). Stable is omitted (no change to localize). Resolved is
-# included: the finding was on the prior and is gone now, so the prior
-# finding mask is the right place to concentrate the change map.
+# CLS_ORDER). Stable is omitted entirely (no change to localize / direct).
 _CHANGE_LOC_ACTIVE_CLS = frozenset({
     CLS_ORDER.index("improving"),
     CLS_ORDER.index("worsening"),
@@ -300,14 +298,21 @@ def _count_finding_mask_jsons(masks_root: str) -> int:
 
 
 def _probe_mask_hit_rate(dataset, n_probe: int = _MASK_PROBE_N):
-    """Return ``(hit_rate, n_active, n_probed)`` over strided train samples."""
+    """Return ``(hit_rate, n_active, n_probed)`` over strided train samples.
+
+    A sample counts as a hit if either prior or current ``prog_finding``
+    mask loads (which-way can use either; where needs prior).
+    """
     n = min(int(n_probe), len(dataset))
     if n <= 0:
         return 0.0, 0, 0
     n_active = 0
     for i in range(n):
         idx = int(i * len(dataset) / n)
-        if bool(dataset[idx]["mask_pool_active"]):
+        sample = dataset[idx]
+        if bool(sample["mask_pool_active"]) or bool(
+            sample["mask_pool_active_curr"]
+        ):
             n_active += 1
     return n_active / float(n), n_active, n
 
@@ -338,7 +343,7 @@ SPLIT_SEED = 42
 #                                       the same non-default value
 #                                       (e.g. rp15 = 0.15)
 #   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
-#   * ``..._chgloc{ww}``              — change-localization grounding weight
+#   * ``..._chglocdir{ww}``           — where+which-way change-loc weight
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
 # (pre-4-loss / pre-CBW / mask-JEPA) runs are left untouched as archives.
 def _cbw_beta_tag(beta: float) -> str:
@@ -378,7 +383,7 @@ if W_REPORT_PRIOR != 0.1 or W_REPORT_PRED != 0.1:
 
 if USE_CHANGE_LOCALIZATION and W_CHANGE_LOC > 0:
     _SETTING_TAG = (
-        f"{_SETTING_TAG}_chgloc{_report_weight_tag(W_CHANGE_LOC)}"
+        f"{_SETTING_TAG}_chglocdir{_report_weight_tag(W_CHANGE_LOC)}"
     )
 
 _DEFAULT_CKPT_DIR = os.path.join(
@@ -502,8 +507,9 @@ if local_rank == 0:
     print(
         f"[train] change-localization: enabled={USE_CHANGE_LOCALIZATION} "
         f"W_CHANGE_LOC={W_CHANGE_LOC} "
-        f"(prior finding mask on ẑ−z_prior change map; "
-        f"active classes={[CLS_ORDER[i] for i in sorted(_CHANGE_LOC_ACTIVE_CLS)]})"
+        f"(where + which-way on prog_finding dual masks; "
+        f"active classes={[CLS_ORDER[i] for i in sorted(_CHANGE_LOC_ACTIVE_CLS)]}; "
+        f"stable skipped)"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -673,16 +679,20 @@ def compute_jepa_losses(
     prog_cls_idx,
     gather: bool,
     mask_patch_weights=None,
+    mask_patch_weights_curr=None,
     mask_pool_active=None,
+    mask_pool_active_curr=None,
 ):
     """
-    out                : dict returned by TempCXRJEPA.forward
-    prog_cls_idx       : (B,) long tensor — silver class for 4th loss
-    gather             : if True, gather contrastive features across ranks
-                         for cross-rank negatives (training). If False, use
-                         local features only (val).
-    mask_patch_weights : optional (B, N) prior-image soft finding weights
-    mask_pool_active   : optional (B,) bool — prior mask was loaded
+    out                     : dict returned by TempCXRJEPA.forward
+    prog_cls_idx            : (B,) long tensor — silver class for 4th loss
+    gather                  : if True, gather contrastive features across ranks
+                              for cross-rank negatives (training). If False, use
+                              local features only (val).
+    mask_patch_weights      : optional (B, N) prior-image soft finding weights
+    mask_patch_weights_curr : optional (B, N) current-image soft finding weights
+    mask_pool_active        : optional (B,) bool — prior mask was loaded
+    mask_pool_active_curr   : optional (B,) bool — current mask was loaded
 
     Returns: (total, jepa, prior, pred, prog, chgloc) as scalar tensors.
     """
@@ -737,23 +747,29 @@ def compute_jepa_losses(
         class_weights=PROG_CLASS_WEIGHTS,
     )
 
-    # Change localization: concentrate ẑ−z_prior change inside prior
-    # finding mask. Full-grid JEPA above is unchanged.
+    # Change localization: where (in-mask change) + which-way (direction).
+    # Full-grid JEPA above is unchanged. Stable excluded via cls gate.
     if (
         USE_CHANGE_LOCALIZATION
         and W_CHANGE_LOC > 0
         and mask_patch_weights is not None
+        and mask_patch_weights_curr is not None
         and mask_pool_active is not None
+        and mask_pool_active_curr is not None
     ):
-        # Non-stable silver classes contribute (incl. resolved).
         cls_ok = torch.zeros_like(mask_pool_active)
         for cidx in _CHANGE_LOC_ACTIVE_CLS:
             cls_ok |= (prog_cls_idx == int(cidx))
-        active = mask_pool_active.bool() & cls_ok
-        chgloc = change_localization_loss(
+        active = cls_ok  # mask gates applied inside the loss
+        chgloc = change_localization_directional_loss(
             out["pred_current_patches"].float(),
             out["prior_patches"].float(),
+            out["current_patches_target"].float(),
             mask_patch_weights.float(),
+            mask_patch_weights_curr.float(),
+            mask_pool_active.bool(),
+            mask_pool_active_curr.bool(),
+            prog_cls_idx,
             active,
         )
     else:
@@ -798,7 +814,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
         prog_prompts = build_progression_prompts(batch["prog_finding"])
         prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
         mask_w = batch["mask_patch_weights"].to(DEVICE)
+        mask_w_curr = batch["mask_patch_weights_curr"].to(DEVICE)
         mask_active = batch["mask_pool_active"].to(DEVICE)
+        mask_active_curr = batch["mask_pool_active_curr"].to(DEVICE)
 
         # One clear (non-tqdm) line so Slurm .out shows mask loading worked.
         if (
@@ -808,10 +826,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
             and USE_CHANGE_LOCALIZATION
             and W_CHANGE_LOC > 0
         ):
+            either = mask_active | mask_active_curr
             print(
                 f"[train] first-batch mask_active_frac="
-                f"{mask_active.float().mean().item():.3f} "
-                f"(n_active={int(mask_active.sum().item())}/{mask_active.numel()})"
+                f"{either.float().mean().item():.3f} "
+                f"(prior={mask_active.float().mean().item():.3f}, "
+                f"curr={mask_active_curr.float().mean().item():.3f}; "
+                f"n_either={int(either.sum().item())}/{either.numel()})"
             )
 
         optimizer.zero_grad()
@@ -832,7 +853,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     prog_cls_idx,
                     gather=True,
                     mask_patch_weights=mask_w,
+                    mask_patch_weights_curr=mask_w_curr,
                     mask_pool_active=mask_active,
+                    mask_pool_active_curr=mask_active_curr,
                 )
             )
 
@@ -857,7 +880,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
                 "chgl": f"{chg_l.item():.4f}",
-                "mask": f"{mask_active.float().mean().item():.2f}",
+                "mask": (
+                    f"{(mask_active | mask_active_curr).float().mean().item():.2f}"
+                ),
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
             })
@@ -889,7 +914,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
             prog_prompts = build_progression_prompts(batch["prog_finding"])
             prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
             mask_w = batch["mask_patch_weights"].to(DEVICE)
+            mask_w_curr = batch["mask_patch_weights_curr"].to(DEVICE)
             mask_active = batch["mask_pool_active"].to(DEVICE)
+            mask_active_curr = batch["mask_pool_active_curr"].to(DEVICE)
 
             with torch.amp.autocast("cuda"):
                 out = model(
@@ -907,7 +934,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                         prog_cls_idx,
                         gather=False,
                         mask_patch_weights=mask_w,
+                        mask_patch_weights_curr=mask_w_curr,
                         mask_pool_active=mask_active,
+                        mask_pool_active_curr=mask_active_curr,
                     )
                 )
 

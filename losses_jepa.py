@@ -18,11 +18,13 @@ scale-invariant — so this module exposes:
     "Class-Balanced Loss Based on Effective Number of Samples") so the
     minority silver classes (``resolved`` ≈ 1 % of silver) get a
     proportionally larger gradient than the majority ``stable`` class.
-  * ``change_localization_loss`` for optional grounding: build a per-patch
-    change map ``s = 1 - cos(ẑ_cur, z_prior)`` on the prior grid, soft-
-    pool inside vs outside the prior finding mask, and maximize
-    ``s_in - s_out`` so change energy concentrates on the finding.
-    No-mask / inactive rows are omitted. Full-grid JEPA is unchanged.
+  * ``change_localization_directional_loss`` for optional grounding:
+    (1) **where** — soft-pool the prior-grid change map
+    ``s = 1 - cos(ẑ, z_prior)`` inside vs outside the prior finding mask
+    and maximize ``s_in - s_out``; (2) **which way** — soft-pool region
+    summaries and push ẑ toward the progression-appropriate side of
+    ``(z_prior, z_cur)``. Stable is excluded by the trainer. Full-grid
+    JEPA is unchanged.
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
@@ -139,8 +141,15 @@ def progression_classification_loss(
 
 
 # =========================================================
-# CHANGE LOCALIZATION (PRIOR FINDING MASK, ADD-ON)
+# CHANGE LOCALIZATION — WHERE + WHICH WAY (ADD-ON)
 # =========================================================
+# CLS_ORDER indices: improving=0, stable=1, worsening=2, new=3, resolved=4
+_CLS_IMPROVING = 0
+_CLS_WORSENING = 2
+_CLS_NEW = 3
+_CLS_RESOLVED = 4
+
+
 def change_localization_loss(
     pred_patches: torch.Tensor,    # (B, N, D) dynamic-conditioned ẑ_cur
     prior_patches: torch.Tensor,   # (B, N, D) z_prior (same prior grid)
@@ -186,3 +195,152 @@ def change_localization_loss(
     s_in = (w * s).sum(dim=-1) / w_sum
     s_out = (w_out * s).sum(dim=-1) / w_out_sum
     return (-(s_in - s_out)).mean()
+
+
+def _soft_pool_patches(
+    patches: torch.Tensor,  # (B, N, D)
+    weights: torch.Tensor,  # (B, N)
+    eps: float,
+) -> torch.Tensor:
+    """L2-normalized soft-mask pooled patch summary ``(B, D)``."""
+    w = weights.to(device=patches.device, dtype=patches.dtype).clamp(min=0.0)
+    w_sum = w.sum(dim=-1, keepdim=True).clamp(min=eps)
+    w_n = w / w_sum
+    u = (patches * w_n.unsqueeze(-1)).sum(dim=1)
+    return F.normalize(u, dim=-1, eps=eps)
+
+
+def change_direction_loss(
+    pred_patches: torch.Tensor,       # (B, N, D) ẑ
+    prior_patches: torch.Tensor,      # (B, N, D) z_prior
+    current_patches: torch.Tensor,    # (B, N, D) z_cur (stop-grad)
+    prior_weights: torch.Tensor,      # (B, N)
+    curr_weights: torch.Tensor,       # (B, N)
+    prior_active: torch.Tensor,       # (B,)
+    curr_active: torch.Tensor,        # (B,)
+    prog_cls_idx: torch.Tensor,       # (B,)
+    active: torch.Tensor,             # (B,) class+mask gate from trainer
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Push ẑ toward the progression-appropriate side of (z_prior, z_cur).
+
+    Soft-pool finding-region summaries (prior mask for ẑ / z_prior when
+    available, else current mask; current mask for z_cur when available,
+    else prior mask). Per active sample:
+
+      * worsening / resolved: ``L = -(cos(û, u_cur) - cos(û, u_prior))``
+      * improving:            ``L = -(cos(û, u_prior) - cos(û, u_cur))``
+      * new:                  ``L = 1 - cos(û, u_cur)``
+
+    Returns 0 when no row is active.
+    """
+    if pred_patches.numel() == 0 or not bool(active.any()):
+        return pred_patches.new_zeros(())
+
+    device = pred_patches.device
+    active = active.to(device=device).bool()
+    prior_active = prior_active.to(device=device).bool()
+    curr_active = curr_active.to(device=device).bool()
+
+    # Need at least one mask to define a finding region.
+    region_ok = prior_active | curr_active
+    active = active & region_ok
+    if not bool(active.any()):
+        return pred_patches.new_zeros(())
+
+    pred = F.normalize(pred_patches, dim=-1, eps=eps)
+    prior = F.normalize(prior_patches, dim=-1, eps=eps)
+    current = F.normalize(current_patches, dim=-1, eps=eps)
+    w_prior = prior_weights.to(device=device, dtype=pred.dtype).clamp(0.0, 1.0)
+    w_curr = curr_weights.to(device=device, dtype=pred.dtype).clamp(0.0, 1.0)
+
+    # Per-row pool weight for ẑ / z_prior: prefer prior mask, else curr.
+    use_prior_for_hat = prior_active & active
+    w_hat = torch.where(
+        use_prior_for_hat.unsqueeze(-1),
+        w_prior,
+        w_curr,
+    )
+    # z_cur pool weight: prefer curr mask, else prior.
+    use_curr_for_cur = curr_active & active
+    w_cur = torch.where(
+        use_curr_for_cur.unsqueeze(-1),
+        w_curr,
+        w_prior,
+    )
+
+    pred_a = pred[active]
+    prior_a = prior[active]
+    current_a = current[active]
+    w_hat_a = w_hat[active]
+    w_cur_a = w_cur[active]
+    cls_a = prog_cls_idx.to(device=device)[active]
+
+    u_hat = _soft_pool_patches(pred_a, w_hat_a, eps)
+    u_pri = _soft_pool_patches(prior_a, w_hat_a, eps)
+    u_cur = _soft_pool_patches(current_a, w_cur_a, eps)
+
+    c_cur = (u_hat * u_cur).sum(dim=-1)
+    c_pri = (u_hat * u_pri).sum(dim=-1)
+
+    # Default: unused classes contribute 0 (should not appear if trainer gates).
+    per = pred_a.new_zeros(pred_a.shape[0])
+
+    is_worsening = cls_a == _CLS_WORSENING
+    is_resolved = cls_a == _CLS_RESOLVED
+    is_improving = cls_a == _CLS_IMPROVING
+    is_new = cls_a == _CLS_NEW
+
+    # Move toward current away from prior.
+    toward_cur = -(c_cur - c_pri)
+    # Move toward prior away from current (improving "which way").
+    toward_pri = -(c_pri - c_cur)
+    match_cur = 1.0 - c_cur
+
+    per = torch.where(is_worsening | is_resolved, toward_cur, per)
+    per = torch.where(is_improving, toward_pri, per)
+    per = torch.where(is_new, match_cur, per)
+
+    return per.mean()
+
+
+def change_localization_directional_loss(
+    pred_patches: torch.Tensor,
+    prior_patches: torch.Tensor,
+    current_patches: torch.Tensor,
+    prior_weights: torch.Tensor,
+    curr_weights: torch.Tensor,
+    prior_active: torch.Tensor,
+    curr_active: torch.Tensor,
+    prog_cls_idx: torch.Tensor,
+    active: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Where (change map in mask) + which-way (region direction) sum.
+
+    ``active`` is the trainer's class gate (non-stable). Where further
+    requires a prior mask; which-way requires prior or current mask.
+    Either term may be 0 if its active set is empty; the returned scalar
+    is their sum (so the shared ``W_CHANGE_LOC`` scales both together).
+    """
+    where_active = active.bool() & prior_active.bool()
+    where = change_localization_loss(
+        pred_patches,
+        prior_patches,
+        prior_weights,
+        where_active,
+        eps=eps,
+    )
+    which = change_direction_loss(
+        pred_patches,
+        prior_patches,
+        current_patches,
+        prior_weights,
+        curr_weights,
+        prior_active,
+        curr_active,
+        prog_cls_idx,
+        active,
+        eps=eps,
+    )
+    return where + which

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_chgloc05
+#SBATCH --job-name=jepa_cbw99999_chglocdir05
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,24 +8,27 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_chgloc05_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_chgloc05_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_chglocdir05_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/temporal/logs/jepa_cbw99999_chglocdir05_%j.err
 
 # ============================================================
 # SLURM launcher for the ``main`` branch's from-scratch β=0.99999
-# + change-localization grounding add-on (``cbw99999_chgloc05``).
+# + where+which-way change-localization (``cbw99999_chglocdir05``).
 #
 # What this run does:
 #   * Progression CBW β = 0.99999 (frozen after the β sweep —
 #     best gold per-class balance; MS-CXR-T stable known to be weak).
 #   * W_REPORT_PRIOR = W_REPORT_PRED = 0.10 (baseline).
-#   * Progression CE + full-grid JEPA unchanged (global patch mean).
-#   * Change-localization add-on (W_CHANGE_LOC=0.05): soft-pool the
-#     prior-grid change map 1-cos(ẑ, z_prior) inside vs outside the
-#     prior finding-mask union; maximize s_in - s_out. Active for
-#     improving / worsening / new / resolved when a prior mask exists
-#     (stable excluded).
-#   * Checkpoints / logs under ``cbw99999_chgloc05``.
+#   * Progression CE + full-grid JEPA unchanged (W_JEPA=1.0).
+#   * Change-localization add-on (W_CHANGE_LOC=0.05):
+#       (1) Where — soft-pool 1-cos(ẑ, z_prior) inside vs outside the
+#           sampled prog_finding prior mask; maximize s_in - s_out.
+#       (2) Which way — soft-pool region summaries; push ẑ toward the
+#           progression-appropriate side of (z_prior, z_cur).
+#     Active for improving / worsening / new / resolved when a finding
+#     mask exists (stable excluded entirely).
+#   * Checkpoints / logs under ``cbw99999_chglocdir05`` (new tag — does
+#     not resume into the older ``chgloc05`` dirs).
 #
 # Same 50-epoch, save-every-5 schedule. ``best.pt`` is overwritten
 # whenever ``val_total`` improves.
@@ -44,13 +47,12 @@
 #     export PROJECT_DIR=/scratch/m000081/eprakash/temporal/final/cxr-temporal-model
 #     export CHEXTEMPORAL_DIR=$PROJECT_DIR/CheXTemporal
 #     export JEPA_IMAGE_ROOTS_DIR=/scratch/m000081/eprakash/all_data
+#     git checkout main && git pull
 #     sbatch resume_train_jepa.sh
 #
 # Auto-resume from the latest epoch checkpoint kicks in automatically
 # if the run is preempted and re-queued, so ``sbatch resume_train_jepa.sh``
-# just picks up where it left off. If you previously trained the older
-# chgloc (no resolved) into the same ckpt dir, move/rename that dir
-# first so this run starts fresh.
+# just picks up where it left off.
 # ============================================================
 
 # ============================================================
@@ -137,7 +139,7 @@ do
     fi
 done
 
-# filtered_masks for change-localization (prior finding masks)
+# filtered_masks for change-localization (finding masks, dual prior/curr)
 _CHEX="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
 if [ ! -d "$_CHEX/filtered_masks" ]; then
     echo "[slurm] ERROR: filtered_masks not found under $_CHEX" >&2
