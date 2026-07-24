@@ -19,8 +19,9 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10,
-# plus change-localization grounding (``_chgloc05`` dir tag; active for
-# improving / worsening / new / resolved — not stable).
+# **anatomy-only JEPA** (``_anatjepaonly100`` dir tag): W_JEPA=0,
+# W_ANAT_JEPA=1.0. No change-localization. Train/val filtered to pairs
+# with the full 22-CXAS inventory on prior AND current.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -34,18 +35,17 @@
 #   ``F.cross_entropy(mean_patches(cos(ẑ_cur^c, z_cur)) / τ, silver_label,
 #                     weight=class_weights)`` — still a *global* patch mean.
 #
-# Change-localization add-on (5th loss, optional per sample):
-#   Soft-pool the prior-grid change map ``1 - cos(ẑ, z_prior)`` inside vs
-#   outside the prior finding-mask union; maximize ``s_in - s_out``.
-#   Applied when a prior mask exists and the sampled silver progression
-#   is improving / worsening / new / resolved (not stable). Full-grid
-#   JEPA / progression / GLoRIA paths stay unmasked.
+# Anatomy-only dual-mask JEPA (replaces full-grid JEPA):
+#   For each of 22 fixed CXAS anatomies (fixed order) from
+#   ``CheXTemporal/filtered_masks_anatomy``, soft-pool ``ẑ`` with the
+#   prior anatomy mask and ``z_cur`` with the current anatomy mask;
+#   ``L = mean_a (1 - cos(u_a, v_a))``. Dataset drops pairs missing the
+#   full inventory on either image.
 
 import os
 import glob
 import random
 import argparse
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -66,11 +66,11 @@ from tempcxr.modules.jepa import (
 )
 from losses import local_contrastive_loss
 from losses_jepa import (
+    anatomy_masked_pool_jepa_loss,
     jepa_cosine_loss,
     progression_classification_loss,
-    change_localization_loss,
 )
-from silver_masks import default_masks_root
+from silver_masks import N_ANATOMY_MASKS, default_anatomy_masks_root
 
 
 # ============================================================
@@ -250,7 +250,8 @@ WARMUP_RATIO = 0.03
 SAVE_EVERY_N_EPOCHS = 1
 
 # Loss weights (baseline report contrastive = 0.10).
-W_JEPA = 1.0
+# Anatomy-only JEPA: full-grid JEPA off; dual-mask anatomy JEPA @ 1.0.
+W_JEPA = 0.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
 # 4th loss: 5-way image-image CE on the predictor's class-conditioned
@@ -261,56 +262,11 @@ PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
 N_CLS = len(CLS_ORDER)
 
-# Change-localization add-on (prior finding mask on ẑ vs z_prior change map).
-# Full-grid JEPA and global progression CE are unchanged.
-W_CHANGE_LOC = 0.05
-USE_CHANGE_LOCALIZATION = True
-# Silver progression classes that receive the grounding term (indices into
-# CLS_ORDER). Stable is omitted (no change to localize). Resolved is
-# included: the finding was on the prior and is gone now, so the prior
-# finding mask is the right place to concentrate the change map.
-_CHANGE_LOC_ACTIVE_CLS = frozenset({
-    CLS_ORDER.index("improving"),
-    CLS_ORDER.index("worsening"),
-    CLS_ORDER.index("new"),
-    CLS_ORDER.index("resolved"),
-})
-# Startup probe: how many train samples to touch before declaring masks dead.
-_MASK_PROBE_N = 64
-
-
-def _require_pycocotools_for_chgloc() -> None:
-    """Fail fast — without pycocotools, compressed RLEs never decode."""
-    try:
-        import pycocotools.mask  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(
-            "USE_CHANGE_LOCALIZATION requires pycocotools "
-            "(pip install pycocotools). Without it every mask decode "
-            "fails silently and val_chgloc stays 0.0."
-        ) from exc
-
-
-def _count_finding_mask_jsons(masks_root: str) -> int:
-    """Count ``*__*.json`` finding-mask files under ``masks_root``."""
-    root = Path(masks_root)
-    if not root.is_dir():
-        return 0
-    return sum(1 for _ in root.rglob("*__*.json"))
-
-
-def _probe_mask_hit_rate(dataset, n_probe: int = _MASK_PROBE_N):
-    """Return ``(hit_rate, n_active, n_probed)`` over strided train samples."""
-    n = min(int(n_probe), len(dataset))
-    if n <= 0:
-        return 0.0, 0, 0
-    n_active = 0
-    for i in range(n):
-        idx = int(i * len(dataset) / n)
-        if bool(dataset[idx]["mask_pool_active"]):
-            n_active += 1
-    return n_active / float(n), n_active, n
-
+# Anatomy dual-mask JEPA (22 fixed CXAS from filtered_masks_anatomy).
+# Replaces full-grid JEPA for this run.
+W_ANAT_JEPA = 1.0
+USE_ANATOMY_JEPA = True
+REQUIRE_FULL_ANATOMY_MASKS = True
 
 # Stratified train/val split when the studies parquet has no 'split'
 # column. Both datasets read/write the same cached splits CSV
@@ -338,7 +294,8 @@ SPLIT_SEED = 42
 #                                       the same non-default value
 #                                       (e.g. rp15 = 0.15)
 #   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
-#   * ``..._chgloc{ww}``              — change-localization grounding weight
+#   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
+#   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
 # (pre-4-loss / pre-CBW / mask-JEPA) runs are left untouched as archives.
 def _cbw_beta_tag(beta: float) -> str:
@@ -376,10 +333,12 @@ if W_REPORT_PRIOR != 0.1 or W_REPORT_PRED != 0.1:
     else:
         _SETTING_TAG = f"{_SETTING_TAG}_rpri{_rprior_tag}_rpred{_rpred_tag}"
 
-if USE_CHANGE_LOCALIZATION and W_CHANGE_LOC > 0:
-    _SETTING_TAG = (
-        f"{_SETTING_TAG}_chgloc{_report_weight_tag(W_CHANGE_LOC)}"
-    )
+if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0:
+    _anat_tag = _report_weight_tag(W_ANAT_JEPA)
+    if W_JEPA == 0.0:
+        _SETTING_TAG = f"{_SETTING_TAG}_anatjepaonly{_anat_tag}"
+    else:
+        _SETTING_TAG = f"{_SETTING_TAG}_anatjepa{_anat_tag}"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -438,6 +397,20 @@ def _compute_cui_class_weights(dataset, beta: float) -> torch.Tensor:
 # ============================================================
 # DATASETS
 # ============================================================
+if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0:
+    try:
+        import pycocotools.mask  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "Anatomy JEPA requires pycocotools "
+            "(pip install pycocotools)."
+        ) from exc
+    _anat_root = default_anatomy_masks_root()
+    if not os.path.isdir(_anat_root):
+        raise RuntimeError(
+            f"filtered_masks_anatomy not found at {_anat_root}"
+        )
+
 train_dataset = JEPACombinedDataset(
     image_roots=IMAGE_ROOTS,
     split="train",
@@ -445,6 +418,7 @@ train_dataset = JEPACombinedDataset(
     val_fraction=VAL_FRACTION,
     split_seed=SPLIT_SEED,
     condition_mode=CONDITION_MODE,
+    require_full_anatomy_masks=REQUIRE_FULL_ANATOMY_MASKS,
 )
 
 val_dataset = JEPACombinedDataset(
@@ -454,37 +428,8 @@ val_dataset = JEPACombinedDataset(
     val_fraction=VAL_FRACTION,
     split_seed=SPLIT_SEED,
     condition_mode=CONDITION_MODE,
+    require_full_anatomy_masks=REQUIRE_FULL_ANATOMY_MASKS,
 )
-
-# Fail fast if change-loc is on but masks cannot actually load (the
-# previous silent failure mode: dir exists, val_chgloc stays 0.0).
-if USE_CHANGE_LOCALIZATION and W_CHANGE_LOC > 0:
-    _require_pycocotools_for_chgloc()
-    _masks_root = getattr(train_dataset, "masks_root", None) or default_masks_root()
-    _n_mask_jsons = _count_finding_mask_jsons(_masks_root)
-    if _n_mask_jsons <= 0:
-        raise RuntimeError(
-            f"USE_CHANGE_LOCALIZATION is on but no finding-mask JSONs "
-            f"(*__*.json) were found under {_masks_root}. "
-            f"Populate CheXTemporal/filtered_masks or disable the loss."
-        )
-    _mask_hit, _mask_n_act, _mask_n = _probe_mask_hit_rate(
-        train_dataset, n_probe=_MASK_PROBE_N
-    )
-    if local_rank == 0:
-        print(
-            f"[train] mask preflight: masks_root={_masks_root} "
-            f"n_finding_jsons={_n_mask_jsons} "
-            f"probe_hit_rate={_mask_hit:.3f} "
-            f"({_mask_n_act}/{_mask_n} active)"
-        )
-    if _mask_hit <= 0.0:
-        raise RuntimeError(
-            f"USE_CHANGE_LOCALIZATION is on but 0/{_mask_n} probed train "
-            f"samples had mask_pool_active=True under {_masks_root}. "
-            f"Check pycocotools, finding__stem.json paths, and parent_image "
-            f"joins — otherwise val_chgloc will stay 0.0."
-        )
 
 # Compute Cui et al. class-balanced weights from the ACTUAL training
 # split (same numbers on every rank because the split is deterministic).
@@ -500,10 +445,11 @@ if local_rank == 0:
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
     print(f"[train] log dir:        {LOG_DIR}")
     print(
-        f"[train] change-localization: enabled={USE_CHANGE_LOCALIZATION} "
-        f"W_CHANGE_LOC={W_CHANGE_LOC} "
-        f"(prior finding mask on ẑ−z_prior change map; "
-        f"active classes={[CLS_ORDER[i] for i in sorted(_CHANGE_LOC_ACTIVE_CLS)]})"
+        f"[train] anatomy-only JEPA: enabled={USE_ANATOMY_JEPA} "
+        f"W_JEPA={W_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
+        f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
+        f"(A={N_ANATOMY_MASKS} CXAS fixed order; prior mask→ẑ, "
+        f"current mask→z_cur)"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -635,7 +581,7 @@ if local_rank == 0 and not os.path.exists(CSV_LOG):
     with open(CSV_LOG, "w") as f:
         f.write(
             "epoch,val_total,val_jepa,val_report_prior,val_report_pred,"
-            "val_prog,val_chgloc\n"
+            "val_prog,val_anatjepa\n"
         )
 
 
@@ -672,19 +618,21 @@ def compute_jepa_losses(
     out,
     prog_cls_idx,
     gather: bool,
-    mask_patch_weights=None,
+    mask_patch_weights_prior=None,
+    mask_patch_weights_curr=None,
     mask_pool_active=None,
 ):
     """
-    out                : dict returned by TempCXRJEPA.forward
-    prog_cls_idx       : (B,) long tensor — silver class for 4th loss
-    gather             : if True, gather contrastive features across ranks
-                         for cross-rank negatives (training). If False, use
-                         local features only (val).
-    mask_patch_weights : optional (B, N) prior-image soft finding weights
-    mask_pool_active   : optional (B,) bool — prior mask was loaded
+    out                      : dict returned by TempCXRJEPA.forward
+    prog_cls_idx             : (B,) long tensor — silver class for 4th loss
+    gather                   : if True, gather contrastive features across
+                               ranks for cross-rank negatives (training).
+                               If False, use local features only (val).
+    mask_patch_weights_prior : optional (B, A, N) prior anatomy soft weights
+    mask_patch_weights_curr  : optional (B, A, N) current anatomy soft weights
+    mask_pool_active         : optional (B,) bool — full 22-mask inventory
 
-    Returns: (total, jepa, prior, pred, prog, chgloc) as scalar tensors.
+    Returns: (total, jepa, prior, pred, prog, anatjepa) as scalar tensors.
     """
 
     # JEPA loss is per-patch cosine; cross-rank gathering doesn't add
@@ -737,36 +685,42 @@ def compute_jepa_losses(
         class_weights=PROG_CLASS_WEIGHTS,
     )
 
-    # Change localization: concentrate ẑ−z_prior change inside prior
-    # finding mask. Full-grid JEPA above is unchanged.
+    # Anatomy dual-mask JEPA: prior anatomy → ẑ, current anatomy → z_cur.
+    # When W_JEPA=0 this is the sole JEPA term.
     if (
-        USE_CHANGE_LOCALIZATION
-        and W_CHANGE_LOC > 0
-        and mask_patch_weights is not None
+        USE_ANATOMY_JEPA
+        and W_ANAT_JEPA > 0
+        and mask_patch_weights_prior is not None
+        and mask_patch_weights_curr is not None
         and mask_pool_active is not None
     ):
-        # Non-stable silver classes contribute (incl. resolved).
-        cls_ok = torch.zeros_like(mask_pool_active)
-        for cidx in _CHANGE_LOC_ACTIVE_CLS:
-            cls_ok |= (prog_cls_idx == int(cidx))
-        active = mask_pool_active.bool() & cls_ok
-        chgloc = change_localization_loss(
+        if (
+            mask_patch_weights_prior.shape[1] != N_ANATOMY_MASKS
+            or mask_patch_weights_curr.shape[1] != N_ANATOMY_MASKS
+        ):
+            raise ValueError(
+                f"expected A={N_ANATOMY_MASKS} anatomy masks; got "
+                f"prior A={mask_patch_weights_prior.shape[1]} "
+                f"curr A={mask_patch_weights_curr.shape[1]}"
+            )
+        anatjepa = anatomy_masked_pool_jepa_loss(
             out["pred_current_patches"].float(),
-            out["prior_patches"].float(),
-            mask_patch_weights.float(),
-            active,
+            out["current_patches_target"].float(),
+            mask_patch_weights_prior.float(),
+            mask_patch_weights_curr.float(),
+            mask_pool_active,
         )
     else:
-        chgloc = out["pred_current_patches"].new_zeros(())
+        anatjepa = out["pred_current_patches"].new_zeros(())
 
     total = (
         W_JEPA * jepa
         + W_REPORT_PRIOR * prior
         + W_REPORT_PRED * pred
         + W_PROG * prog
-        + W_CHANGE_LOC * chgloc
+        + W_ANAT_JEPA * anatjepa
     )
-    return total, jepa, prior, pred, prog, chgloc
+    return total, jepa, prior, pred, prog, anatjepa
 
 
 # ============================================================
@@ -797,22 +751,27 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         prog_prompts = build_progression_prompts(batch["prog_finding"])
         prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
-        mask_w = batch["mask_patch_weights"].to(DEVICE)
+        mask_w_prior = batch["mask_patch_weights_prior"].to(DEVICE)
+        mask_w_curr = batch["mask_patch_weights_curr"].to(DEVICE)
         mask_active = batch["mask_pool_active"].to(DEVICE)
 
-        # One clear (non-tqdm) line so Slurm .out shows mask loading worked.
         if (
             epoch == start_epoch
             and batch_idx == 0
             and local_rank == 0
-            and USE_CHANGE_LOCALIZATION
-            and W_CHANGE_LOC > 0
+            and USE_ANATOMY_JEPA
         ):
+            frac = mask_active.float().mean().item()
             print(
-                f"[train] first-batch mask_active_frac="
-                f"{mask_active.float().mean().item():.3f} "
-                f"(n_active={int(mask_active.sum().item())}/{mask_active.numel()})"
+                f"[train] first-batch mask_active_frac={frac:.3f} "
+                f"(n_active={int(mask_active.sum().item())}/"
+                f"{mask_active.numel()})"
             )
+            if REQUIRE_FULL_ANATOMY_MASKS and frac < 1.0 - 1e-6:
+                raise RuntimeError(
+                    "require_full_anatomy_masks=True but first batch "
+                    f"mask_active_frac={frac:.3f} < 1.0"
+                )
 
         optimizer.zero_grad()
 
@@ -826,12 +785,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 progression_prompts_flat=prog_prompts,
             )
 
-            loss, jepa_l, prior_l, pred_l, prog_l, chg_l = (
+            loss, jepa_l, prior_l, pred_l, prog_l, anat_l = (
                 compute_jepa_losses(
                     out,
                     prog_cls_idx,
                     gather=True,
-                    mask_patch_weights=mask_w,
+                    mask_patch_weights_prior=mask_w_prior,
+                    mask_patch_weights_curr=mask_w_curr,
                     mask_pool_active=mask_active,
                 )
             )
@@ -856,7 +816,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "loss": f"{loss.item():.4f}",
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
-                "chgl": f"{chg_l.item():.4f}",
+                "anat": f"{anat_l.item():.4f}",
                 "mask": f"{mask_active.float().mean().item():.2f}",
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
@@ -873,7 +833,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # VALIDATION
     # ============================================================
     model.eval()
-    val_total = val_jepa = val_prior = val_pred = val_prog = val_chgloc = 0.0
+    val_total = val_jepa = val_prior = val_pred = val_prog = val_anatjepa = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -888,7 +848,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             prog_prompts = build_progression_prompts(batch["prog_finding"])
             prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
-            mask_w = batch["mask_patch_weights"].to(DEVICE)
+            mask_w_prior = batch["mask_patch_weights_prior"].to(DEVICE)
+            mask_w_curr = batch["mask_patch_weights_curr"].to(DEVICE)
             mask_active = batch["mask_pool_active"].to(DEVICE)
 
             with torch.amp.autocast("cuda"):
@@ -901,12 +862,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     progression_prompts_flat=prog_prompts,
                 )
 
-                total, jepa_l, prior_l, pred_l, prog_l, chg_l = (
+                total, jepa_l, prior_l, pred_l, prog_l, anat_l = (
                     compute_jepa_losses(
                         out,
                         prog_cls_idx,
                         gather=False,
-                        mask_patch_weights=mask_w,
+                        mask_patch_weights_prior=mask_w_prior,
+                        mask_patch_weights_curr=mask_w_curr,
                         mask_pool_active=mask_active,
                     )
                 )
@@ -916,7 +878,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             val_prior += prior_l.item()
             val_pred += pred_l.item()
             val_prog += prog_l.item()
-            val_chgloc += chg_l.item()
+            val_anatjepa += anat_l.item()
             val_batches += 1
 
     val_total /= max(val_batches, 1)
@@ -924,14 +886,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
     val_prior /= max(val_batches, 1)
     val_pred /= max(val_batches, 1)
     val_prog /= max(val_batches, 1)
-    val_chgloc /= max(val_batches, 1)
+    val_anatjepa /= max(val_batches, 1)
 
     val_total = ddp_reduce(val_total)
     val_jepa = ddp_reduce(val_jepa)
     val_prior = ddp_reduce(val_prior)
     val_pred = ddp_reduce(val_pred)
     val_prog = ddp_reduce(val_prog)
-    val_chgloc = ddp_reduce(val_chgloc)
+    val_anatjepa = ddp_reduce(val_anatjepa)
 
     if local_rank == 0:
 
@@ -942,13 +904,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"PriorReport={val_prior:.4f} | "
             f"PredReport={val_pred:.4f} | "
             f"Prog={val_prog:.4f} | "
-            f"ChgLoc={val_chgloc:.4f}"
+            f"AnatJEPA={val_anatjepa:.4f}"
         )
 
         with open(CSV_LOG, "a") as f:
             f.write(
                 f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred},"
-                f"{val_prog},{val_chgloc}\n"
+                f"{val_prog},{val_anatjepa}\n"
             )
 
         ckpt = {

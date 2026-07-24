@@ -1,10 +1,20 @@
-"""Load CheXTemporal ``filtered_masks`` and map them onto JEPA patch weights.
+"""Load CheXTemporal soft masks and map them onto JEPA patch weights.
 
-Mask files live under::
+Two layouts are supported:
 
-    CheXTemporal/filtered_masks/
-        chexpert/train/{patient}/{study}/{finding}__{view}.json
-        mimic/{pXX}/{subject}/{study}/{finding}__{dicom_id}.json
+1. Finding-filtered masks (``filtered_masks/``)::
+
+       CheXTemporal/filtered_masks/
+           chexpert/train/{patient}/{study}/{finding}__{view}.json
+           mimic/{pXX}/{subject}/{study}/{finding}__{dicom_id}.json
+
+2. Fixed-anatomy masks (``filtered_masks_anatomy/``)::
+
+       CheXTemporal/filtered_masks_anatomy/
+           chexpert/train/{patient}/{study}/{view}.json
+           mimic/{pXX}/{subject}/{study}/{dicom_id}.json
+
+   Each retained JSON has the same 22 CXAS anatomy categories.
 
 Each JSON is a tiny COCO-style document with RLE ``segmentation`` masks
 in **original image** resolution. Training images go through
@@ -13,9 +23,8 @@ same *geometric* transforms (nearest-neighbor; no brightness/contrast)
 and are then average-pooled onto the BioViL-T 14×14 patch grid as
 **float** coverage weights in ``[0, 1]``.
 
-Change-localization uses the **prior**-image finding-mask union to
-soft-pool the prior-grid change map ``1 - cos(ẑ, z_prior)`` inside vs
-outside the finding.
+Anatomy dual-mask JEPA pools predicted ``ẑ`` with the **prior** anatomy
+mask and ``z_cur`` with the **current** anatomy mask, per category.
 """
 
 from __future__ import annotations
@@ -407,13 +416,251 @@ def load_dual_findings_patch_weights(
     return prior_w, curr_w, True
 
 
-def default_masks_root(chextemporal_dir: Optional[str] = None) -> str:
-    """``$CHEXTEMPORAL_DIR/filtered_masks`` (or local CheXTemporal default)."""
-    root = chextemporal_dir or os.environ.get(
+# Fixed 22 CXAS categories retained by ``filter_masks_by_anatomy_map.py``.
+# Order is alphabetical (matches ``allowed_categories.json``).
+REQUIRED_CXAS_ANATOMIES: tuple[str, ...] = (
+    "aortic arch",
+    "cardiomediastinum",
+    "clavicle left",
+    "clavicle right",
+    "heart",
+    "heart atrium right",
+    "left apical zone lung",
+    "left hemidiaphragm",
+    "left lung",
+    "left lung base",
+    "left mid zone lung",
+    "left upper zone lung",
+    "right apical zone lung",
+    "right hemidiaphragm",
+    "right lung",
+    "right lung base",
+    "right mid zone lung",
+    "right upper zone lung",
+    "spine",
+    "trachea",
+    "tracheal bifurcation",
+    "upper mediastinum",
+)
+N_ANATOMY_MASKS = len(REQUIRED_CXAS_ANATOMIES)
+
+
+def _chextemporal_root(chextemporal_dir: Optional[str] = None) -> str:
+    return chextemporal_dir or os.environ.get(
         "CHEXTEMPORAL_DIR",
         os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             "CheXTemporal",
         ),
     )
-    return os.path.join(root, "filtered_masks")
+
+
+def default_masks_root(chextemporal_dir: Optional[str] = None) -> str:
+    """``$CHEXTEMPORAL_DIR/filtered_masks`` (finding-filtered)."""
+    return os.path.join(_chextemporal_root(chextemporal_dir), "filtered_masks")
+
+
+def default_anatomy_masks_root(chextemporal_dir: Optional[str] = None) -> str:
+    """``$CHEXTEMPORAL_DIR/filtered_masks_anatomy`` (fixed 22 CXAS)."""
+    return os.path.join(
+        _chextemporal_root(chextemporal_dir), "filtered_masks_anatomy"
+    )
+
+
+def resolve_anatomy_mask_json_path(
+    masks_root: Union[str, Path],
+    dataset: str,
+    parent_image: str,
+) -> Optional[Path]:
+    """Locate ``{image_stem}.json`` under ``filtered_masks_anatomy``."""
+    if not parent_image:
+        return None
+
+    rel = normalize_parent_image_rel(dataset, parent_image)
+    if rel is None:
+        return None
+
+    rel_path = Path(rel)
+    candidate = Path(masks_root) / rel_path.parent / f"{rel_path.stem}.json"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def load_per_category_masks_hw(
+    mask_json_path: Union[str, Path],
+    categories: Sequence[str] = REQUIRED_CXAS_ANATOMIES,
+) -> Optional[Dict[str, np.ndarray]]:
+    """Decode one RLE mask per required category; None if any are missing."""
+    with open(mask_json_path, "r") as f:
+        doc = json.load(f)
+
+    id_to_name = {
+        int(c["id"]): str(c["name"])
+        for c in (doc.get("categories") or [])
+        if "id" in c and "name" in c
+    }
+    want = set(categories)
+    by_name: Dict[str, np.ndarray] = {}
+
+    for ann in doc.get("annotations") or []:
+        seg = ann.get("segmentation")
+        if seg is None or isinstance(seg, list):
+            continue
+        cid = ann.get("category_id")
+        if cid is None:
+            continue
+        name = id_to_name.get(int(cid))
+        if name is None or name not in want:
+            continue
+        try:
+            m = _decode_rle_to_mask(seg)
+        except Exception:
+            continue
+        if name in by_name:
+            by_name[name] = np.logical_or(by_name[name], m)
+        else:
+            by_name[name] = m
+
+    if any(c not in by_name for c in categories):
+        return None
+    return by_name
+
+
+def anatomy_categories_present(
+    mask_json_path: Union[str, Path],
+    categories: Sequence[str] = REQUIRED_CXAS_ANATOMIES,
+) -> bool:
+    """True iff every required category has at least one RLE annotation.
+
+    Does **not** decode RLEs — cheap enough to filter the silver corpus.
+    """
+    try:
+        with open(mask_json_path, "r") as f:
+            doc = json.load(f)
+    except Exception:
+        return False
+
+    id_to_name = {
+        int(c["id"]): str(c["name"])
+        for c in (doc.get("categories") or [])
+        if "id" in c and "name" in c
+    }
+    present = set()
+    for ann in doc.get("annotations") or []:
+        seg = ann.get("segmentation")
+        if seg is None or isinstance(seg, list):
+            continue
+        cid = ann.get("category_id")
+        if cid is None:
+            continue
+        name = id_to_name.get(int(cid))
+        if name is not None:
+            present.add(name)
+    return all(c in present for c in categories)
+
+
+# Cache: (masks_root, dataset, parent_image) -> has full 22-category inventory.
+_ANATOMY_INVENTORY_CACHE: Dict[tuple, bool] = {}
+
+
+def image_has_full_anatomy_inventory(
+    masks_root: Union[str, Path],
+    dataset: str,
+    parent_image: str,
+    categories: Sequence[str] = REQUIRED_CXAS_ANATOMIES,
+) -> bool:
+    """Whether one image's anatomy JSON covers all required CXAS classes."""
+    key = (str(masks_root), dataset, str(parent_image))
+    cached = _ANATOMY_INVENTORY_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    path = resolve_anatomy_mask_json_path(masks_root, dataset, parent_image)
+    ok = path is not None and anatomy_categories_present(path, categories)
+    _ANATOMY_INVENTORY_CACHE[key] = ok
+    return ok
+
+
+def pair_has_full_anatomy_inventory(
+    masks_root: Union[str, Path],
+    dataset: str,
+    parent_image_prev: str,
+    parent_image_curr: str,
+    categories: Sequence[str] = REQUIRED_CXAS_ANATOMIES,
+) -> bool:
+    """True iff **both** prior and current have the full anatomy inventory."""
+    return image_has_full_anatomy_inventory(
+        masks_root, dataset, parent_image_prev, categories
+    ) and image_has_full_anatomy_inventory(
+        masks_root, dataset, parent_image_curr, categories
+    )
+
+
+def load_dual_anatomy_patch_weights(
+    masks_root: Union[str, Path],
+    dataset: str,
+    parent_image_prev: str,
+    parent_image_curr: str,
+    categories: Sequence[str] = REQUIRED_CXAS_ANATOMIES,
+    aug_params: Optional[Dict[str, float]] = None,
+    min_weight_sum: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Per-anatomy soft weights for dual-mask pooled JEPA.
+
+    Returns ``(prior_weights, current_weights, active)`` with shapes
+    ``(A, N)``, ``(A, N)``, bool where ``A = len(categories)`` (22).
+
+    Row order is exactly ``categories`` (default:
+    ``REQUIRED_CXAS_ANATOMIES``) so every sample shares one anatomy axis.
+
+    ``active`` is True only when:
+      1. Both prior and current have a readable anatomy JSON, and
+      2. Both JSONs contain all ``categories`` with RLE annotations, and
+      3. Every warped weight tensor (prior + current, all A) has mass.
+
+    Prior weights pool ``ẑ`` (prior-grid residual); current weights pool
+    ``z_cur`` (EMA current target).
+    """
+    # Freeze to the canonical tuple so callers cannot silently reorder.
+    categories = tuple(categories)
+    if categories != REQUIRED_CXAS_ANATOMIES:
+        raise ValueError(
+            "anatomy JEPA requires FIXED order REQUIRED_CXAS_ANATOMIES; "
+            f"got {categories!r}"
+        )
+
+    a = len(categories)
+    z = torch.zeros(a, N_PATCHES, dtype=torch.float32)
+
+    p_path = resolve_anatomy_mask_json_path(
+        masks_root, dataset, parent_image_prev
+    )
+    c_path = resolve_anatomy_mask_json_path(
+        masks_root, dataset, parent_image_curr
+    )
+    if p_path is None or c_path is None:
+        return z, z, False
+
+    try:
+        prior_hw = load_per_category_masks_hw(p_path, categories)
+        curr_hw = load_per_category_masks_hw(c_path, categories)
+    except Exception:
+        return z, z, False
+    if prior_hw is None or curr_hw is None:
+        return z, z, False
+
+    prior_rows = []
+    curr_rows = []
+    for cat in categories:  # fixed order → axis A is aligned across batch
+        try:
+            pw = mask_hw_to_patch_weights(prior_hw[cat], aug_params=aug_params)
+            cw = mask_hw_to_patch_weights(curr_hw[cat], aug_params=aug_params)
+        except Exception:
+            return z, z, False
+        if float(pw.sum()) <= min_weight_sum or float(cw.sum()) <= min_weight_sum:
+            return z, z, False
+        prior_rows.append(pw)
+        curr_rows.append(cw)
+
+    return torch.stack(prior_rows, dim=0), torch.stack(curr_rows, dim=0), True

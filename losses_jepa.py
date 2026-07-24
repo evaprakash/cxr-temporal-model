@@ -18,11 +18,14 @@ scale-invariant — so this module exposes:
     "Class-Balanced Loss Based on Effective Number of Samples") so the
     minority silver classes (``resolved`` ≈ 1 % of silver) get a
     proportionally larger gradient than the majority ``stable`` class.
-  * ``change_localization_loss`` for optional grounding: build a per-patch
-    change map ``s = 1 - cos(ẑ_cur, z_prior)`` on the prior grid, soft-
-    pool inside vs outside the prior finding mask, and maximize
-    ``s_in - s_out`` so change energy concentrates on the finding.
-    No-mask / inactive rows are omitted. Full-grid JEPA is unchanged.
+  * ``anatomy_masked_pool_jepa_loss`` for optional dual-mask anatomy JEPA:
+    for each of 22 fixed CXAS anatomies, soft-pool ``ẑ`` with the prior
+    anatomy mask and ``z_cur`` with the current anatomy mask, then take
+    ``1 - cos(u, v)``. Mean over anatomies, then over active pairs.
+    Pairs missing the full 22-mask inventory on either image are omitted.
+    Full-grid JEPA is unchanged.
+  * ``change_localization_loss`` (legacy / other branches): concentrate
+    prior-grid change energy inside a finding mask.
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
@@ -136,6 +139,83 @@ def progression_classification_loss(
     logits = logits / temperature
 
     return F.cross_entropy(logits, silver_labels, weight=class_weights)
+
+
+# =========================================================
+# ANATOMY DUAL-MASK POOLED JEPA (22 FIXED CXAS, ADD-ON)
+# =========================================================
+def anatomy_masked_pool_jepa_loss(
+    pred_patches: torch.Tensor,          # (B, N, D) dynamic-conditioned ẑ_cur
+    target_patches: torch.Tensor,        # (B, N, D) z_cur (stop-grad)
+    pred_patch_weights: torch.Tensor,    # (B, A, N) prior-image anatomy masks
+    target_patch_weights: torch.Tensor,  # (B, A, N) current-image anatomy masks
+    active: torch.Tensor,                # (B,) bool — True → contribute
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """JEPA cosine on per-anatomy soft-mask-pooled region summaries.
+
+    For each active sample and anatomy ``a``::
+
+        u_a = normalize( Σ_n w^prior_{a,n}  ẑ_n / Σ_n w^prior_{a,n} )
+        v_a = normalize( Σ_n w^curr_{a,n}   z_n / Σ_n w^curr_{a,n} )
+        L_a = 1 - cos(u_a, v_a)
+
+    Mean over the A anatomies, then over active batch rows. Inactive
+    rows (missing / incomplete 22-mask inventory on prior or current)
+    are omitted. Returns 0 when no row is active. Full-grid
+    ``jepa_cosine_loss`` is separate.
+    """
+    if pred_patches.numel() == 0 or not bool(active.any()):
+        return pred_patches.new_zeros(())
+
+    w_pred = pred_patch_weights.to(
+        device=pred_patches.device, dtype=pred_patches.dtype
+    ).clamp(min=0.0)
+    w_tgt = target_patch_weights.to(
+        device=pred_patches.device, dtype=pred_patches.dtype
+    ).clamp(min=0.0)
+
+    if w_pred.ndim != 3 or w_tgt.ndim != 3:
+        raise ValueError(
+            f"anatomy weights must be (B, A, N); got "
+            f"pred={tuple(w_pred.shape)} tgt={tuple(w_tgt.shape)}"
+        )
+    if w_pred.shape[0] != pred_patches.shape[0] or w_pred.shape[2] != pred_patches.shape[1]:
+        raise ValueError(
+            f"pred_patch_weights shape {tuple(w_pred.shape)} incompatible "
+            f"with pred_patches {tuple(pred_patches.shape)}"
+        )
+    if w_tgt.shape[0] != target_patches.shape[0] or w_tgt.shape[2] != target_patches.shape[1]:
+        raise ValueError(
+            f"target_patch_weights shape {tuple(w_tgt.shape)} incompatible "
+            f"with target_patches {tuple(target_patches.shape)}"
+        )
+    if w_pred.shape[1] != w_tgt.shape[1]:
+        raise ValueError(
+            f"anatomy count mismatch: pred A={w_pred.shape[1]} tgt A={w_tgt.shape[1]}"
+        )
+
+    active = active.to(device=pred_patches.device).bool()
+    pred = pred_patches[active]          # (B', N, D)
+    target = target_patches[active]
+    w_pred = w_pred[active]              # (B', A, N)
+    w_tgt = w_tgt[active]
+
+    # Broadcast patches over anatomy: (B', A, N, D)
+    a = w_pred.shape[1]
+    pred_e = pred.unsqueeze(1).expand(-1, a, -1, -1)
+    tgt_e = target.unsqueeze(1).expand(-1, a, -1, -1)
+
+    w_pred_sum = w_pred.sum(dim=-1, keepdim=True).clamp(min=eps)
+    w_tgt_sum = w_tgt.sum(dim=-1, keepdim=True).clamp(min=eps)
+    w_pred_n = w_pred / w_pred_sum
+    w_tgt_n = w_tgt / w_tgt_sum
+
+    u = (pred_e * w_pred_n.unsqueeze(-1)).sum(dim=2)  # (B', A, D)
+    v = (tgt_e * w_tgt_n.unsqueeze(-1)).sum(dim=2)
+    u = F.normalize(u, dim=-1, eps=eps)
+    v = F.normalize(v, dim=-1, eps=eps)
+    return (1.0 - (u * v).sum(dim=-1)).mean()
 
 
 # =========================================================
