@@ -658,8 +658,14 @@ def load_dual_anatomy_patch_weights(
             cw = mask_hw_to_patch_weights(curr_hw[cat], aug_params=aug_params)
         except Exception:
             return z, z, False
-        if float(pw.sum()) <= min_weight_sum or float(cw.sum()) <= min_weight_sum:
-            return z, z, False
+        # Tiny structures can vanish after affine/crop. Keep a negligible
+        # mass so the pair stays usable instead of dropping all 22.
+        if float(pw.sum()) <= min_weight_sum:
+            pw = pw.clone()
+            pw[pw.numel() // 2] = float(min_weight_sum)
+        if float(cw.sum()) <= min_weight_sum:
+            cw = cw.clone()
+            cw[cw.numel() // 2] = float(min_weight_sum)
         prior_rows.append(pw)
         curr_rows.append(cw)
 

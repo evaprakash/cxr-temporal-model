@@ -531,6 +531,40 @@ class JEPACombinedDataset(Dataset):
         return " ".join(clauses)
 
     def __getitem__(self, idx):
+        # Init-time anatomy filter only checks JSON category presence.
+        # At load time, RLE decode / affine warp can still leave an
+        # anatomy with ~0 patch mass → inactive. Resample instead of
+        # crashing the whole job.
+        max_tries = 16 if self.require_full_anatomy_masks else 1
+        last_err = None
+        for attempt in range(max_tries):
+            if attempt == 0:
+                cur_idx = int(idx)
+            elif self.train:
+                cur_idx = random.randrange(len(self.df))
+            else:
+                cur_idx = (int(idx) + attempt) % len(self.df)
+
+            try:
+                sample = self._getitem_one(cur_idx)
+            except Exception as exc:
+                last_err = exc
+                continue
+
+            if sample["mask_pool_active"] or not self.require_full_anatomy_masks:
+                return sample
+            last_err = RuntimeError(
+                "dual anatomy weights inactive after warp/decode for "
+                f"dataset={sample['dataset']} "
+                f"(idx={cur_idx})"
+            )
+
+        raise RuntimeError(
+            f"Failed to load an anatomy-complete sample after {max_tries} "
+            f"tries (start idx={idx}). Last error: {last_err}"
+        )
+
+    def _getitem_one(self, idx: int):
         row = self.df.iloc[idx]
         dataset = row["dataset"]
 
@@ -594,13 +628,6 @@ class JEPACombinedDataset(Dataset):
             categories=REQUIRED_CXAS_ANATOMIES,
             aug_params=params,
         )
-        if self.require_full_anatomy_masks and not mask_pool_active:
-            raise RuntimeError(
-                "require_full_anatomy_masks=True but dual anatomy weights "
-                f"inactive for dataset={dataset} "
-                f"prev={row['parent_image_prev']!r} "
-                f"curr={row['parent_image_curr']!r}"
-            )
 
         return {
             "prior_image": prior_img,
