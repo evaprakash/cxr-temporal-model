@@ -40,6 +40,7 @@ from dataset_combined import (
 )
 from progression_phrases import CLS_ORDER, SILVER_TO_CLS
 from silver_masks import (
+    N_PATCHES,
     REQUIRED_CXAS_ANATOMIES,
     default_anatomy_masks_root,
     load_dual_anatomy_patch_weights,
@@ -313,7 +314,8 @@ class JEPACombinedDataset(Dataset):
         splits_file: Optional[str] = None,
         condition_mode: str = "dynamic",
         masks_root: Optional[str] = None,
-        require_full_anatomy_masks: bool = True,
+        require_full_anatomy_masks: bool = False,
+        load_anatomy_masks: Optional[bool] = None,
     ):
         if condition_mode not in CONDITION_MODES:
             raise ValueError(
@@ -328,14 +330,26 @@ class JEPACombinedDataset(Dataset):
         self.splits_file = splits_file or DEFAULT_SPLITS_FILE
         self.condition_mode = condition_mode
         self.require_full_anatomy_masks = bool(require_full_anatomy_masks)
+        # Default: only load anatomy masks when the dataset filters on them.
+        self.load_anatomy_masks = (
+            bool(require_full_anatomy_masks)
+            if load_anatomy_masks is None
+            else bool(load_anatomy_masks)
+        )
         self.masks_root = masks_root or default_anatomy_masks_root()
-        if not os.path.isdir(self.masks_root):
-            print(
-                f"[JEPA dataset] WARNING: anatomy masks_root not found "
-                f"({self.masks_root}); anatomy JEPA will never fire."
-            )
+        if self.load_anatomy_masks:
+            if not os.path.isdir(self.masks_root):
+                print(
+                    f"[JEPA dataset] WARNING: anatomy masks_root not found "
+                    f"({self.masks_root}); anatomy JEPA will never fire."
+                )
+            else:
+                print(f"[JEPA dataset] anatomy masks_root={self.masks_root}")
         else:
-            print(f"[JEPA dataset] anatomy masks_root={self.masks_root}")
+            print(
+                "[JEPA dataset] anatomy masks disabled "
+                "(load_anatomy_masks=False)"
+            )
 
         # ------------------------------------------------------------
         # Load + filter
@@ -615,19 +629,30 @@ class JEPACombinedDataset(Dataset):
             prog_finding, prog_cls_idx = "", 0
 
         # Anatomy dual-mask JEPA: fixed-order 22 CXAS soft masks —
-        # prior masks pool ẑ, current masks pool z_cur.
-        (
-            mask_patch_weights_prior,
-            mask_patch_weights_curr,
-            mask_pool_active,
-        ) = load_dual_anatomy_patch_weights(
-            self.masks_root,
-            dataset,
-            str(row["parent_image_prev"]),
-            str(row["parent_image_curr"]),
-            categories=REQUIRED_CXAS_ANATOMIES,
-            aug_params=params,
-        )
+        # prior masks pool ẑ, current masks pool z_cur. Skipped when
+        # load_anatomy_masks=False (global-pool JEPA runs).
+        if self.load_anatomy_masks:
+            (
+                mask_patch_weights_prior,
+                mask_patch_weights_curr,
+                mask_pool_active,
+            ) = load_dual_anatomy_patch_weights(
+                self.masks_root,
+                dataset,
+                str(row["parent_image_prev"]),
+                str(row["parent_image_curr"]),
+                categories=REQUIRED_CXAS_ANATOMIES,
+                aug_params=params,
+            )
+        else:
+            a = len(REQUIRED_CXAS_ANATOMIES)
+            mask_patch_weights_prior = torch.zeros(
+                a, N_PATCHES, dtype=torch.float32
+            )
+            mask_patch_weights_curr = torch.zeros(
+                a, N_PATCHES, dtype=torch.float32
+            )
+            mask_pool_active = False
 
         return {
             "prior_image": prior_img,

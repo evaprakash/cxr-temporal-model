@@ -6,11 +6,11 @@ averaged across the val set rather than reported for a single sample.
 What gets averaged
 ------------------
 JEPA cosine distance (predictor)
-    ``1 - cos(ẑ_cur, z_cur)`` averaged across patches and val pairs.
-    This is the unit-sphere training loss, so it should closely match
-    the ``val_jepa`` column in ``logs/val_metrics_jepa.csv`` at the
-    resumed epoch (modulo augmentation differences — eval runs without
-    augmentation).
+    ``1 - cos(pool(ẑ_cur), pool(z_cur))`` (global mean-pool then
+    re-normalize). Matches the unit-sphere training loss, so it should
+    closely match the ``val_jepa`` column in
+    ``logs/val_metrics_jepa.csv`` at the resumed epoch (modulo
+    augmentation differences — eval runs without augmentation).
 
 JEPA cosine distance (do-nothing)
     Same metric but with ``ẑ_cur := z_prior`` (i.e., Δz = 0). The
@@ -27,10 +27,9 @@ Slide-deck cos(Δẑ, Δz_true)
     Positive numbers mean the predictor is, on average, picking the
     right direction of change.
 
-Per-patch cosine (predictor / do-nothing)
-    Per-sample mean over the 196 patches of the cosine between
-    predicted-vs-target and prior-vs-target patch features. Sanity
-    check that the absolute prediction quality is reasonable.
+Global-pool cosine (predictor / do-nothing)
+    ``cos(pool(ẑ), pool(z_cur))`` / ``cos(pool(z_prior), pool(z_cur))``.
+    Sanity check that absolute prediction quality is reasonable.
 
 Each metric is reduced **per sample first** and then averaged across
 samples, so each pair contributes equally regardless of batch.
@@ -53,6 +52,7 @@ from tqdm import tqdm
 
 from dataset_combined_jepa import JEPACombinedDataset, jepa_collate_fn
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
+from losses_jepa import global_pool_normalize
 
 
 def main():
@@ -146,9 +146,13 @@ def main():
             z_prior = out["prior_patches"].float()             # (B, N, D)
             B = pred.size(0)
 
-            # Per-patch cosine, averaged over the 196 patches per sample.
-            cos_p = F.cosine_similarity(pred,    target, dim=-1).mean(dim=1)  # (B,)
-            cos_n = F.cosine_similarity(z_prior, target, dim=-1).mean(dim=1)  # (B,)
+            # Global-pool cosine (mean over patches → L2-normalize),
+            # matching ``jepa_cosine_loss`` / progression CE / gold eval.
+            pred_g = global_pool_normalize(pred)
+            target_g = global_pool_normalize(target)
+            prior_g = global_pool_normalize(z_prior)
+            cos_p = (pred_g * target_g).sum(dim=-1)   # (B,)
+            cos_n = (prior_g * target_g).sum(dim=-1)  # (B,)
 
             # Per-sample cosine distance (1 - cos), the training-time loss.
             cos_dist_pred  = 1.0 - cos_p

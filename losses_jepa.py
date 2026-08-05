@@ -7,23 +7,20 @@ in that geometry is cosine — a directional loss that is automatically
 scale-invariant — so this module exposes:
 
   * ``jepa_cosine_loss`` for the main JEPA invariant:
-    ``1 - cos(ẑ_cur, z_cur)`` averaged over patches.
+    global-pool ``ẑ_cur`` and ``z_cur`` over patches, re-normalize, then
+    ``1 - cos(ẑ_global, z_global)``.
   * ``progression_classification_loss`` for the 4th loss: a 5-way CE on
     image-image cosine *logits*, computed from N candidate ``ẑ_cur^c``
-    (one per progression class). This is the train-time analog of the
-    image-image eval rule in ``eval_progression_jepa.py`` —
-    "best match is determined through cos(ẑ_cur, z_cur)" — so the
-    training objective matches what's actually being measured at test
-    time. Supports optional per-class weights (Cui et al. 2019
-    "Class-Balanced Loss Based on Effective Number of Samples") so the
-    minority silver classes (``resolved`` ≈ 1 % of silver) get a
+    (one per progression class). Same global-pool cosine as JEPA, so
+    train rule = test rule. Supports optional per-class weights (Cui et
+    al. 2019 "Class-Balanced Loss Based on Effective Number of Samples")
+    so the minority silver classes (``resolved`` ≈ 1 % of silver) get a
     proportionally larger gradient than the majority ``stable`` class.
-  * ``anatomy_masked_pool_jepa_loss`` for optional dual-mask anatomy JEPA:
-    for each of 22 fixed CXAS anatomies, soft-pool ``ẑ`` with the prior
-    anatomy mask and ``z_cur`` with the current anatomy mask, then take
-    ``1 - cos(u, v)``. Mean over anatomies, then over active pairs.
-    Pairs missing the full 22-mask inventory on either image are omitted.
-    Full-grid JEPA is unchanged.
+  * ``anatomy_masked_pool_jepa_loss`` (optional / off on main): for each
+    of 22 fixed CXAS anatomies, soft-pool ``ẑ`` with the prior anatomy
+    mask and ``z_cur`` with the current anatomy mask, then take
+    ``1 - cos(u, v)``. Kept for ablations; not used when global-pool
+    JEPA is the main objective.
   * ``change_localization_loss`` (legacy / other branches): concentrate
     prior-grid change energy inside a finding mask.
 
@@ -38,28 +35,43 @@ import torch
 import torch.nn.functional as F
 
 
+def global_pool_normalize(
+    patches: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Mean-pool over the patch axis and L2-normalize.
+
+    patches : ``(..., N, D)`` — last two dims are patches × features.
+    Returns ``(..., D)`` unit vectors.
+    """
+    pooled = patches.mean(dim=-2)
+    return F.normalize(pooled, dim=-1, eps=eps)
+
+
 # =========================================================
-# JEPA COSINE LOSS
+# JEPA COSINE LOSS (GLOBAL POOL)
 # =========================================================
 def jepa_cosine_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Per-patch cosine distance between predicted and target patches.
+    """Global-pool cosine distance between predicted and target maps.
 
     pred   : (B, N, D) predictor output (L2-norm, with gradient).
     target : (B, N, D) EMA target encoder output (L2-norm, detached).
 
-    Returns the mean of ``1 - cos(pred, target)`` across batch and
-    patches. Inputs are expected to already be L2-normalized along the
-    feature dim by the model; we still re-normalize defensively so the
-    loss is well-defined even if a caller forgets.
+    Averages patches → one vector per sample, re-normalizes, then returns
+    the mean of ``1 - cos(pred_global, target_global)`` over the batch.
+    This avoids per-patch index matching (registration noise across
+    prior/current grids).
     """
     pred = F.normalize(pred, dim=-1, eps=eps)
     target = F.normalize(target, dim=-1, eps=eps)
-    cos_per_patch = (pred * target).sum(dim=-1)  # (B, N)
-    return (1.0 - cos_per_patch).mean()
+    pred_g = global_pool_normalize(pred, eps=eps)
+    target_g = global_pool_normalize(target, eps=eps)
+    cos = (pred_g * target_g).sum(dim=-1)  # (B,)
+    return (1.0 - cos).mean()
 
 
 # =========================================================
@@ -73,24 +85,22 @@ def progression_classification_loss(
     eps: float = 1e-8,
     class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """5-way image-image cross-entropy on the predictor's candidate latents.
+    """5-way image-image cross-entropy on global-pooled candidate latents.
 
     For each pair ``b`` and progression class ``c``:
 
-        logit[b, c] = mean over patches of cos(ẑ_cur^c[b], z_cur[b])
+        logit[b, c] = cos(pool(ẑ_cur^c[b]), pool(z_cur[b]))
 
-    where ``ẑ_cur^c[b]`` is the predictor's output when conditioned on the
+    where ``pool`` is mean over patches then L2-normalize, and
+    ``ẑ_cur^c[b]`` is the predictor's output when conditioned on the
     class-c prompt ``"{prog_finding[b]} is {class[c]}."`` (computed
     upstream by ``TempCXRJEPA.forward`` running the predictor C times per
     pair). The standard cross-entropy is then applied to
     ``logits / temperature`` against the silver progression label.
 
-    The aggregation is mean-over-patches because the JEPA loss is
-    per-patch cosine averaged over patches — this keeps the
-    classification objective consistent with the regression objective:
-    both are scored on the same per-patch quantity, just rolled up two
-    different ways (regression = average; classification = pick the
-    argmax candidate's average).
+    Same aggregation as ``jepa_cosine_loss`` so the classification
+    objective matches the JEPA regression objective and the image-image
+    eval rule in ``eval_progression_jepa.py``.
 
     Parameters
     ----------
@@ -131,11 +141,11 @@ def progression_classification_loss(
 
     pred = F.normalize(pred_progression_patches, dim=-1, eps=eps)
     target = F.normalize(current_patches_target, dim=-1, eps=eps)
-    # Broadcast target over the candidate-class dim:
-    #   pred   : (B, C, N, D)
-    #   target : (B, 1, N, D)
-    cos_per_patch = (pred * target.unsqueeze(1)).sum(dim=-1)  # (B, C, N)
-    logits = cos_per_patch.mean(dim=-1)                        # (B, C)
+    # pred   : (B, C, N, D) → pool N → (B, C, D)
+    # target : (B, N, D)    → pool N → (B, D)
+    pred_g = global_pool_normalize(pred, eps=eps)
+    target_g = global_pool_normalize(target, eps=eps)
+    logits = (pred_g * target_g.unsqueeze(1)).sum(dim=-1)  # (B, C)
     logits = logits / temperature
 
     return F.cross_entropy(logits, silver_labels, weight=class_weights)
@@ -162,7 +172,7 @@ def anatomy_masked_pool_jepa_loss(
 
     Mean over the A anatomies, then over active batch rows. Inactive
     rows (missing / incomplete 22-mask inventory on prior or current)
-    are omitted. Returns 0 when no row is active. Full-grid
+    are omitted. Returns 0 when no row is active. Full-grid / global-pool
     ``jepa_cosine_loss`` is separate.
     """
     if pred_patches.numel() == 0 or not bool(active.any()):

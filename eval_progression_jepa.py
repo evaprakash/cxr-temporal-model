@@ -18,7 +18,9 @@ This eval mirrors the training-time JEPA invariant exactly:
   4. Batch the predictor across the 5 prompts (same ``z_prior``
      expanded to a batch of 5) to obtain five candidate predictions
      ``ẑ_cur^c`` — one per progression class.
-  5. Score each candidate by ``mean over patches of cos(ẑ_cur^c, z_cur)``.
+  5. Score each candidate by ``cos(pool(ẑ_cur^c), pool(z_cur))``,
+     where ``pool`` is mean over patches then L2-normalize (same as
+     training JEPA / progression CE).
   6. **Predicted class = argmax_c**.
 
 The class whose prompt produced the predicted current latent closest
@@ -58,10 +60,10 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from dataset_combined_jepa import DEFAULT_FINDINGS
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
+from losses_jepa import global_pool_normalize
 from progression_classify import (
     DATASETS,
     DEFAULT_GOLD_PARQUET,
@@ -164,11 +166,11 @@ def score_one_pair(
     Returns
     -------
     prompts          : list[str] (length n_classes) — per-class templated prompts
-    cos_class_scores : list[float] (length n_classes) — mean per-patch
-                       ``cos(ẑ_cur^c, z_cur)`` for each class ``c``
+    cos_class_scores : list[float] (length n_classes) — global-pool
+                       ``cos(pool(ẑ_cur^c), pool(z_cur))`` for each class
     pred_class       : int — argmax over the class scores (index into
                        the supplied ``classes``, not into ``CLS_ORDER``)
-    cos_naive        : float — mean per-patch ``cos(z_prior, z_cur)``,
+    cos_naive        : float — global-pool ``cos(pool(z_prior), pool(z_cur))``,
                        a do-nothing baseline
     """
     prompts, txt_local, token_mask = _encode_prompts(
@@ -192,15 +194,15 @@ def score_one_pair(
     preds = model.predictor(z_prior_b, txt_local, token_mask)
 
     pred_f = preds.float()
-    target_f = z_cur.float().expand_as(pred_f)
-    cos_per_patch = F.cosine_similarity(pred_f, target_f, dim=-1)  # (n_prompts, N)
-    cos_class_scores = cos_per_patch.mean(dim=1).tolist()
+    target_f = z_cur.float()
+    pred_g = global_pool_normalize(pred_f)                  # (n_prompts, D)
+    target_g = global_pool_normalize(target_f)              # (1, D)
+    cos_class_scores = (pred_g * target_g).sum(dim=-1).tolist()
 
     # Do-nothing baseline: would a "predict z_prior" predictor have
     # scored higher than any of these? Useful sanity check.
-    cos_naive = F.cosine_similarity(
-        z_prior.float(), z_cur.float(), dim=-1,
-    ).mean().item()
+    prior_g = global_pool_normalize(z_prior.float())
+    cos_naive = (prior_g * target_g).sum(dim=-1).item()
 
     pred_class = max(range(n_prompts), key=lambda k: cos_class_scores[k])
 
