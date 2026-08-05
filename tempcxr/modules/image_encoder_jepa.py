@@ -45,7 +45,7 @@ from health_multimodal.image.model.pretrained import (
     _download_biovil_t_image_model_weights,
 )
 
-DEBUG = True
+DEBUG = False
 
 
 class BioViLTImageEncoderJEPA(nn.Module):
