@@ -20,8 +20,8 @@ Per CSV row ``(prior_image, current_image, finding, gt_progression)``:
      ``"{Finding} is {class}."``.
   4. Batch the predictor with the same ``z_prior`` and the 3 different
      text prompts to obtain three candidate ``ẑ_cur^c``.
-  5. Score each by ``cos(pool(ẑ_cur^c), pool(z_cur))`` (global pool,
-     same as training / ``eval_progression_jepa.py``).
+  5. Score each candidate (anatomy dual-mask cosine when masks are
+     passed; otherwise mean per-patch cosine).
   6. **Predicted class = argmax_c** over the 3 cosines.
 
 Unlike the legacy ``eval_mscxrt.py`` (which scores predicted patches

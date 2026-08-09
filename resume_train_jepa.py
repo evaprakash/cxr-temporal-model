@@ -4,12 +4,12 @@
 #
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
 #   - Model:    TempCXRJEPA (online + EMA + predictor) — unit-sphere
-#   - Losses:   JEPA global-pool cosine (1 - cos(pool(ẑ), pool(z_cur)))
+#   - Losses:   Anatomy dual-mask JEPA (22 CXAS)
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.99999 in this run) — see the
-#                 ``CBW_*`` constants below.
+#                 (Cui et al. 2019, β=0.99999) with the **same** anatomy
+#                 dual-mask cosine as JEPA
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
@@ -19,10 +19,15 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10,
-# **global-pool JEPA** (``_globalpool`` dir tag): W_JEPA=1.0,
-# W_ANAT_JEPA=0. No anatomy masks / filtering. JEPA and progression CE
-# both score ``cos(mean-pool(ẑ), mean-pool(z_cur))`` after re-normalize
-# — matching gold / MS-CXR-T / CIG eval.
+# **anatomy JEPA + anatomy progression CE**
+# (``_anatjepaonly100_anatprog`` dir tag):
+#   * W_JEPA = 0, W_ANAT_JEPA = 1.0
+#   * Train/val filtered to pairs with full 22-CXAS inventory on BOTH
+#     prior and current under ``filtered_masks_anatomy/``
+#   * Prior anatomy masks pool ``ẑ`` / ``ẑ^c``; current masks pool
+#     ``z_cur``; logit = mean over 22 organ cosines
+#   * Eval must use the same anatomy scoring (see
+#     ``eval_progression_jepa.py`` on this branch)
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -33,7 +38,7 @@
 #   and the model runs the predictor a second time on
 #   ``z_prior.repeat_interleave(5, dim=0)`` with these 5 text conditions
 #   to produce ``ẑ_cur^c`` for each class. The loss is
-#   ``F.cross_entropy(cos(pool(ẑ_cur^c), pool(z_cur)) / τ, silver_label,
+#   ``F.cross_entropy(mean_a cos(u_a^c, v_a) / τ, silver_label,
 #                     weight=class_weights)``.
 
 import os
@@ -244,22 +249,22 @@ WARMUP_RATIO = 0.03
 SAVE_EVERY_N_EPOCHS = 1
 
 # Loss weights (baseline report contrastive = 0.10).
-# Global-pool JEPA: mean-pool patches → cosine (no anatomy masks).
-W_JEPA = 1.0
+# Anatomy-only JEPA: full-grid per-patch JEPA off; dual-mask anatomy @ 1.0.
+W_JEPA = 0.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
 # 4th loss: 5-way image-image CE on the predictor's class-conditioned
-# ẑ_cur. Same magnitude bracket as the two contrastive heads; sweep if
-# it dominates or under-shoots at later epochs.
+# ẑ_cur, scored with the same anatomy dual-mask cosine as JEPA.
 W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
 N_CLS = len(CLS_ORDER)
 
-# Anatomy dual-mask JEPA off for this run (global-pool only).
-W_ANAT_JEPA = 0.0
-USE_ANATOMY_JEPA = False
-REQUIRE_FULL_ANATOMY_MASKS = False
+# Anatomy dual-mask JEPA + anatomy progression CE (22 fixed CXAS).
+W_ANAT_JEPA = 1.0
+USE_ANATOMY_JEPA = True
+USE_ANATOMY_PROG = True
+REQUIRE_FULL_ANATOMY_MASKS = True
 
 # Stratified train/val split when the studies parquet has no 'split'
 # column. Both datasets read/write the same cached splits CSV
@@ -287,9 +292,9 @@ SPLIT_SEED = 42
 #                                       the same non-default value
 #                                       (e.g. rp15 = 0.15)
 #   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
-#   * ``..._globalpool``              — global-pool JEPA + progression CE
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
+#   * ``..._anatprog``                — progression CE uses anatomy pooling
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
 # (pre-4-loss / pre-CBW / mask-JEPA) runs are left untouched as archives.
 def _cbw_beta_tag(beta: float) -> str:
@@ -333,9 +338,8 @@ if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0:
         _SETTING_TAG = f"{_SETTING_TAG}_anatjepaonly{_anat_tag}"
     else:
         _SETTING_TAG = f"{_SETTING_TAG}_anatjepa{_anat_tag}"
-else:
-    # Default main-line similarity: global mean-pool then cosine.
-    _SETTING_TAG = f"{_SETTING_TAG}_globalpool"
+if USE_ANATOMY_PROG:
+    _SETTING_TAG = f"{_SETTING_TAG}_anatprog"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -394,12 +398,15 @@ def _compute_cui_class_weights(dataset, beta: float) -> torch.Tensor:
 # ============================================================
 # DATASETS
 # ============================================================
-if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0:
+_USE_ANATOMY = bool(
+    (USE_ANATOMY_JEPA and W_ANAT_JEPA > 0) or USE_ANATOMY_PROG
+)
+if _USE_ANATOMY:
     try:
         import pycocotools.mask  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
-            "Anatomy JEPA requires pycocotools "
+            "Anatomy JEPA / progression CE requires pycocotools "
             "(pip install pycocotools)."
         ) from exc
     _anat_root = default_anatomy_masks_root()
@@ -408,7 +415,7 @@ if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0:
             f"filtered_masks_anatomy not found at {_anat_root}"
         )
 
-_LOAD_ANATOMY_MASKS = bool(USE_ANATOMY_JEPA and W_ANAT_JEPA > 0)
+_LOAD_ANATOMY_MASKS = _USE_ANATOMY
 
 train_dataset = JEPACombinedDataset(
     image_roots=IMAGE_ROOTS,
@@ -446,11 +453,12 @@ if local_rank == 0:
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
     print(f"[train] log dir:        {LOG_DIR}")
     print(
-        f"[train] global-pool JEPA: W_JEPA={W_JEPA} "
-        f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
+        f"[train] anatomy JEPA+prog: W_JEPA={W_JEPA} "
+        f"W_ANAT_JEPA={W_ANAT_JEPA} USE_ANATOMY_PROG={USE_ANATOMY_PROG} "
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
-        f"(JEPA + progression CE = cos(pool(ẑ), pool(z_cur)))"
+        f"(A={N_ANATOMY_MASKS}; prior mask→ẑ/ẑ^c, current mask→z_cur; "
+        f"logit = mean organ cosine)"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -636,10 +644,7 @@ def compute_jepa_losses(
     Returns: (total, jepa, prior, pred, prog, anatjepa) as scalar tensors.
     """
 
-    # JEPA loss is global-pool cosine; cross-rank gathering doesn't add
-    # useful negatives, so we always compute it on local features. Cast
-    # to fp32 so bf16's low precision on small (1 - cos) residuals doesn't
-    # round to zero late in training.
+    # Optional full-grid per-patch JEPA (unused when W_JEPA=0).
     jepa = jepa_cosine_loss(
         out["pred_current_patches"].float(),
         out["current_patches_target"].float(),
@@ -676,34 +681,23 @@ def compute_jepa_losses(
         current_token_mask,
     )
 
-    # 5-way image-image CE on the predictor's class-conditioned ẑ_cur.
-    # Same global-pool cosine as JEPA (not masked). ``weight=`` uses Cui CBW.
-    prog = progression_classification_loss(
-        out["pred_progression_patches"].float(),
-        out["current_patches_target"].float(),
-        prog_cls_idx,
-        temperature=PROG_TEMP,
-        class_weights=PROG_CLASS_WEIGHTS,
-    )
-
     # Anatomy dual-mask JEPA: prior anatomy → ẑ, current anatomy → z_cur.
-    # When W_JEPA=0 this is the sole JEPA term.
-    if (
-        USE_ANATOMY_JEPA
-        and W_ANAT_JEPA > 0
-        and mask_patch_weights_prior is not None
+    have_anat_masks = (
+        mask_patch_weights_prior is not None
         and mask_patch_weights_curr is not None
         and mask_pool_active is not None
+    )
+    if have_anat_masks and (
+        mask_patch_weights_prior.shape[1] != N_ANATOMY_MASKS
+        or mask_patch_weights_curr.shape[1] != N_ANATOMY_MASKS
     ):
-        if (
-            mask_patch_weights_prior.shape[1] != N_ANATOMY_MASKS
-            or mask_patch_weights_curr.shape[1] != N_ANATOMY_MASKS
-        ):
-            raise ValueError(
-                f"expected A={N_ANATOMY_MASKS} anatomy masks; got "
-                f"prior A={mask_patch_weights_prior.shape[1]} "
-                f"curr A={mask_patch_weights_curr.shape[1]}"
-            )
+        raise ValueError(
+            f"expected A={N_ANATOMY_MASKS} anatomy masks; got "
+            f"prior A={mask_patch_weights_prior.shape[1]} "
+            f"curr A={mask_patch_weights_curr.shape[1]}"
+        )
+
+    if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0 and have_anat_masks:
         anatjepa = anatomy_masked_pool_jepa_loss(
             out["pred_current_patches"].float(),
             out["current_patches_target"].float(),
@@ -713,6 +707,37 @@ def compute_jepa_losses(
         )
     else:
         anatjepa = out["pred_current_patches"].new_zeros(())
+
+    # 5-way image-image CE — anatomy dual-mask cosine when enabled
+    # (same pooling rule as anatomy JEPA). ``weight=`` uses Cui CBW.
+    if USE_ANATOMY_PROG:
+        if not have_anat_masks:
+            raise RuntimeError(
+                "USE_ANATOMY_PROG=True but anatomy masks missing from batch"
+            )
+        if not bool(mask_pool_active.all()):
+            raise RuntimeError(
+                "USE_ANATOMY_PROG=True requires every batch row to have "
+                f"active dual anatomy masks; got "
+                f"{int(mask_pool_active.sum())}/{mask_pool_active.numel()} active"
+            )
+        prog = progression_classification_loss(
+            out["pred_progression_patches"].float(),
+            out["current_patches_target"].float(),
+            prog_cls_idx,
+            temperature=PROG_TEMP,
+            class_weights=PROG_CLASS_WEIGHTS,
+            pred_patch_weights=mask_patch_weights_prior.float(),
+            target_patch_weights=mask_patch_weights_curr.float(),
+        )
+    else:
+        prog = progression_classification_loss(
+            out["pred_progression_patches"].float(),
+            out["current_patches_target"].float(),
+            prog_cls_idx,
+            temperature=PROG_TEMP,
+            class_weights=PROG_CLASS_WEIGHTS,
+        )
 
     total = (
         W_JEPA * jepa

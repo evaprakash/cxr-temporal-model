@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_globalpool
+#SBATCH --job-name=jepa_cbw99999_anatjepaonly100_anatprog
 #SBATCH -p batch
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
@@ -8,26 +8,29 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_globalpool_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_globalpool_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_anatjepaonly100_anatprog_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_anatjepaonly100_anatprog_%j.err
 
 # ============================================================
-# SLURM launcher: global-pool JEPA + progression CE
-# (``cbw99999_globalpool``) on Marlowe project m000081-pm06.
+# SLURM launcher: anatomy JEPA + anatomy progression CE
+# (``cbw99999_anatjepaonly100_anatprog``) on Marlowe m000081-pm06.
 #
-#   * W_JEPA = 1.0 — cos(mean-pool(ẑ), mean-pool(z_cur))
-#   * W_ANAT_JEPA = 0 — no anatomy masks / filtering
-#   * Progression CE uses the same global-pool cosine logits
+#   * W_JEPA = 0
+#   * W_ANAT_JEPA = 1.0 — 22 CXAS dual-mask JEPA
+#     (prior mask → ẑ, current mask → z_cur)
+#   * Progression CE uses the same anatomy dual-mask cosine logits
+#   * Train/val filtered to full 22/22 inventory on BOTH images
 #   * Report contrastive unchanged (W_REPORT_* = 0.1)
 #
 # Layout expected under scratch:
 #   /scratch/m000081-pm06/eprakash/
 #     all_data/
-#     cxr-temporal-model/   (+ CheXTemporal inside)
+#     cxr-temporal-model/   (+ CheXTemporal/filtered_masks_anatomy)
 #     logs/
 #
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
+#     git fetch origin && git checkout experiment/anatomy-jepa-prog-ce
 #     git pull
 #     sbatch resume_train_jepa.sh
 # ============================================================
@@ -75,6 +78,23 @@ do
         echo "[slurm] WARNING: missing image root: $d" >&2
     fi
 done
+
+if [ ! -d "$CHEXTEMPORAL_DIR/filtered_masks_anatomy" ]; then
+    echo "[slurm] ERROR: filtered_masks_anatomy not found under $CHEXTEMPORAL_DIR" >&2
+    exit 1
+fi
+_N_ANAT=$(find "$CHEXTEMPORAL_DIR/filtered_masks_anatomy" -name '*.json' 2>/dev/null | head -5 | wc -l | tr -d ' ')
+if [ "${_N_ANAT}" -lt 1 ]; then
+    echo "[slurm] ERROR: no anatomy mask JSONs under $CHEXTEMPORAL_DIR/filtered_masks_anatomy" >&2
+    exit 1
+fi
+echo "[slurm] filtered_masks_anatomy OK under $CHEXTEMPORAL_DIR"
+
+if ! python -c "import pycocotools.mask" >/dev/null 2>&1; then
+    echo "[slurm] ERROR: pycocotools not importable. pip install pycocotools" >&2
+    exit 1
+fi
+echo "[slurm] pycocotools OK"
 
 mkdir -p "$SCRATCH_BASE/logs"
 

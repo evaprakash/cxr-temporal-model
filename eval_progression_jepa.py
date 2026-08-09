@@ -1,56 +1,28 @@
-"""5-way progression classification via image-image cosine matching.
+"""5-way progression classification via anatomy dual-mask cosine matching.
 
-This eval mirrors the training-time JEPA invariant exactly:
-``cos(ẑ_cur, z_cur)`` on the unit sphere. Per gold row
-``(prior_image, current_image, finding, gt_progression)``:
+This eval mirrors the anatomy JEPA + anatomy progression CE train rule.
+Per gold row ``(prior_image, current_image, finding, gt_progression)``:
 
-  1. Encode the prior image with the **online** image encoder, giving
-     unit-norm patch features ``z_prior``.
-  2. Encode the current image with the **EMA target** image encoder,
-     giving unit-norm patch features ``z_cur`` (detached).
-  3. For each of the 5 progression classes in ``CLS_ORDER`` build a
-     single canonical templated prompt::
-
-         "{Finding} is {class}."
-
-     (matching the templated training condition format). Encode all 5
-     prompts through the text encoder.
-  4. Batch the predictor across the 5 prompts (same ``z_prior``
-     expanded to a batch of 5) to obtain five candidate predictions
-     ``ẑ_cur^c`` — one per progression class.
-  5. Score each candidate by ``cos(pool(ẑ_cur^c), pool(z_cur))``,
-     where ``pool`` is mean over patches then L2-normalize (same as
-     training JEPA / progression CE).
+  1. Encode the prior image with the **online** image encoder → ``z_prior``.
+  2. Encode the current image with the **EMA target** encoder → ``z_cur``.
+  3. For each of the 5 progression classes build
+     ``"{Finding} is {class}."`` and encode via the text encoder.
+  4. Predict ``ẑ_cur^c`` for each class with the temporal predictor.
+  5. Load dual 22-CXAS anatomy masks (prior + current). Soft-pool
+     ``ẑ_cur^c`` with **prior** masks and ``z_cur`` with **current**
+     masks; score = mean over organs of ``cos(u_a^c, v_a)``.
   6. **Predicted class = argmax_c**.
 
-The class whose prompt produced the predicted current latent closest
-to the real current latent wins. This is the image-image inference
-rule, not the image-text rule — the model is now being asked at test
-time exactly the question it was trained on: "given this prior and
-this change description, can you predict the current latent?"
-
-Do-nothing baseline
--------------------
-For each pair we also report ``cos(z_prior, z_cur)``. If every
-``ẑ_cur^c`` scores below this baseline, the predictor's delta was
-worse than predicting "no change" on this pair; if some classes beat
-it and others don't, the per-class margins above the baseline are the
-real discriminative signal.
+Pairs missing the full 22-mask inventory on either image are skipped
+when ``--require-anatomy-masks`` is set (default on this branch).
 
 Usage
 -----
-    # Sanity-check one gold row (random or specific --idx)
-    python eval_progression_jepa.py --demo
-    python eval_progression_jepa.py --demo --idx 17
+    python eval_progression_jepa.py --demo \\
+        --ckpt checkpoints_jepa_dynamic_cbw99999_anatjepaonly100_anatprog/best.pt
 
-    # Full 5-way eval over the gold parquet
-    python eval_progression_jepa.py --eval
-    python eval_progression_jepa.py --eval --limit 200
-
-    # Custom checkpoint and per-dataset image roots
-    python eval_progression_jepa.py --eval \
-        --ckpt checkpoints_jepa_dynamic/epoch_30.pt \
-        --image-root mimic=/data/final_gold_mimic_images
+    python eval_progression_jepa.py --eval \\
+        --ckpt checkpoints_jepa_dynamic_cbw99999_anatjepaonly100_anatprog/best.pt
 """
 
 import argparse
@@ -60,10 +32,11 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from dataset_combined_jepa import DEFAULT_FINDINGS
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
-from losses_jepa import global_pool_normalize
+from losses_jepa import anatomy_dual_mask_cosine
 from progression_classify import (
     DATASETS,
     DEFAULT_GOLD_PARQUET,
@@ -73,6 +46,10 @@ from progression_classify import (
     load_image_tensor,
 )
 from progression_phrases import CLS_ORDER
+from silver_masks import (
+    default_anatomy_masks_root,
+    load_dual_anatomy_patch_weights,
+)
 from tempcxr.modules.jepa import TempCXRJEPA
 
 
@@ -155,23 +132,14 @@ def score_one_pair(
     device: torch.device,
     text_cache: Optional[Dict[str, Tuple]] = None,
     classes: Optional[List[str]] = None,
+    mask_patch_weights_prior: Optional[torch.Tensor] = None,
+    mask_patch_weights_curr: Optional[torch.Tensor] = None,
 ) -> Dict:
     """N-way image-image scoring for ONE (prior, current, finding) row.
 
-    With ``classes=None`` (the default) this runs the full 5-way gold
-    eval. Passing a 3-element subset
-    (``["improving", "stable", "worsening"]``) gives the 3-way variant
-    used by MS-CXR-T / CIG.
-
-    Returns
-    -------
-    prompts          : list[str] (length n_classes) — per-class templated prompts
-    cos_class_scores : list[float] (length n_classes) — global-pool
-                       ``cos(pool(ẑ_cur^c), pool(z_cur))`` for each class
-    pred_class       : int — argmax over the class scores (index into
-                       the supplied ``classes``, not into ``CLS_ORDER``)
-    cos_naive        : float — global-pool ``cos(pool(z_prior), pool(z_cur))``,
-                       a do-nothing baseline
+    With anatomy weights (``(A, N)`` or ``(1, A, N)``), scores each class
+    by mean organ cosine (prior masks on ``ẑ^c``, current on ``z_cur``).
+    Without weights, falls back to mean per-patch cosine.
     """
     prompts, txt_local, token_mask = _encode_prompts(
         model, finding, template, device, text_cache, classes=classes,
@@ -181,28 +149,47 @@ def score_one_pair(
     prior = prior_img.unsqueeze(0).to(device)
     current = current_img.unsqueeze(0).to(device)
 
-    # Encode images once. Encoders already L2-normalize their outputs
-    # along the feature dim, so ``z_prior`` and ``z_cur`` live on the
-    # unit sphere.
     _, z_prior = model.image_encoder(prior)               # (1, N, D)
     _, z_cur = model.target_image_encoder(current)        # (1, N, D)
     z_cur = z_cur.detach()
 
-    # Batch the predictor across all prompts by broadcasting the same
-    # z_prior. delta_z differs per prompt because txt_local does.
     z_prior_b = z_prior.expand(n_prompts, -1, -1).contiguous()
     preds = model.predictor(z_prior_b, txt_local, token_mask)
 
-    pred_f = preds.float()
-    target_f = z_cur.float()
-    pred_g = global_pool_normalize(pred_f)                  # (n_prompts, D)
-    target_g = global_pool_normalize(target_f)              # (1, D)
-    cos_class_scores = (pred_g * target_g).sum(dim=-1).tolist()
+    pred_f = preds.float()          # (C, N, D) after squeeze? actually (n_prompts, N, D)
+    target_f = z_cur.float()        # (1, N, D)
 
-    # Do-nothing baseline: would a "predict z_prior" predictor have
-    # scored higher than any of these? Useful sanity check.
-    prior_g = global_pool_normalize(z_prior.float())
-    cos_naive = (prior_g * target_g).sum(dim=-1).item()
+    use_anat = (
+        mask_patch_weights_prior is not None
+        and mask_patch_weights_curr is not None
+    )
+    if use_anat:
+        w_prior = mask_patch_weights_prior
+        w_curr = mask_patch_weights_curr
+        if w_prior.ndim == 2:
+            w_prior = w_prior.unsqueeze(0)
+        if w_curr.ndim == 2:
+            w_curr = w_curr.unsqueeze(0)
+        w_prior = w_prior.to(device=device, dtype=pred_f.dtype)
+        w_curr = w_curr.to(device=device, dtype=pred_f.dtype)
+        # pred_f is (C, N, D); wrap as batch-1 for einsum helper
+        cos_per_anat = anatomy_dual_mask_cosine(
+            pred_f.unsqueeze(0),   # (1, C, N, D)
+            target_f,              # (1, N, D)
+            w_prior,               # (1, A, N)
+            w_curr,                # (1, A, N)
+        )  # (1, C, A)
+        cos_class_scores = cos_per_anat[0].mean(dim=-1).tolist()
+        cos_naive = anatomy_dual_mask_cosine(
+            z_prior.float(), target_f, w_prior, w_curr,
+        )[0].mean().item()
+    else:
+        target_exp = target_f.expand_as(pred_f)
+        cos_per_patch = F.cosine_similarity(pred_f, target_exp, dim=-1)
+        cos_class_scores = cos_per_patch.mean(dim=1).tolist()
+        cos_naive = F.cosine_similarity(
+            z_prior.float(), z_cur.float(), dim=-1,
+        ).mean().item()
 
     pred_class = max(range(n_prompts), key=lambda k: cos_class_scores[k])
 
@@ -211,6 +198,7 @@ def score_one_pair(
         "cos_class_scores": cos_class_scores,
         "pred_class": pred_class,
         "cos_naive": cos_naive,
+        "used_anatomy": use_anat,
     }
 
 
@@ -243,14 +231,30 @@ def run_demo(args, model, gold_df, device):
         row["dataset"], row["parent_image_curr"], args.image_roots,
     )
 
+    w_prior, w_curr, active = load_dual_anatomy_patch_weights(
+        args.masks_root,
+        str(row["dataset"]),
+        str(row["parent_image_prev"]),
+        str(row["parent_image_curr"]),
+        aug_params=None,
+    )
+    if args.require_anatomy_masks and not active:
+        raise RuntimeError(
+            "Demo row is missing full dual anatomy masks. "
+            f"masks_root={args.masks_root}"
+        )
+
     out = score_one_pair(
         model, prior, current, finding, args.prompt_template, device,
+        mask_patch_weights_prior=w_prior if active else None,
+        mask_patch_weights_curr=w_curr if active else None,
     )
     best = out["pred_class"]
     pred_label = CLS_ORDER[best]
     naive = out["cos_naive"]
+    rule = "anatomy dual-mask" if out["used_anatomy"] else "per-patch mean"
 
-    print("\nPer-class cos(ẑ_cur^c, z_cur) (mean over patches):")
+    print(f"\nPer-class cos(ẑ_cur^c, z_cur) ({rule}):")
     print(f"  {'class':<10}  {'prompt':<40}  {'cos':>8}  {'Δ vs naive':>10}")
     for k, cls in enumerate(CLS_ORDER):
         marker = "  <-- argmax" if k == best else ""
@@ -261,7 +265,7 @@ def run_demo(args, model, gold_df, device):
             f"{score:>+8.4f}  {delta:>+10.4f}{marker}"
         )
     print(
-        f"\n  do-nothing baseline (cos(z_prior, z_cur)) = {naive:+.4f}"
+        f"\n  do-nothing baseline (same scoring rule) = {naive:+.4f}"
     )
     print(
         f"\n  Prediction: {pred_label:<10}  vs gt {gt_label:<10}  "
@@ -507,6 +511,11 @@ def run_eval(args, model, gold_df, device):
     print(
         f"[eval] one prompt per class (template: {args.prompt_template!r})"
     )
+    print(
+        f"[eval] anatomy masks_root={args.masks_root} "
+        f"require_anatomy_masks={args.require_anatomy_masks}"
+    )
+    n_skip_masks = 0
 
     for i in range(len(gold_df)):
         row = gold_df.iloc[i]
@@ -525,9 +534,27 @@ def run_eval(args, model, gold_df, device):
                 print(f"[eval] skipping row {i} (missing image: {e})")
             continue
 
+        w_prior, w_curr, active = load_dual_anatomy_patch_weights(
+            args.masks_root,
+            str(row["dataset"]),
+            str(row["parent_image_prev"]),
+            str(row["parent_image_curr"]),
+            aug_params=None,
+        )
+        if args.require_anatomy_masks and not active:
+            n_skip_masks += 1
+            if n_skip_masks <= 5:
+                print(
+                    f"[eval] skipping row {i} "
+                    f"(incomplete dual anatomy masks)"
+                )
+            continue
+
         out = score_one_pair(
             model, prior, current, finding, args.prompt_template, device,
             text_cache=text_cache,
+            mask_patch_weights_prior=w_prior if active else None,
+            mask_patch_weights_curr=w_curr if active else None,
         )
         pred_idx = out["pred_class"]
         pred_label = CLS_ORDER[pred_idx]
@@ -560,6 +587,10 @@ def run_eval(args, model, gold_df, device):
 
     if skipped:
         print(f"\nSkipped {skipped} rows due to missing images")
+    if n_skip_masks:
+        print(
+            f"Skipped {n_skip_masks} rows due to incomplete anatomy masks"
+        )
 
     _print_eval_summary(
         n_correct=n_correct,
@@ -633,6 +664,20 @@ def main():
              "Example: --image-root mimic=/data/final_gold_mimic_images. "
              "Defaults: final_gold_<dataset>_images/ next to the gold "
              "parquet if present, else IMAGE_ROOTS from infer_jepa.py.",
+    )
+    parser.add_argument(
+        "--masks-root",
+        default=os.environ.get(
+            "JEPA_ANATOMY_MASKS_ROOT", default_anatomy_masks_root()
+        ),
+        help="Root of filtered_masks_anatomy/ (22 CXAS dual masks).",
+    )
+    parser.add_argument(
+        "--require-anatomy-masks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip gold rows without full dual 22-mask inventory "
+             "(default: true on this anatomy branch).",
     )
 
     mode = parser.add_mutually_exclusive_group(required=True)

@@ -40,10 +40,10 @@ condition, and returns ``pred_progression_patches`` of shape
 encoders through this second predictor pass.
 
 Losses (computed by the caller):
-    - JEPA cosine                              : 1 − cos(pool(ẑ_cur), pool(z_cur))
+    - Anatomy JEPA                             : mean_a (1 − cos(u_a, v_a))
     - GLoRIA local contrastive                 : z_prior ↔ τ_prior
     - GLoRIA local contrastive                 : ẑ_cur ↔ τ_current
-    - Progression classification (5-way CE)    : argmax_c cos(pool(ẑ_cur^c), pool(z_cur))
+    - Progression classification (5-way CE)    : argmax_c mean_a cos(u_a^c, v_a)
 """
 
 import copy

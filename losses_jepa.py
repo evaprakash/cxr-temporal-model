@@ -6,23 +6,17 @@ along the feature dim inside the model's forward pass. The natural loss
 in that geometry is cosine — a directional loss that is automatically
 scale-invariant — so this module exposes:
 
-  * ``jepa_cosine_loss`` for the main JEPA invariant:
-    global-pool ``ẑ_cur`` and ``z_cur`` over patches, re-normalize, then
-    ``1 - cos(ẑ_global, z_global)``.
-  * ``progression_classification_loss`` for the 4th loss: a 5-way CE on
-    image-image cosine *logits*, computed from N candidate ``ẑ_cur^c``
-    (one per progression class). Same global-pool cosine as JEPA, so
-    train rule = test rule. Supports optional per-class weights (Cui et
-    al. 2019 "Class-Balanced Loss Based on Effective Number of Samples")
-    so the minority silver classes (``resolved`` ≈ 1 % of silver) get a
-    proportionally larger gradient than the majority ``stable`` class.
-  * ``anatomy_masked_pool_jepa_loss`` (optional / off on main): for each
-    of 22 fixed CXAS anatomies, soft-pool ``ẑ`` with the prior anatomy
-    mask and ``z_cur`` with the current anatomy mask, then take
-    ``1 - cos(u, v)``. Kept for ablations; not used when global-pool
-    JEPA is the main objective.
-  * ``change_localization_loss`` (legacy / other branches): concentrate
-    prior-grid change energy inside a finding mask.
+  * ``jepa_cosine_loss`` — per-patch ``1 - cos(ẑ, z_cur)`` (legacy /
+    optional full-grid term; anatomy runs typically set ``W_JEPA=0``).
+  * ``anatomy_masked_pool_jepa_loss`` — dual-mask anatomy JEPA: for each
+    of 22 fixed CXAS anatomies, soft-pool ``ẑ`` with the **prior**
+    anatomy mask and ``z_cur`` with the **current** anatomy mask, then
+    ``1 - cos(u, v)``. Mean over anatomies, then over active pairs.
+  * ``progression_classification_loss`` — 5-way CE. With anatomy weights,
+    logit = mean over 22 organs of ``cos(u_a^c, v_a)`` (prior masks on
+    ``ẑ^c``, current masks on ``z_cur``). Without weights, falls back to
+    mean per-patch cosine (original rule).
+  * ``change_localization_loss`` (legacy / other branches).
 
 The contrastive (GLoRIA) losses live in ``losses.py`` and are reused
 unchanged; they re-L2-normalize their inputs internally, so passing
@@ -48,30 +42,74 @@ def global_pool_normalize(
     return F.normalize(pooled, dim=-1, eps=eps)
 
 
+def anatomy_dual_mask_cosine(
+    pred_patches: torch.Tensor,
+    target_patches: torch.Tensor,
+    pred_patch_weights: torch.Tensor,
+    target_patch_weights: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Per-anatomy cosine after dual-mask soft pooling.
+
+    pred_patches         : ``(B, N, D)`` or ``(B, C, N, D)``
+    target_patches       : ``(B, N, D)``
+    pred_patch_weights   : ``(B, A, N)`` — prior-grid masks (pool ``ẑ``)
+    target_patch_weights : ``(B, A, N)`` — current-grid masks (pool ``z_cur``)
+
+    Returns
+    -------
+    ``(B, A)`` if pred is ``(B, N, D)``, or ``(B, C, A)`` if pred is
+    ``(B, C, N, D)``.
+    """
+    pred = F.normalize(pred_patches, dim=-1, eps=eps)
+    target = F.normalize(target_patches, dim=-1, eps=eps)
+    w_pred = pred_patch_weights.to(device=pred.device, dtype=pred.dtype).clamp(min=0.0)
+    w_tgt = target_patch_weights.to(device=pred.device, dtype=pred.dtype).clamp(min=0.0)
+
+    w_pred_n = w_pred / w_pred.sum(dim=-1, keepdim=True).clamp(min=eps)
+    w_tgt_n = w_tgt / w_tgt.sum(dim=-1, keepdim=True).clamp(min=eps)
+
+    # v: (B, A, D) — current anatomy summaries
+    v = torch.einsum("ban,bnd->bad", w_tgt_n, target)
+    v = F.normalize(v, dim=-1, eps=eps)
+
+    if pred.ndim == 3:
+        # u: (B, A, D)
+        u = torch.einsum("ban,bnd->bad", w_pred_n, pred)
+        u = F.normalize(u, dim=-1, eps=eps)
+        return (u * v).sum(dim=-1)  # (B, A)
+
+    if pred.ndim == 4:
+        # u: (B, C, A, D)
+        u = torch.einsum("ban,bcnd->bcad", w_pred_n, pred)
+        u = F.normalize(u, dim=-1, eps=eps)
+        return (u * v.unsqueeze(1)).sum(dim=-1)  # (B, C, A)
+
+    raise ValueError(
+        f"pred_patches must be (B,N,D) or (B,C,N,D); got {tuple(pred.shape)}"
+    )
+
+
 # =========================================================
-# JEPA COSINE LOSS (GLOBAL POOL)
+# JEPA COSINE LOSS (PER-PATCH — LEGACY / OPTIONAL FULL-GRID)
 # =========================================================
 def jepa_cosine_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Global-pool cosine distance between predicted and target maps.
+    """Per-patch cosine distance between predicted and target patches.
 
     pred   : (B, N, D) predictor output (L2-norm, with gradient).
     target : (B, N, D) EMA target encoder output (L2-norm, detached).
 
-    Averages patches → one vector per sample, re-normalizes, then returns
-    the mean of ``1 - cos(pred_global, target_global)`` over the batch.
-    This avoids per-patch index matching (registration noise across
-    prior/current grids).
+    Returns the mean of ``1 - cos(pred, target)`` across batch and
+    patches. Anatomy runs typically leave this unused (``W_JEPA=0``).
     """
     pred = F.normalize(pred, dim=-1, eps=eps)
     target = F.normalize(target, dim=-1, eps=eps)
-    pred_g = global_pool_normalize(pred, eps=eps)
-    target_g = global_pool_normalize(target, eps=eps)
-    cos = (pred_g * target_g).sum(dim=-1)  # (B,)
-    return (1.0 - cos).mean()
+    cos_per_patch = (pred * target).sum(dim=-1)  # (B, N)
+    return (1.0 - cos_per_patch).mean()
 
 
 # =========================================================
@@ -84,75 +122,42 @@ def progression_classification_loss(
     temperature: float = 0.1,
     eps: float = 1e-8,
     class_weights: Optional[torch.Tensor] = None,
+    pred_patch_weights: Optional[torch.Tensor] = None,   # (B, A, N) prior
+    target_patch_weights: Optional[torch.Tensor] = None, # (B, A, N) curr
 ) -> torch.Tensor:
-    """5-way image-image cross-entropy on global-pooled candidate latents.
+    """5-way image-image cross-entropy on candidate latents.
 
-    For each pair ``b`` and progression class ``c``:
+    Without anatomy weights (default)::
 
-        logit[b, c] = cos(pool(ẑ_cur^c[b]), pool(z_cur[b]))
+        logit[b, c] = mean_p cos(ẑ_cur^c[b, p], z_cur[b, p])
 
-    where ``pool`` is mean over patches then L2-normalize, and
-    ``ẑ_cur^c[b]`` is the predictor's output when conditioned on the
-    class-c prompt ``"{prog_finding[b]} is {class[c]}."`` (computed
-    upstream by ``TempCXRJEPA.forward`` running the predictor C times per
-    pair). The standard cross-entropy is then applied to
-    ``logits / temperature`` against the silver progression label.
+    With dual anatomy masks (prior on ``ẑ^c``, current on ``z_cur``)::
 
-    Same aggregation as ``jepa_cosine_loss`` so the classification
-    objective matches the JEPA regression objective and the image-image
-    eval rule in ``eval_progression_jepa.py``.
+        logit[b, c] = mean_a cos(u_a^c, v_a)
 
-    Parameters
-    ----------
-    pred_progression_patches
-        ``(B, C, N, D)``. The predictor's ``ẑ_cur^c`` for each pair and
-        candidate class. Already L2-normalized by the predictor's final
-        renormalization; we re-normalize defensively.
-    current_patches_target
-        ``(B, N, D)``. The EMA target encoder's ``z_cur``, detached
-        (stop-grad).
-    silver_labels
-        ``(B,)`` integers in ``[0, C)``. The silver-derived progression
-        class index for the per-pair ``prog_finding``.
-    temperature
-        Softmax temperature. Cosine logits live in ``[-1, 1]``, so
-        ``temperature=0.1`` gives an effective ``[-10, 10]`` logit range
-        — peaky enough to be discriminative without saturating.
-    eps
-        L2-normalization numeric stability epsilon.
-    class_weights
-        Optional ``(C,)`` float tensor of per-class weights forwarded to
-        ``F.cross_entropy(..., weight=class_weights)``. Intended for
-        class-balanced re-weighting of the CE — e.g. the effective-
-        number-of-samples scheme (Cui et al. 2019) that up-weights rare
-        silver classes (``resolved`` at 1 % of silver would otherwise
-        contribute negligible gradient). When ``None`` (default) the
-        loss reduces to standard unweighted CE.
-
-    Returns
-    -------
-    Scalar CE loss tensor on the same device as ``pred_progression_patches``.
-    Returns 0 if the batch carries no candidates (degenerate edge case
-    that shouldn't fire in practice but lets the trainer keep a single
-    code path).
+    where ``u_a^c`` / ``v_a`` are soft-mask-pooled organ summaries.
     """
     if pred_progression_patches.numel() == 0:
         return pred_progression_patches.new_zeros(())
 
     pred = F.normalize(pred_progression_patches, dim=-1, eps=eps)
     target = F.normalize(current_patches_target, dim=-1, eps=eps)
-    # pred   : (B, C, N, D) → pool N → (B, C, D)
-    # target : (B, N, D)    → pool N → (B, D)
-    pred_g = global_pool_normalize(pred, eps=eps)
-    target_g = global_pool_normalize(target, eps=eps)
-    logits = (pred_g * target_g.unsqueeze(1)).sum(dim=-1)  # (B, C)
-    logits = logits / temperature
 
+    if pred_patch_weights is not None and target_patch_weights is not None:
+        cos_per_anat = anatomy_dual_mask_cosine(
+            pred, target, pred_patch_weights, target_patch_weights, eps=eps,
+        )  # (B, C, A)
+        logits = cos_per_anat.mean(dim=-1)  # (B, C)
+    else:
+        cos_per_patch = (pred * target.unsqueeze(1)).sum(dim=-1)  # (B, C, N)
+        logits = cos_per_patch.mean(dim=-1)  # (B, C)
+
+    logits = logits / temperature
     return F.cross_entropy(logits, silver_labels, weight=class_weights)
 
 
 # =========================================================
-# ANATOMY DUAL-MASK POOLED JEPA (22 FIXED CXAS, ADD-ON)
+# ANATOMY DUAL-MASK POOLED JEPA (22 FIXED CXAS)
 # =========================================================
 def anatomy_masked_pool_jepa_loss(
     pred_patches: torch.Tensor,          # (B, N, D) dynamic-conditioned ẑ_cur
@@ -172,18 +177,17 @@ def anatomy_masked_pool_jepa_loss(
 
     Mean over the A anatomies, then over active batch rows. Inactive
     rows (missing / incomplete 22-mask inventory on prior or current)
-    are omitted. Returns 0 when no row is active. Full-grid / global-pool
-    ``jepa_cosine_loss`` is separate.
+    are omitted. Returns 0 when no row is active.
     """
     if pred_patches.numel() == 0 or not bool(active.any()):
         return pred_patches.new_zeros(())
 
     w_pred = pred_patch_weights.to(
         device=pred_patches.device, dtype=pred_patches.dtype
-    ).clamp(min=0.0)
+    )
     w_tgt = target_patch_weights.to(
         device=pred_patches.device, dtype=pred_patches.dtype
-    ).clamp(min=0.0)
+    )
 
     if w_pred.ndim != 3 or w_tgt.ndim != 3:
         raise ValueError(
@@ -206,26 +210,14 @@ def anatomy_masked_pool_jepa_loss(
         )
 
     active = active.to(device=pred_patches.device).bool()
-    pred = pred_patches[active]          # (B', N, D)
-    target = target_patches[active]
-    w_pred = w_pred[active]              # (B', A, N)
-    w_tgt = w_tgt[active]
-
-    # Broadcast patches over anatomy: (B', A, N, D)
-    a = w_pred.shape[1]
-    pred_e = pred.unsqueeze(1).expand(-1, a, -1, -1)
-    tgt_e = target.unsqueeze(1).expand(-1, a, -1, -1)
-
-    w_pred_sum = w_pred.sum(dim=-1, keepdim=True).clamp(min=eps)
-    w_tgt_sum = w_tgt.sum(dim=-1, keepdim=True).clamp(min=eps)
-    w_pred_n = w_pred / w_pred_sum
-    w_tgt_n = w_tgt / w_tgt_sum
-
-    u = (pred_e * w_pred_n.unsqueeze(-1)).sum(dim=2)  # (B', A, D)
-    v = (tgt_e * w_tgt_n.unsqueeze(-1)).sum(dim=2)
-    u = F.normalize(u, dim=-1, eps=eps)
-    v = F.normalize(v, dim=-1, eps=eps)
-    return (1.0 - (u * v).sum(dim=-1)).mean()
+    cos = anatomy_dual_mask_cosine(
+        pred_patches[active],
+        target_patches[active],
+        w_pred[active],
+        w_tgt[active],
+        eps=eps,
+    )  # (B', A)
+    return (1.0 - cos).mean()
 
 
 # =========================================================
@@ -250,8 +242,6 @@ def change_localization_loss(
     ``w`` is the downsampled float finding-mask coverage on the **prior**
     image (ẑ / z_prior live on the prior patch grid). Inactive rows are
     omitted from the mean. Returns 0 when no row is active.
-    Full-grid ``jepa_cosine_loss`` is separate — this does **not** match
-    ẑ to z_cur appearance.
     """
     if pred_patches.numel() == 0 or not bool(active.any()):
         return pred_patches.new_zeros(())
