@@ -6,8 +6,11 @@ Matches the ``experiment/anatomy-jepa-prog-ce`` train rule:
   * prior CXAS anatomy masks soft-pool ``ẑ^c``
   * current masks soft-pool ``z_cur``
   * logit = mean cosine over the 22 ``REQUIRED_CXAS_ANATOMIES``
-  * only pairs where **both** images have the full 22-category inventory
-    (same keep rule as training ``require_full_anatomy_masks``)
+  * only pairs where **both** images pass the same keep rules used to
+    build silver ``filtered_masks_anatomy``:
+      - ``min_key_hits`` major-anatomy QC (default 8/10)
+      - full allowed CXAS inventory (22 train anatomies, non-empty mass)
+      - optional ``--strict`` geometric QC
 
 Gold CXAS masks (from ``run_cxas_gold.sh`` in mask_silver /
 ChestXRayAnatomySegmentation) live under::
@@ -67,9 +70,16 @@ from progression_classify import (
     load_image_tensor,
 )
 from progression_phrases import CLS_ORDER
+from filter_masks_by_anatomy_map import (
+    KEY_CLASSES_FOR_QC,
+    allowed_cxas_categories,
+    compute_key_hits,
+    filter_mask_json,
+    passes_strict_filter,
+)
 from silver_masks import (
+    N_PATCHES,
     REQUIRED_CXAS_ANATOMIES,
-    anatomy_categories_present,
     load_per_category_masks_hw,
     mask_hw_to_patch_weights,
 )
@@ -106,32 +116,36 @@ def dataset_masks_root(gold_masks_base: str, dataset: str) -> Path:
 # Path resolution for gold CXAS JSONs
 # ---------------------------------------------------------------------------
 class GoldMaskIndex:
-    """Lazy index over one dataset's ``final_gold_{ds}_masks`` tree."""
+    """Lazy index over one dataset's ``final_gold_{ds}_masks`` tree.
+
+    Important: CheXpert stems are often the non-unique ``view1_frontal``.
+    We never resolve by bare stem when that would be ambiguous — only by
+    full relative path, unique basename, or mega-COCO ``file_name``.
+    """
 
     def __init__(self, root: Path):
         self.root = root
-        self._stem_to_path: Optional[Dict[str, Path]] = None
-        self._mega: Optional[dict] = None  # parsed mega COCO, if any
-        self._mega_by_key: Optional[Dict[str, int]] = None  # key -> image_id
+        self._rel_to_path: Optional[Dict[str, Path]] = None
+        self._basename_to_paths: Optional[Dict[str, List[Path]]] = None
+        self._mega: Optional[dict] = None
+        self._mega_by_key: Optional[Dict[str, int]] = None
         self._tmpdir: Optional[tempfile.TemporaryDirectory] = None
         self._extracted: Dict[int, Path] = {}
 
-    def _ensure_stem_index(self) -> None:
-        if self._stem_to_path is not None:
+    def _ensure_file_index(self) -> None:
+        if self._rel_to_path is not None:
             return
-        self._stem_to_path = {}
+        self._rel_to_path = {}
+        self._basename_to_paths = defaultdict(list)
         if not self.root.is_dir():
             return
         for p in self.root.rglob("*.json"):
-            # Prefer unique stems; if collision, keep first and also
-            # index by path-relative key without suffix.
-            stem = p.stem
-            self._stem_to_path.setdefault(stem, p)
             try:
-                rel = str(p.relative_to(self.root).with_suffix(""))
+                rel = str(p.relative_to(self.root).with_suffix("")).replace("\\", "/")
             except ValueError:
-                rel = stem
-            self._stem_to_path.setdefault(rel.replace("\\", "/"), p)
+                rel = p.stem
+            self._rel_to_path[rel] = p
+            self._basename_to_paths[p.name].append(p)
 
     def _ensure_mega(self) -> None:
         if self._mega_by_key is not None:
@@ -142,83 +156,86 @@ class GoldMaskIndex:
             return
         # Stock cxas_segment on a directory writes one JSON named after
         # the input folder, e.g. final_gold_chexpert_images.json.
-        candidates = sorted(self.root.glob("*.json"))
-        mega = None
-        for p in candidates:
+        for p in sorted(self.root.glob("*.json")):
             try:
                 with p.open() as f:
                     doc = json.load(f)
             except Exception:
                 continue
             images = doc.get("images") or []
-            # Flatten CXAS process_file quirk: images may be [[{...}]]
             flat = []
             for im in images:
                 if isinstance(im, list):
                     flat.extend(x for x in im if isinstance(x, dict))
                 elif isinstance(im, dict):
                     flat.append(im)
-            if len(flat) >= 2 and doc.get("annotations"):
-                mega = doc
-                mega["_flat_images"] = flat
-                self._mega = mega
-                for im in flat:
-                    fn = str(im.get("file_name", ""))
-                    iid = int(im["id"])
-                    stem = Path(fn).stem
-                    self._mega_by_key.setdefault(stem, iid)
-                    self._mega_by_key.setdefault(fn, iid)
-                    self._mega_by_key.setdefault(Path(fn).name, iid)
-                break
+            if len(flat) < 2 or not doc.get("annotations"):
+                continue
+            doc["_flat_images"] = flat
+            self._mega = doc
+            for im in flat:
+                fn = str(im.get("file_name", "")).replace("\\", "/")
+                iid = int(im["id"])
+                # Index unique keys only — never bare stem (collides).
+                self._mega_by_key[fn] = iid
+                self._mega_by_key[Path(fn).name] = iid
+                stem_path = str(Path(fn).with_suffix("")).replace("\\", "/")
+                self._mega_by_key[stem_path] = iid
+            break
 
     def resolve_json_path(self, parent_image: str) -> Optional[Path]:
         """Return a on-disk single-image COCO JSON for ``parent_image``."""
-        rel = str(parent_image).strip().lstrip("/")
-        stem = Path(rel).stem
-        name = Path(rel).name
-
-        self._ensure_stem_index()
-        assert self._stem_to_path is not None
-
-        # 1) Direct / mirrored candidates under the dataset mask root.
-        candidates = [
-            self.root / f"{stem}.json",
-            self.root / name.replace(Path(name).suffix, ".json"),
-            self.root / Path(rel).with_suffix(".json"),
-            self.root / rel,
-        ]
-        # strip leading dataset/ prefixes sometimes present
+        rel = str(parent_image).strip().lstrip("/").replace("\\", "/")
         for prefix in ("chexpert/train/", "chexpert/", "mimic/", "rexgradient/"):
             if rel.startswith(prefix):
-                candidates.append(self.root / Path(rel[len(prefix):]).with_suffix(".json"))
-        for c in candidates:
-            if c.is_file():
-                return c
+                rel = rel[len(prefix):]
+                break
+        rel_nosuffix = str(Path(rel).with_suffix("")).replace("\\", "/")
+        name_json = Path(rel).with_suffix(".json").name
 
-        # 2) Stem / relative-key index from rglob.
-        for key in (stem, str(Path(rel).with_suffix("")).replace("\\", "/")):
-            hit = self._stem_to_path.get(key)
+        self._ensure_file_index()
+        assert self._rel_to_path is not None and self._basename_to_paths is not None
+
+        # 1) Exact relative path (mirrored tree) — unambiguous.
+        for key in (rel_nosuffix, rel):
+            hit = self._rel_to_path.get(key)
             if hit is not None and hit.is_file():
-                # Skip mega files (many images) — handled below.
-                if hit.stat().st_size > 50_000_000:
-                    continue
                 return hit
+        direct = self.root / Path(rel).with_suffix(".json")
+        if direct.is_file():
+            return direct
 
-        # 3) Mega COCO: extract one image's annotations to a temp JSON.
+        # 2) Unique basename only (e.g. unique dicom_id.json). Never use
+        #    CheXpert-style colliding stems even if only one file remains
+        #    on disk (overwrites would silently reuse the wrong mask).
+        _COLLIDING = {"view1_frontal", "view2_frontal", "view1_lateral",
+                      "view2_lateral", "view3_frontal"}
+        hits = self._basename_to_paths.get(name_json, [])
+        if (
+            Path(name_json).stem not in _COLLIDING
+            and len(hits) == 1
+            and hits[0].is_file()
+        ):
+            return hits[0]
+
+        # 3) Mega COCO: match full relative file_name, not bare stem.
         self._ensure_mega()
         if self._mega is None:
             return None
         iid = None
-        for key in (stem, name, rel, Path(rel).name):
+        for key in (rel, Path(rel).name, rel_nosuffix, name_json):
             if key in self._mega_by_key:
                 iid = self._mega_by_key[key]
                 break
         if iid is None:
-            # endswith match on file_name
-            for k, v in self._mega_by_key.items():
-                if k.endswith(name) or k.endswith(rel):
-                    iid = v
-                    break
+            # Unique endswith on full relative path (not stem alone).
+            matches = [
+                v for k, v in self._mega_by_key.items()
+                if k.endswith("/" + Path(rel).name) or k.endswith(rel)
+            ]
+            uniq = list(dict.fromkeys(matches))
+            if len(uniq) == 1:
+                iid = uniq[0]
         if iid is None:
             return None
         return self._extract_mega_image(iid)
@@ -257,23 +274,89 @@ def get_index(masks_root: Path) -> GoldMaskIndex:
     return _INDEX_CACHE[key]
 
 
+def _load_json(path: Path) -> dict:
+    with path.open() as f:
+        return json.load(f)
+
+
+def passes_silver_anatomy_filter(
+    mask_data: dict,
+    min_key_hits: int = 8,
+    strict: bool = False,
+) -> Tuple[bool, str]:
+    """Same keep rules as ``filter_masks_by_anatomy_map.py`` (default mode).
+
+    1. ``compute_key_hits`` >= ``min_key_hits`` (default 8 / 10 majors)
+    2. Every allowed CXAS class for the fixed medgemma inventory is present
+    3. Optional ``--strict`` geometric QC
+    """
+    if min_key_hits > 0:
+        hits = compute_key_hits(mask_data)
+        if hits < min_key_hits:
+            return False, f"key_hits({hits}<{min_key_hits})"
+
+    if strict:
+        ok, reason = passes_strict_filter(mask_data)
+        if not ok:
+            return False, f"strict:{reason}"
+
+    allowed = allowed_cxas_categories()
+    _filtered, _present, missing = filter_mask_json(mask_data, allowed)
+    if missing:
+        # Also require the exact 22 used at train time.
+        return False, f"missing_cxas({len(missing)})"
+
+    # Train-time inventory is REQUIRED_CXAS_ANATOMIES (22). Enforce both
+    # the filter-script allowed set and that 22-tuple.
+    present_names = {
+        c["name"]
+        for c in mask_data.get("categories", [])
+        if "name" in c
+    }
+    # Categories listed is not enough — need at least one annotation each.
+    id_to_name = {
+        int(c["id"]): str(c["name"])
+        for c in (mask_data.get("categories") or [])
+        if "id" in c and "name" in c
+    }
+    annotated = set()
+    for ann in mask_data.get("annotations") or []:
+        seg = ann.get("segmentation")
+        if seg is None or isinstance(seg, list):
+            continue
+        name = id_to_name.get(int(ann.get("category_id", -1)))
+        if name is not None:
+            annotated.add(name)
+    missing_22 = [c for c in REQUIRED_CXAS_ANATOMIES if c not in annotated]
+    if missing_22:
+        return False, f"missing_22({missing_22[0]})"
+
+    # Non-empty mask mass for each of the 22 (raw CXAS often emits empty RLEs).
+    try:
+        # Write a tiny temp view isn't needed — decode via helper below in
+        # caller. Here just check annotation presence; mass checked after decode.
+        _ = present_names
+    except Exception:
+        pass
+    return True, "ok"
+
+
 def load_gold_dual_anatomy_weights(
     gold_masks_base: str,
     dataset: str,
     parent_image_prev: str,
     parent_image_curr: str,
+    min_key_hits: int = 8,
+    strict: bool = False,
     min_weight_sum: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, bool, str]:
     """Load dual 22-CXAS patch weights for a gold pair.
 
-    Returns ``(prior_w, curr_w, active, reason)``. ``active`` is True only
-    when both JSONs exist and contain every ``REQUIRED_CXAS_ANATOMIES``
-    category with decodable RLE mass after resize/crop (same keep rule as
-    training ``load_dual_anatomy_patch_weights`` / full inventory filter).
+    Applies the **same keep rules** as silver ``filter_masks_by_anatomy_map``
+    (key-hits QC + full allowed CXAS inventory) on **both** prior and
+    current, then requires non-empty patch mass per anatomy after warp.
     """
     a = len(REQUIRED_CXAS_ANATOMIES)
-    from silver_masks import N_PATCHES
-
     z = torch.zeros(a, N_PATCHES, dtype=torch.float32)
     root = dataset_masks_root(gold_masks_base, dataset)
     if not root.is_dir():
@@ -283,18 +366,32 @@ def load_gold_dual_anatomy_weights(
     p_path = idx.resolve_json_path(parent_image_prev)
     c_path = idx.resolve_json_path(parent_image_curr)
     if p_path is None or c_path is None:
-        return z, z, False, f"json not found prev={p_path} curr={c_path}"
+        return z, z, False, "json_not_found"
 
-    if not anatomy_categories_present(p_path) or not anatomy_categories_present(c_path):
-        return z, z, False, "incomplete 22-CXAS inventory"
+    try:
+        p_doc = _load_json(p_path)
+        c_doc = _load_json(c_path)
+    except Exception as exc:
+        return z, z, False, f"json_load_failed:{exc}"
+
+    ok_p, reason_p = passes_silver_anatomy_filter(
+        p_doc, min_key_hits=min_key_hits, strict=strict,
+    )
+    if not ok_p:
+        return z, z, False, f"prior:{reason_p}"
+    ok_c, reason_c = passes_silver_anatomy_filter(
+        c_doc, min_key_hits=min_key_hits, strict=strict,
+    )
+    if not ok_c:
+        return z, z, False, f"curr:{reason_c}"
 
     try:
         prior_hw = load_per_category_masks_hw(p_path)
         curr_hw = load_per_category_masks_hw(c_path)
     except Exception as exc:
-        return z, z, False, f"decode failed: {exc}"
+        return z, z, False, f"decode_failed:{exc}"
     if prior_hw is None or curr_hw is None:
-        return z, z, False, "missing category after decode"
+        return z, z, False, "missing_category_after_decode"
 
     prior_rows = []
     curr_rows = []
@@ -303,13 +400,12 @@ def load_gold_dual_anatomy_weights(
             pw = mask_hw_to_patch_weights(prior_hw[cat], aug_params=None)
             cw = mask_hw_to_patch_weights(curr_hw[cat], aug_params=None)
         except Exception as exc:
-            return z, z, False, f"warp failed ({cat}): {exc}"
+            return z, z, False, f"warp_failed:{cat}:{exc}"
+        # Do **not** fake mass for empty organs — that would defeat filtering.
         if float(pw.sum()) <= min_weight_sum:
-            pw = pw.clone()
-            pw[pw.numel() // 2] = float(min_weight_sum)
+            return z, z, False, f"prior_empty_mass:{cat}"
         if float(cw.sum()) <= min_weight_sum:
-            cw = cw.clone()
-            cw[cw.numel() // 2] = float(min_weight_sum)
+            return z, z, False, f"curr_empty_mass:{cat}"
         prior_rows.append(pw)
         curr_rows.append(cw)
 
@@ -351,11 +447,13 @@ def run_demo(args, model, gold_df, device):
         str(row["dataset"]),
         str(row["parent_image_prev"]),
         str(row["parent_image_curr"]),
+        min_key_hits=args.min_key_hits,
+        strict=args.strict,
     )
     print(f"  anatomy:       active={active} ({reason})")
     if not active:
         raise RuntimeError(
-            "Demo row failed the full-22 anatomy filter. "
+            "Demo row failed the silver-style anatomy filter. "
             "Pick another --idx or check --gold-masks-base."
         )
 
@@ -399,6 +497,11 @@ def run_eval(args, model, gold_df, device):
         f"\n[eval] gold anatomy dual-mask scoring on {len(gold_df)} rows"
     )
     print(f"[eval] gold_masks_base={args.gold_masks_base}")
+    print(
+        f"[eval] filter = silver filtered_masks_anatomy rules "
+        f"(min_key_hits={args.min_key_hits}/{len(KEY_CLASSES_FOR_QC)}, "
+        f"strict={args.strict}, full 22 CXAS with non-empty mass on BOTH sides)"
+    )
     for ds in DATASETS:
         root = dataset_masks_root(args.gold_masks_base, ds)
         print(f"[eval]   {ds}: {root}  exists={root.is_dir()}")
@@ -426,6 +529,8 @@ def run_eval(args, model, gold_df, device):
             ds,
             str(row["parent_image_prev"]),
             str(row["parent_image_curr"]),
+            min_key_hits=args.min_key_hits,
+            strict=args.strict,
         )
         if not active:
             skipped_mask += 1
@@ -517,6 +622,18 @@ def main():
         default=_discover_gold_masks_base(),
         help="Directory containing final_gold_{ds}_masks/ "
              "(default: auto-detect cluster or ../mask_silver/...).",
+    )
+    parser.add_argument(
+        "--min-key-hits",
+        type=int,
+        default=8,
+        help="Same as filter_masks_by_anatomy_map.py (default 8). "
+             "Set 0 to disable key-class QC.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Also apply filter_masks_by_anatomy_map --strict geometric QC.",
     )
     parser.add_argument("--prompt-template", default=PROMPT_TEMPLATE)
     parser.add_argument(
