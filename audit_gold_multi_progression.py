@@ -19,6 +19,12 @@ To evaluate only the unique-label subset::
         --ckpt /path/to/best.pt
 
     python eval_progression_biovilt.py --eval --drop-multi-progression
+
+For top-|GT| set-match on multi-label groups (secondary analysis)::
+
+    python eval_progression_gold_setmatch.py --backend jepa --eval \\
+        --ckpt /path/to/best.pt
+    python eval_progression_gold_setmatch.py --backend biovilt --eval
 """
 
 from __future__ import annotations
