@@ -15,6 +15,11 @@ Usage
     python eval_progression_jepa_perpatch.py --eval \\
         --ckpt /path/to/old_perpatch_checkpoint/best.pt
 
+    # Optional: drop (pair, finding) rows with conflicting lesion-level
+    # progression labels (see audit_gold_multi_progression.py).
+    python eval_progression_jepa_perpatch.py --eval --drop-multi-progression \\
+        --ckpt /path/to/old_perpatch_checkpoint/best.pt
+
     python eval_progression_jepa_perpatch.py --demo --idx 17 \\
         --ckpt /path/to/old_perpatch_checkpoint/best.pt
 """

@@ -42,6 +42,7 @@ from progression_classify import (
     DEFAULT_GOLD_PARQUET,
     _normalize_label,
     discover_gold_image_roots,
+    drop_multi_progression_labels,
     load_gold_pairs,
     load_image_tensor,
 )
@@ -702,6 +703,15 @@ def main():
         "--limit", type=int, default=None,
         help="(eval only) Only evaluate the first N rows.",
     )
+    parser.add_argument(
+        "--drop-multi-progression",
+        action="store_true",
+        help="Drop (pair, finding) groups with >1 distinct progression "
+             "label. Image-level scoring can emit only one class, so "
+             "conflicting lesion-level GTs for the same disease make "
+             "those rows mutually exclusive / noisy (~17%% of groups / "
+             "~31%% of rows on CheXTemporal gold).",
+    )
 
     args = parser.parse_args()
 
@@ -746,6 +756,8 @@ def main():
         label_col=args.label_col,
         finding_col=args.finding_col,
     )
+    if getattr(args, "drop_multi_progression", False):
+        gold_df = drop_multi_progression_labels(gold_df)
     if len(gold_df) == 0:
         raise RuntimeError("No usable gold rows after filtering.")
 
