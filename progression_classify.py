@@ -321,6 +321,109 @@ def load_gold_pairs(
     return gold
 
 
+PAIR_FINDING_KEY_COLS = [
+    "dataset",
+    "patient_id",
+    "study_id_curr",
+    "study_id_prev",
+    "finding",
+]
+
+
+def audit_multi_progression_labels(gold: pd.DataFrame) -> pd.DataFrame:
+    """Summarize (pair, finding) groups with >1 distinct progression label.
+
+    Image-level progression classifiers emit one class per
+    ``(prior, current, finding)``. When gold keeps one row per lesion
+    box and the same disease has different labels at different sites
+    (e.g. right lung worse, left lung stable), the same image-level
+    prediction is scored against conflicting GTs — at most one can be
+    correct. Returns one row per multi-label group with label combo.
+    """
+    need = PAIR_FINDING_KEY_COLS + ["progression"]
+    missing = [c for c in need if c not in gold.columns]
+    if missing:
+        raise ValueError(
+            f"audit_multi_progression_labels needs columns {need}; "
+            f"missing {missing}"
+        )
+    g = gold.copy()
+    g["_finding_lc"] = g["finding"].astype(str).str.strip().str.lower()
+    g["_prog_lc"] = g["progression"].astype(str).str.strip().str.lower()
+    keys = [
+        "dataset",
+        "patient_id",
+        "study_id_curr",
+        "study_id_prev",
+        "_finding_lc",
+    ]
+    nuniq = g.groupby(keys, dropna=False)["_prog_lc"].nunique()
+    multi_keys = nuniq[nuniq > 1].index
+    if len(multi_keys) == 0:
+        return pd.DataFrame(
+            columns=keys + ["n_rows", "n_unique_prog", "progressions"]
+        )
+    rows = []
+    for key, sub in g.groupby(keys, dropna=False):
+        progs = tuple(sorted(sub["_prog_lc"].unique()))
+        if len(progs) <= 1:
+            continue
+        row = dict(zip(keys, key if isinstance(key, tuple) else (key,)))
+        row["n_rows"] = len(sub)
+        row["n_unique_prog"] = len(progs)
+        row["progressions"] = progs
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def drop_multi_progression_labels(gold: pd.DataFrame) -> pd.DataFrame:
+    """Keep only (pair, finding) groups with a single progression label.
+
+    Drops every gold row belonging to a multi-label group. Prints a short
+    audit before filtering. See ``audit_multi_progression_labels``.
+    """
+    need = PAIR_FINDING_KEY_COLS + ["progression"]
+    missing = [c for c in need if c not in gold.columns]
+    if missing:
+        raise ValueError(
+            f"drop_multi_progression_labels needs columns {need}; "
+            f"missing {missing}"
+        )
+    g = gold.copy()
+    g["_finding_lc"] = g["finding"].astype(str).str.strip().str.lower()
+    g["_prog_lc"] = g["progression"].astype(str).str.strip().str.lower()
+    keys = [
+        "dataset",
+        "patient_id",
+        "study_id_curr",
+        "study_id_prev",
+        "_finding_lc",
+    ]
+    nuniq = g.groupby(keys, dropna=False)["_prog_lc"].transform("nunique")
+    n_groups = g.drop_duplicates(keys).shape[0]
+    n_multi_groups = int(
+        g.loc[nuniq > 1].drop_duplicates(keys).shape[0]
+    )
+    n_multi_rows = int((nuniq > 1).sum())
+    print(
+        f"[gold] multi-progression audit: {n_multi_groups}/{n_groups} "
+        f"(pair, finding) groups have >1 label "
+        f"({n_multi_rows}/{len(g)} rows)"
+    )
+    if n_multi_groups:
+        audit = audit_multi_progression_labels(gold)
+        print("[gold]   top conflicting label combos:")
+        vc = audit["progressions"].value_counts().head(8)
+        for combo, cnt in vc.items():
+            print(f"    {cnt:>4}  {combo}")
+    kept = g.loc[nuniq == 1].drop(columns=["_finding_lc", "_prog_lc"])
+    print(
+        f"[gold]   kept {len(kept)}/{len(g)} rows with a unique "
+        f"progression per (pair, finding)"
+    )
+    return kept.reset_index(drop=True)
+
+
 # ============================================================
 # CORE SCORING
 # ============================================================
