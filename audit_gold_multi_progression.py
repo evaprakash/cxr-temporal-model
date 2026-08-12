@@ -13,10 +13,12 @@ Usage
     python audit_gold_multi_progression.py \\
         --gold-parquet /path/to/gold_progression_pairs.parquet
 
-To evaluate only the unique-label subset with the per-patch JEPA rule::
+To evaluate only the unique-label subset::
 
     python eval_progression_jepa_perpatch.py --eval --drop-multi-progression \\
         --ckpt /path/to/best.pt
+
+    python eval_progression_biovilt.py --eval --drop-multi-progression
 """
 
 from __future__ import annotations
