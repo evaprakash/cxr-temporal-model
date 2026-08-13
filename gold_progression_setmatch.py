@@ -285,7 +285,7 @@ def _print_single_label_breakdown(
         f"(chance = {1.0 / len(CLS_ORDER):.3f})"
     )
 
-    print("\nPer-class accuracy (= per-class recall):")
+    print("\nPer-progression accuracy (SINGLE; = per-class recall):")
     print(f"  {'gt class':<10} {'n':>6} {'acc':>8}")
     for cls in CLS_ORDER:
         n = sum(confusion[cls].values())
@@ -305,7 +305,7 @@ def _print_single_label_breakdown(
     for k, cls in enumerate(CLS_ORDER):
         print(f"  {cls:<10} {cos_sums[k] / n_seen:>10.4f}")
 
-    print("\nPer-finding accuracy:")
+    print("\nPer-disease accuracy (SINGLE):")
     print(f"  {'finding':<26} {'n':>6} {'acc':>8}")
     for finding in sorted(per_finding):
         c, n = per_finding[finding]
@@ -387,30 +387,12 @@ def _print_multi_label_breakdown(
             f"exact={sum(x.exact for x in rs) / len(rs):.4f}"
         )
 
-    # Per-progression: among groups where cls ∈ GT, P(cls ∈ Ŷ);
-    # among groups where cls ∈ Ŷ, P(cls ∈ GT).
-    print("\nPer-progression label retrieval (multi-label groups):")
-    print(
-        f"  {'class':<10} {'n_in_GT':>8} {'recall':>8} "
-        f"{'n_in_Ŷ':>8} {'precision':>10}"
+    _print_progression_retrieval(
+        multi,
+        "Per-progression label retrieval (MULTI):",
     )
-    for cls in CLS_ORDER:
-        in_gt = [r for r in multi if cls in r.gt]
-        in_pred = [r for r in multi if cls in r.pred_set]
-        rec = (
-            sum(1 for r in in_gt if cls in r.pred_set) / len(in_gt)
-            if in_gt else float("nan")
-        )
-        prec = (
-            sum(1 for r in in_pred if cls in r.gt) / len(in_pred)
-            if in_pred else float("nan")
-        )
-        print(
-            f"  {cls:<10} {len(in_gt):>8} {rec:>8.4f} "
-            f"{len(in_pred):>8} {prec:>10.4f}"
-        )
 
-    print("\nPer-finding set-match (multi-label groups):")
+    print("\nPer-disease set-match (MULTI):")
     print(
         f"  {'finding':<26} {'n':>6} {'recall':>8} "
         f"{'precision':>10} {'jaccard':>8} {'exact':>8}"
@@ -442,13 +424,56 @@ def _print_multi_label_breakdown(
             print(f"  {cls:<10} {cos_sums[k] / n_cos:>10.4f}")
 
 
+def _print_progression_retrieval(
+    results: List[SetMatchResult],
+    heading: str,
+) -> None:
+    """Per-progression label retrieval over the given groups.
+
+    For every group, prediction set ``Ŷ`` is top-|GT| (so |GT|=1 ⇒
+    ``Ŷ = {argmax}``). Per class::
+
+        recall    = P(cls ∈ Ŷ | cls ∈ GT)
+        precision = P(cls ∈ GT | cls ∈ Ŷ)
+    """
+    print(f"\n{heading}")
+    if not results:
+        print("  (no groups)")
+        return
+    print(
+        f"  {'class':<10} {'n_in_GT':>8} {'recall':>8} "
+        f"{'n_in_Ŷ':>8} {'precision':>10}"
+    )
+    for cls in CLS_ORDER:
+        in_gt = [r for r in results if cls in r.gt]
+        in_pred = [r for r in results if cls in r.pred_set]
+        rec = (
+            sum(1 for r in in_gt if cls in r.pred_set) / len(in_gt)
+            if in_gt else float("nan")
+        )
+        prec = (
+            sum(1 for r in in_pred if cls in r.gt) / len(in_pred)
+            if in_pred else float("nan")
+        )
+        print(
+            f"  {cls:<10} {len(in_gt):>8} {rec:>8.4f} "
+            f"{len(in_pred):>8} {prec:>10.4f}"
+        )
+
+
 def _print_combined_per_finding(results: List[SetMatchResult]) -> None:
-    """Per-finding combined score (single 0/1 + multi Jaccard)."""
-    print("\nPer-finding COMBINED score "
-          "(single=argmax acc, multi=Jaccard):")
+    """Per-disease combined score (single 0/1 + multi Jaccard)."""
+    print(
+        "\nPer-disease COMBINED "
+        "(group_score: single=argmax 0/1, multi=Jaccard):"
+    )
+    if not results:
+        print("  (no groups)")
+        return
     print(
         f"  {'finding':<26} {'n':>6} {'n_single':>8} {'n_multi':>8} "
-        f"{'combined':>8} {'single_acc':>10} {'multi_jac':>9}"
+        f"{'combined':>8} {'single_acc':>10} {'multi_jac':>9} "
+        f"{'multi_rec':>9}"
     )
     by_f: Dict[str, List[SetMatchResult]] = defaultdict(list)
     for r in results:
@@ -466,9 +491,13 @@ def _print_combined_per_finding(results: List[SetMatchResult]) -> None:
             sum(r.jaccard for r in multi) / len(multi)
             if multi else float("nan")
         )
+        m_r = (
+            sum(r.recall for r in multi) / len(multi)
+            if multi else float("nan")
+        )
         print(
             f"  {finding:<26} {len(rs):>6} {len(single):>8} {len(multi):>8} "
-            f"{comb:>8.4f} {s_acc:>10.4f} {m_j:>9.4f}"
+            f"{comb:>8.4f} {s_acc:>10.4f} {m_j:>9.4f} {m_r:>9.4f}"
         )
 
 
@@ -477,8 +506,9 @@ def print_setmatch_report(
     backend: str,
     pooling_note: str = "",
 ) -> None:
-    """Full report: set-match summary + single/multi breakdowns."""
+    """Full report with per-progression + per-disease for single/multi/combined."""
     summary = summarize_setmatch(results)
+
     print(f"\n{'=' * 60}")
     print(f"=== Gold set-match results ({backend}{pooling_note})")
     print(f"{'=' * 60}")
@@ -488,42 +518,37 @@ def print_setmatch_report(
         f"{int(summary['n_multi'])} multi-label"
     )
 
-    print("\n(A) Multi-progression summary (top-|GT| set match):")
-    if summary["n_multi"] == 0:
-        print("  (no multi-label groups)")
-    else:
-        print(f"  n                {int(summary['n_multi']):>8}")
-        print(f"  mean recall      {summary['multi_recall']:>8.4f}")
-        print(f"  mean precision   {summary['multi_precision']:>8.4f}")
-        print(f"  mean Jaccard     {summary['multi_jaccard']:>8.4f}")
-        print(
-            f"  exact set match  {summary['multi_exact']:>8.4f}   "
-            f"(Ŷ == GT)"
-        )
-
-    print(
-        "\n(B) Combined overall "
-        "(single = argmax accuracy; multi = top-|GT| Jaccard):"
+    _print_multi_label_breakdown(
+        results,
+        "(A) MULTI-label groups — summary + per-progression + per-disease",
     )
+
+    print(f"\n{'-' * 60}")
+    print(
+        "(B) COMBINED (all groups) — "
+        "single=argmax 0/1, multi=top-|GT| Jaccard"
+    )
+    print(f"{'-' * 60}")
     print(f"  single-label acc {summary['single_acc']:>8.4f}   "
           f"(n={int(summary['n_single'])})")
     print(f"  multi Jaccard    {summary['multi_jaccard']:>8.4f}   "
           f"(n={int(summary['n_multi'])})")
     print(
         f"  COMBINED score   {summary['combined_score']:>8.4f}   "
-        f"(mean over all groups)"
+        f"(mean group_score over all groups)"
     )
     print(
         f"  combined (alt)   {summary['combined_score_recall']:>8.4f}   "
         f"(single 0/1 + multi recall)"
     )
+    _print_progression_retrieval(
+        results,
+        "Per-progression label retrieval (COMBINED — all groups):",
+    )
+    _print_combined_per_finding(results)
 
     _print_single_label_breakdown(
         results,
-        "(C) Single-label groups — full breakdown (argmax, like regular eval)",
+        "(C) SINGLE-label groups — full breakdown "
+        "(argmax; per-progression + per-disease)",
     )
-    _print_multi_label_breakdown(
-        results,
-        "(D) Multi-label groups — full set-match breakdown",
-    )
-    _print_combined_per_finding(results)
