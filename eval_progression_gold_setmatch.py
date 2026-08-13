@@ -8,8 +8,12 @@ For each ``(pair, finding)`` group (one forward pass):
     recall / precision / Jaccard against the GT set
 
 Prints:
-  (A) metrics on multi-progression groups only
+  (A) multi-progression summary (top-|GT| recall / precision / Jaccard)
   (B) combined overall = mean of (single 0/1, multi Jaccard)
+  (C) single-label full breakdown (per-progression, confusion, per-disease,
+      macro / kappa) — same tables as regular gold eval
+  (D) multi-label full breakdown (per-progression retrieval, per-disease
+      set-match, |GT| sizes)
 
 Backends
 --------
@@ -34,7 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -51,7 +55,6 @@ from eval_progression_jepa import (
 from gold_progression_setmatch import (
     group_gold_by_pair_finding,
     print_setmatch_report,
-    summarize_setmatch,
     topk_set_match,
 )
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
@@ -148,7 +151,12 @@ def run_eval(args, score_fn, groups, device):
         out = score_fn(
             prior, current, finding, text_cache,
         )
-        sm = topk_set_match(out["cos_class_scores"], gt_labels, CLS_ORDER)
+        sm = topk_set_match(
+            out["cos_class_scores"],
+            gt_labels,
+            CLS_ORDER,
+            finding=finding,
+        )
         results.append(sm)
 
         if (i + 1) % max(1, len(groups) // 20) == 0:
@@ -160,27 +168,10 @@ def run_eval(args, score_fn, groups, device):
         print("No groups evaluated.")
         return
 
-    summary = summarize_setmatch(results)
     note = ""
     if args.backend == "jepa":
         note = f", pooling={args.pooling}"
-    print_setmatch_report(summary, args.backend, note)
-
-    # Small diagnostic: multi groups by |GT|
-    multi = [r for r in results if r.is_multi]
-    if multi:
-        print("\nMulti-label breakdown by |GT|:")
-        by_k: Dict[int, List] = {}
-        for r in multi:
-            by_k.setdefault(r.k, []).append(r)
-        for k in sorted(by_k):
-            rs = by_k[k]
-            mean_j = sum(r.jaccard for r in rs) / len(rs)
-            mean_r = sum(r.recall for r in rs) / len(rs)
-            print(
-                f"  |GT|={k}: n={len(rs):>4}  "
-                f"recall={mean_r:.4f}  jaccard={mean_j:.4f}"
-            )
+    print_setmatch_report(results, args.backend, note)
 
 
 def main():
