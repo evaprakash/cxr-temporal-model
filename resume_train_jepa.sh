@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999
+#SBATCH --job-name=jepa_cbw99999_progglobal
 #SBATCH -p batch
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
@@ -8,17 +8,19 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_progglobal_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_progglobal_%j.err
 
 # ============================================================
-# SLURM launcher: per-patch JEPA + progression CE
-# (``cbw99999``, no ``_globalpool`` tag) on Marlowe project m000081-pm06.
+# SLURM launcher: per-patch JEPA + global-pool progression CE
+# (``cbw99999_progglobal``) on Marlowe project m000081-pm06.
 #
-#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ[p], z_cur[p]))
+#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ[p], z_cur[p]))  (unchanged)
+#   * W_PROG = 0.1 — cos(pool(ẑ^c), pool(z_cur))
 #   * W_ANAT_JEPA = 0 — no anatomy masks / filtering
-#   * Progression CE uses the same per-patch mean cosine logits
+#   * Dynamic sentence condition for the JEPA loss
 #   * Report contrastive unchanged (W_REPORT_* = 0.1)
+#   * Writes to checkpoints_jepa_dynamic_cbw99999_progglobal/
 #
 # Layout expected under scratch:
 #   /scratch/m000081-pm06/eprakash/
