@@ -249,6 +249,21 @@ def summarize_setmatch(
     }
 
 
+def format_running_setmatch(results: List[SetMatchResult]) -> str:
+    """One-line running combined / single acc / multi Jaccard."""
+    s = summarize_setmatch(results)
+
+    def _fmt(x: float) -> str:
+        return f"{x:.3f}" if x == x else "nan"
+
+    return (
+        f"combined={_fmt(s['combined_score'])} "
+        f"single_acc={_fmt(s['single_acc'])} "
+        f"multi_jac={_fmt(s['multi_jaccard'])} "
+        f"(n_s={int(s['n_single'])} n_m={int(s['n_multi'])})"
+    )
+
+
 def _print_single_label_breakdown(
     results: List[SetMatchResult],
     title: str,

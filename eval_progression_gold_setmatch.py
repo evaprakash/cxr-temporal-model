@@ -53,6 +53,7 @@ from eval_progression_jepa import (
     _encode_prompts,
 )
 from gold_progression_setmatch import (
+    format_running_setmatch,
     group_gold_by_pair_finding,
     print_setmatch_report,
     topk_set_match,
@@ -130,6 +131,10 @@ def run_eval(args, score_fn, groups, device):
         f"\n[eval] set-match on {len(groups)} (pair, finding) groups "
         f"(backend={args.backend})"
     )
+    print(
+        "[eval] running: combined = mean of group scores "
+        "(single = argmax accuracy, multi = top-|GT| Jaccard; not F1)"
+    )
 
     for i in range(len(groups)):
         row = groups.iloc[i]
@@ -160,7 +165,10 @@ def run_eval(args, score_fn, groups, device):
         results.append(sm)
 
         if (i + 1) % max(1, len(groups) // 20) == 0:
-            print(f"[eval]   {i + 1}/{len(groups)}  skipped={skipped}")
+            print(
+                f"[eval]   {i + 1}/{len(groups)}  skipped={skipped}  "
+                f"{format_running_setmatch(results)}"
+            )
 
     if skipped:
         print(f"\nSkipped {skipped} groups due to missing images")
