@@ -143,12 +143,11 @@ def jepa_metrics(pred: torch.Tensor, target: torch.Tensor, prior: torch.Tensor):
     target_f = target.float()
     prior_f = prior.float()
 
-    # Training-time loss on the unit sphere: global-pool cosine.
-    from losses_jepa import global_pool_normalize
-    pred_g = global_pool_normalize(pred_f)
-    target_g = global_pool_normalize(target_f)
-    cos_global = (pred_g * target_g).sum(dim=-1)
-    cosine_dist = (1.0 - cos_global).mean().item()
+    # Training-time loss on the unit sphere: per-patch cosine.
+    pred_n = F.normalize(pred_f, dim=-1)
+    target_n = F.normalize(target_f, dim=-1)
+    cos_per_patch = (pred_n * target_n).sum(dim=-1)
+    cosine_dist = (1.0 - cos_per_patch).mean().item()
 
     # Smooth L1 kept as a diagnostic — monotone in cosine distance on
     # unit-norm vectors, but lets you compare to pre-unit-sphere runs.
@@ -163,7 +162,7 @@ def jepa_metrics(pred: torch.Tensor, target: torch.Tensor, prior: torch.Tensor):
         "cosine_dist": cosine_dist,
         "smooth_l1": smooth_l1,
         "cos_delta": cos_delta,
-        "cos_global": cos_global.mean().item(),
+        "cos_global": cos_per_patch.mean().item(),
         "cos_patch_mean": cos_patches.mean().item(),
         "cos_patch_min": cos_patches.min().item(),
         "cos_patch_max": cos_patches.max().item(),
@@ -277,19 +276,19 @@ def main():
     cosine_dist_naive = m_naive["cosine_dist"]
 
     print("\n=== Predictor (z_prior + Δz, L2-norm'd) vs target z_cur ===")
-    print(f"  JEPA cosine distance (global):  {m_pred['cosine_dist']:.4f}")
+    print(f"  JEPA cosine distance (per-patch): {m_pred['cosine_dist']:.4f}")
     print(f"  JEPA Smooth L1 (diagnostic):    {m_pred['smooth_l1']:.4f}")
     print(f"  Slide-deck cos(Δẑ, Δz_true):    {m_pred['cos_delta']:.4f}")
-    print(f"  Global-pool cos sim:            {m_pred['cos_global']:.4f}")
+    print(f"  Mean per-patch cos sim:         {m_pred['cos_global']:.4f}")
     print(f"  Per-patch cos sim mean/min/max: "
           f"{m_pred['cos_patch_mean']:.4f} / "
           f"{m_pred['cos_patch_min']:.4f} / "
           f"{m_pred['cos_patch_max']:.4f}")
 
     print("\n=== Do-nothing baseline (ẑ_cur := z_prior) ===")
-    print(f"  JEPA cosine distance (global):  {cosine_dist_naive:.4f}")
+    print(f"  JEPA cosine distance (per-patch): {cosine_dist_naive:.4f}")
     print(f"  JEPA Smooth L1 (diagnostic):    {smooth_l1_naive:.4f}")
-    print(f"  Global-pool cos sim:            {m_naive['cos_global']:.4f}")
+    print(f"  Mean per-patch cos sim:         {m_naive['cos_global']:.4f}")
 
     # ---- Improvement ----
     if cosine_dist_naive > 0:

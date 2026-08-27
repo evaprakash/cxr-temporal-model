@@ -4,7 +4,7 @@
 #
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
 #   - Model:    TempCXRJEPA (online + EMA + predictor) — unit-sphere
-#   - Losses:   JEPA global-pool cosine (1 - cos(pool(ẑ), pool(z_cur)))
+#   - Losses:   JEPA per-patch cosine (1 - cos(ẑ, z_cur) mean over patches)
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
 #               + Progression 5-way image-image CE, class-balanced
@@ -19,10 +19,10 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: from-scratch β=0.99999 progression CBW, W_REPORT_*=0.10,
-# **global-pool JEPA** (``_globalpool`` dir tag): W_JEPA=1.0,
+# **per-patch JEPA** (no ``_globalpool`` dir tag): W_JEPA=1.0,
 # W_ANAT_JEPA=0. No anatomy masks / filtering. JEPA and progression CE
-# both score ``cos(mean-pool(ẑ), mean-pool(z_cur))`` after re-normalize
-# — matching gold / MS-CXR-T / CIG eval.
+# both score mean-over-patches ``cos(ẑ[p], z_cur[p])`` — matching gold
+# set-match ``--pooling perpatch``.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -33,7 +33,7 @@
 #   and the model runs the predictor a second time on
 #   ``z_prior.repeat_interleave(5, dim=0)`` with these 5 text conditions
 #   to produce ``ẑ_cur^c`` for each class. The loss is
-#   ``F.cross_entropy(cos(pool(ẑ_cur^c), pool(z_cur)) / τ, silver_label,
+#   ``F.cross_entropy(mean_p cos(ẑ_cur^c[p], z_cur[p]) / τ, silver_label,
 #                     weight=class_weights)``.
 
 import os
@@ -244,7 +244,7 @@ WARMUP_RATIO = 0.03
 SAVE_EVERY_N_EPOCHS = 1
 
 # Loss weights (baseline report contrastive = 0.10).
-# Global-pool JEPA: mean-pool patches → cosine (no anatomy masks).
+# Per-patch JEPA: mean over patches of 1 - cos(ẑ[p], z_cur[p]).
 W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
@@ -256,7 +256,7 @@ PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
 N_CLS = len(CLS_ORDER)
 
-# Anatomy dual-mask JEPA off for this run (global-pool only).
+# Anatomy dual-mask JEPA off for this run (per-patch full-grid only).
 W_ANAT_JEPA = 0.0
 USE_ANATOMY_JEPA = False
 REQUIRE_FULL_ANATOMY_MASKS = False
@@ -272,8 +272,10 @@ SPLIT_SEED = 42
 # ============================================================
 # CHECKPOINT / LOG DIR NAMING
 # ============================================================
-# Encode CBW β, report reweighting, and pooling mode in the ckpt /
-# log dir names so ablations never clobber each other:
+# Encode CBW β and report reweighting in the ckpt / log dir names so
+# ablations never clobber each other. Main-line is per-patch (no extra
+# pooling tag). Global-pool runs used a ``_globalpool`` suffix and are
+# left as archives:
 #   * ``cbw{beta_tag}``               — from-scratch β run
 #                                       (W_REPORT_PRIOR = W_REPORT_PRED = 0.1)
 #   * ``cbw{stage1}to{cur}``          — hard-β=``{cur}`` run that
@@ -287,7 +289,7 @@ SPLIT_SEED = 42
 #                                       the same non-default value
 #                                       (e.g. rp15 = 0.15)
 #   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
-#   * ``..._globalpool``              — global-pool JEPA + progression CE
+#   * ``..._globalpool``              — archived global-pool JEPA runs
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -333,9 +335,9 @@ if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0:
         _SETTING_TAG = f"{_SETTING_TAG}_anatjepaonly{_anat_tag}"
     else:
         _SETTING_TAG = f"{_SETTING_TAG}_anatjepa{_anat_tag}"
-else:
-    # Default main-line similarity: global mean-pool then cosine.
-    _SETTING_TAG = f"{_SETTING_TAG}_globalpool"
+# else: main-line per-patch JEPA — no extra pooling suffix
+# (``checkpoints_jepa_dynamic_cbw99999``). Do not append
+# ``_globalpool``; that tag is only for the archived ablation.
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -446,11 +448,11 @@ if local_rank == 0:
     print(f"[train] checkpoint dir: {CHECKPOINT_DIR}")
     print(f"[train] log dir:        {LOG_DIR}")
     print(
-        f"[train] global-pool JEPA: W_JEPA={W_JEPA} "
+        f"[train] per-patch JEPA: W_JEPA={W_JEPA} "
         f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
-        f"(JEPA + progression CE = cos(pool(ẑ), pool(z_cur)))"
+        f"(JEPA + progression CE = mean_p cos(ẑ[p], z_cur[p]))"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -636,7 +638,7 @@ def compute_jepa_losses(
     Returns: (total, jepa, prior, pred, prog, anatjepa) as scalar tensors.
     """
 
-    # JEPA loss is global-pool cosine; cross-rank gathering doesn't add
+    # JEPA loss is per-patch cosine; cross-rank gathering doesn't add
     # useful negatives, so we always compute it on local features. Cast
     # to fp32 so bf16's low precision on small (1 - cos) residuals doesn't
     # round to zero late in training.
@@ -677,7 +679,7 @@ def compute_jepa_losses(
     )
 
     # 5-way image-image CE on the predictor's class-conditioned ẑ_cur.
-    # Same global-pool cosine as JEPA (not masked). ``weight=`` uses Cui CBW.
+    # Same per-patch cosine as JEPA (not masked). ``weight=`` uses Cui CBW.
     prog = progression_classification_loss(
         out["pred_progression_patches"].float(),
         out["current_patches_target"].float(),

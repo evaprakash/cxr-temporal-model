@@ -354,11 +354,11 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
             pred_synth[b, prog_cls_idx[b].item()] = target[b]
 
         # Recompute logits the same way the loss does, then argmax
-        # (global-pool cosine).
-        from losses_jepa import global_pool_normalize
-        pred_g = global_pool_normalize(pred_synth)
-        target_g = global_pool_normalize(target)
-        logits = (pred_g * target_g.unsqueeze(1)).sum(dim=-1)  # (B, C)
+        # (per-patch mean cosine).
+        pred_n = F.normalize(pred_synth, dim=-1)
+        target_n = F.normalize(target, dim=-1)
+        cos_per_patch = (pred_n * target_n.unsqueeze(1)).sum(dim=-1)
+        logits = cos_per_patch.mean(dim=-1)  # (B, C)
         argmax = logits.argmax(dim=-1)
 
         loss_aligned = progression_classification_loss(

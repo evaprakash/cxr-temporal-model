@@ -630,7 +630,7 @@ class JEPACombinedDataset(Dataset):
 
         # Anatomy dual-mask JEPA: fixed-order 22 CXAS soft masks —
         # prior masks pool ẑ, current masks pool z_cur. Skipped when
-        # load_anatomy_masks=False (global-pool JEPA runs).
+        # load_anatomy_masks=False (main per-patch JEPA runs).
         if self.load_anatomy_masks:
             (
                 mask_patch_weights_prior,

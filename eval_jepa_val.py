@@ -6,9 +6,8 @@ averaged across the val set rather than reported for a single sample.
 What gets averaged
 ------------------
 JEPA cosine distance (predictor)
-    ``1 - cos(pool(ẑ_cur), pool(z_cur))`` (global mean-pool then
-    re-normalize). Matches the unit-sphere training loss, so it should
-    closely match the ``val_jepa`` column in
+    ``1 - mean_p cos(ẑ[p], z_cur[p])``. Matches the per-patch training
+    loss, so it should closely match the ``val_jepa`` column in
     ``logs/val_metrics_jepa.csv`` at the resumed epoch (modulo
     augmentation differences — eval runs without augmentation).
 
@@ -27,8 +26,8 @@ Slide-deck cos(Δẑ, Δz_true)
     Positive numbers mean the predictor is, on average, picking the
     right direction of change.
 
-Global-pool cosine (predictor / do-nothing)
-    ``cos(pool(ẑ), pool(z_cur))`` / ``cos(pool(z_prior), pool(z_cur))``.
+Per-patch cosine (predictor / do-nothing)
+    ``mean_p cos(ẑ[p], z_cur[p])`` / ``mean_p cos(z_prior[p], z_cur[p])``.
     Sanity check that absolute prediction quality is reasonable.
 
 Each metric is reduced **per sample first** and then averaged across
@@ -52,7 +51,6 @@ from tqdm import tqdm
 
 from dataset_combined_jepa import JEPACombinedDataset, jepa_collate_fn
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
-from losses_jepa import global_pool_normalize
 
 
 def main():
@@ -146,15 +144,15 @@ def main():
             z_prior = out["prior_patches"].float()             # (B, N, D)
             B = pred.size(0)
 
-            # Global-pool cosine (mean over patches → L2-normalize),
-            # matching ``jepa_cosine_loss`` / progression CE / gold eval.
-            pred_g = global_pool_normalize(pred)
-            target_g = global_pool_normalize(target)
-            prior_g = global_pool_normalize(z_prior)
-            cos_p = (pred_g * target_g).sum(dim=-1)   # (B,)
-            cos_n = (prior_g * target_g).sum(dim=-1)  # (B,)
+            # Per-patch cosine (mean over patches), matching
+            # ``jepa_cosine_loss`` / progression CE / gold perpatch.
+            pred_n = F.normalize(pred, dim=-1)
+            target_n = F.normalize(target, dim=-1)
+            prior_n = F.normalize(z_prior, dim=-1)
+            cos_p = (pred_n * target_n).sum(dim=-1).mean(dim=-1)   # (B,)
+            cos_n = (prior_n * target_n).sum(dim=-1).mean(dim=-1)  # (B,)
 
-            # Per-sample cosine distance (1 - cos), the training-time loss.
+            # Per-sample cosine distance (1 - mean_p cos), the train loss.
             cos_dist_pred  = 1.0 - cos_p
             cos_dist_naive = 1.0 - cos_n
 

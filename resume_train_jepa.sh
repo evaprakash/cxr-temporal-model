@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_globalpool
+#SBATCH --job-name=jepa_cbw99999
 #SBATCH -p batch
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
@@ -8,16 +8,16 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_globalpool_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_globalpool_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_%j.err
 
 # ============================================================
-# SLURM launcher: global-pool JEPA + progression CE
-# (``cbw99999_globalpool``) on Marlowe project m000081-pm06.
+# SLURM launcher: per-patch JEPA + progression CE
+# (``cbw99999``, no ``_globalpool`` tag) on Marlowe project m000081-pm06.
 #
-#   * W_JEPA = 1.0 — cos(mean-pool(ẑ), mean-pool(z_cur))
+#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ[p], z_cur[p]))
 #   * W_ANAT_JEPA = 0 — no anatomy masks / filtering
-#   * Progression CE uses the same global-pool cosine logits
+#   * Progression CE uses the same per-patch mean cosine logits
 #   * Report contrastive unchanged (W_REPORT_* = 0.1)
 #
 # Layout expected under scratch:
