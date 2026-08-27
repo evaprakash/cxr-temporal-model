@@ -40,17 +40,38 @@ import os
 import glob
 import random
 import argparse
+import sys
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 
-from dataset_combined_jepa import JEPACombinedDataset, jepa_collate_fn
+from dataset_combined_jepa import (
+    DEFAULT_FINDINGS,
+    JEPACombinedDataset,
+    jepa_collate_fn,
+)
+from eval_progression_jepa import PROMPT_TEMPLATE as JEPA_PROMPT_TEMPLATE
+from eval_progression_jepa import _encode_prompts
+from gold_progression_setmatch import (
+    format_running_setmatch,
+    group_gold_by_pair_finding,
+    print_setmatch_report,
+    summarize_setmatch,
+    topk_set_match,
+)
+from progression_classify import (
+    DEFAULT_GOLD_PARQUET,
+    discover_gold_image_roots,
+    load_gold_pairs,
+    load_image_tensor,
+)
 from progression_phrases import CLS_ORDER
 from tempcxr.modules.jepa import (
     TempCXRJEPA,
@@ -61,6 +82,7 @@ from tempcxr.modules.jepa import (
 from losses import local_contrastive_loss
 from losses_jepa import (
     anatomy_masked_pool_jepa_loss,
+    global_pool_normalize,
     jepa_cosine_loss,
     progression_classification_loss,
 )
@@ -176,6 +198,11 @@ IMAGE_ROOTS = {
 # ============================================================
 parser = argparse.ArgumentParser()
 parser.add_argument("--resume", type=str, default=None)
+parser.add_argument(
+    "--skip-gold",
+    action="store_true",
+    help="Skip CheXTemporal gold set-match after each epoch.",
+)
 args = parser.parse_args()
 
 
@@ -590,8 +617,32 @@ if local_rank == 0 and not os.path.exists(CSV_LOG):
     with open(CSV_LOG, "w") as f:
         f.write(
             "epoch,val_total,val_jepa,val_report_prior,val_report_pred,"
-            "val_prog,val_anatjepa\n"
+            "val_prog,val_anatjepa,"
+            "gold_combined,gold_single,gold_multi\n"
         )
+
+
+# ============================================================
+# GOLD SET-MATCH (rank 0, after each epoch)
+# ============================================================
+gold_groups = None
+gold_roots = None
+if not args.skip_gold:
+    if local_rank == 0:
+        gold_df = load_gold_pairs(DEFAULT_GOLD_PARQUET, DEFAULT_FINDINGS)
+        gold_groups = group_gold_by_pair_finding(gold_df)
+        gold_parquet_dir = os.path.dirname(os.path.abspath(DEFAULT_GOLD_PARQUET))
+        gold_roots = {
+            **IMAGE_ROOTS,
+            **discover_gold_image_roots(gold_parquet_dir),
+        }
+        print(
+            f"[gold] set-match after every epoch "
+            f"({len(gold_groups)} groups, pooling={PROG_POOLING}, rank-0 only)"
+        )
+        print("[gold] image roots:")
+        for d in ("mimic", "chexpert", "rexgradient"):
+            print(f"  {d}: {gold_roots.get(d, '<missing>')}")
 
 
 # ============================================================
@@ -618,6 +669,94 @@ def build_progression_prompts(prog_findings):
         for cls in CLS_ORDER:
             prompts.append(PROG_TEMPLATE.format(f_cap, cls))
     return prompts
+
+
+@torch.no_grad()
+def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
+    """5-way scores matching progression CE (PROG_POOLING)."""
+    prompts, txt_local, token_mask = _encode_prompts(
+        raw_model, finding, JEPA_PROMPT_TEMPLATE, DEVICE, text_cache,
+    )
+    n_prompts = len(prompts)
+    prior = prior_img.unsqueeze(0).to(DEVICE)
+    current = current_img.unsqueeze(0).to(DEVICE)
+    _, z_prior = raw_model.image_encoder(prior)
+    _, z_cur = raw_model.target_image_encoder(current)
+    z_cur = z_cur.detach()
+    z_prior_b = z_prior.expand(n_prompts, -1, -1).contiguous()
+    preds = raw_model.predictor(z_prior_b, txt_local, token_mask)
+    pred_f = preds.float()
+    target_f = z_cur.float()
+    if PROG_POOLING == "global":
+        pred_g = global_pool_normalize(pred_f)
+        target_g = global_pool_normalize(target_f)
+        scores = F.cosine_similarity(
+            pred_g, target_g.expand_as(pred_g), dim=-1,
+        ).tolist()
+    else:
+        cos_per_patch = F.cosine_similarity(
+            pred_f, target_f.expand_as(pred_f), dim=-1,
+        )
+        scores = cos_per_patch.mean(dim=1).tolist()
+    return scores
+
+
+@torch.no_grad()
+def eval_gold_setmatch(raw_model, groups, image_roots, epoch):
+    """Rank-0 CheXTemporal gold set-match (same tables as standalone eval)."""
+    raw_model.eval()
+    results = []
+    skipped = 0
+    text_cache = {}
+    pbar = tqdm(
+        range(len(groups)),
+        desc=f"gold set-match ep{epoch}",
+        dynamic_ncols=True,
+        file=sys.stdout,
+    )
+    for i in pbar:
+        row = groups.iloc[i]
+        try:
+            prior = load_image_tensor(
+                row["dataset"], row["parent_image_prev"], image_roots,
+            )
+            current = load_image_tensor(
+                row["dataset"], row["parent_image_curr"], image_roots,
+            )
+        except (FileNotFoundError, OSError):
+            skipped += 1
+            pbar.set_postfix(
+                skipped=skipped,
+                metrics=format_running_setmatch(results),
+            )
+            continue
+        scores = _score_gold_pair(
+            raw_model, prior, current, str(row["finding"]), text_cache,
+        )
+        results.append(
+            topk_set_match(
+                scores,
+                list(row["gt_labels"]),
+                CLS_ORDER,
+                finding=str(row["finding"]),
+            )
+        )
+        pbar.set_postfix(
+            skipped=skipped,
+            metrics=format_running_setmatch(results),
+        )
+    pbar.close()
+    if skipped:
+        print(f"[gold] skipped missing images: {skipped}")
+    if not results:
+        print("[gold] set-match: no groups evaluated")
+        return None
+    print_setmatch_report(
+        results,
+        "jepa",
+        f", pooling={PROG_POOLING}, epoch={epoch} (in-training)",
+    )
+    return summarize_setmatch(results)
 
 
 # ============================================================
@@ -916,12 +1055,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"AnatJEPA={val_anatjepa:.4f}"
         )
 
-        with open(CSV_LOG, "a") as f:
-            f.write(
-                f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred},"
-                f"{val_prog},{val_anatjepa}\n"
-            )
-
         ckpt = {
             "epoch": epoch,
             "model": model.module.state_dict(),
@@ -943,5 +1076,25 @@ for epoch in range(start_epoch, EPOCHS + 1):
             ckpt["best_val_loss"] = best_val_loss
             torch.save(ckpt, os.path.join(CHECKPOINT_DIR, "best.pt"))
             print("Saved new BEST checkpoint")
+
+        gold_combined = gold_single = gold_multi = ""
+        if gold_groups is not None:
+            gold_sum = eval_gold_setmatch(
+                model.module, gold_groups, gold_roots, epoch,
+            )
+            if gold_sum is not None:
+                gold_combined = f"{gold_sum['combined_score']:.6f}"
+                gold_single = f"{gold_sum['single_acc']:.6f}"
+                gold_multi = f"{gold_sum['multi_jaccard']:.6f}"
+
+        with open(CSV_LOG, "a") as f:
+            f.write(
+                f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred},"
+                f"{val_prog},{val_anatjepa},"
+                f"{gold_combined},{gold_single},{gold_multi}\n"
+            )
+
+    if WORLD_SIZE > 1:
+        dist.barrier()
 
 dist.destroy_process_group()

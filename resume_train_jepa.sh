@@ -21,6 +21,9 @@
 #   * Dynamic sentence condition for the JEPA loss
 #   * Report contrastive unchanged (W_REPORT_* = 0.1)
 #   * Writes to checkpoints_jepa_dynamic_cbw99999_progglobal/
+#   * Rank-0 gold set-match after each epoch (same tables as
+#     eval_progression_gold_setmatch.py --pooling global).
+#     Skip with: sbatch resume_train_jepa.sh --skip-gold
 #
 # Layout expected under scratch:
 #   /scratch/m000081-pm06/eprakash/
