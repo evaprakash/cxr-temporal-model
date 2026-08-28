@@ -29,21 +29,22 @@ or the per-finding templated string ``"{finding} is {progression}"``
 (``condition_mode="templated"``). The model treats it as an opaque
 string either way.
 
-The 4th (progression-classification) loss reuses the same predictor and
-text encoder. The trainer passes a flat ``progression_prompts_flat`` list
-of ``B*C`` prompts (one per (pair, class) combo, in pair-major
-class-minor order). The model encodes them in the same batched text-
-encoder call as the other reports, runs the predictor a second time on
-``z_prior.repeat_interleave(C, dim=0)`` with these prompts as the text
-condition, and returns ``pred_progression_patches`` of shape
-``(B, C, N, D)``. Gradients flow back into both the image and text
-encoders through this second predictor pass.
+The 4th (progression) loss is a linear head on
+``[pool(ẑ); pool(z_cur); finding]``. The trainer passes ``finding_texts``
+(length B). The model encodes those names with the **same trained**
+BioViL-T text encoder used for JEPA / GLoRIA (not a second copy), runs
+the predictor once more conditioned on the finding only, and returns
+``prog_logits`` of shape ``(B, 5)``. Gold uses the same finding-only
+``ẑ`` (no dynamic sentences, no 5 class templates).
+
+The older 5-template cosine path (``progression_prompts_flat`` →
+``pred_progression_patches``) is still accepted for archived eval.
 
 Losses (computed by the caller):
-    - JEPA cosine                              : 1 − cos(pool(ẑ_cur), pool(z_cur))
+    - JEPA cosine                              : 1 − cos(ẑ_cur, z_cur) mean over patches
     - GLoRIA local contrastive                 : z_prior ↔ τ_prior
     - GLoRIA local contrastive                 : ẑ_cur ↔ τ_current
-    - Progression classification (5-way CE)    : argmax_c cos(pool(ẑ_cur^c), pool(z_cur))
+    - Progression head CE                      : Linear([pool(ẑ); pool(z_cur); finding]) → 5
 """
 
 import copy
@@ -66,7 +67,11 @@ from .image_encoder_jepa import BioViLTImageEncoderJEPA
 from .text_encoder import BioViLTTextEncoder
 
 from losses import local_contrastive_loss
-from losses_jepa import jepa_cosine_loss, progression_classification_loss
+from losses_jepa import (
+    global_pool_normalize,
+    jepa_cosine_loss,
+    progression_classification_loss,
+)
 
 
 # =========================================================
@@ -269,6 +274,21 @@ class TempCXRJEPA(nn.Module):
             depth=predictor_depth,
             num_heads=predictor_heads,
         )
+        self.d_model = d_model
+        # Supervised-style linear readout on the JEPA pair:
+        # [pool(ẑ_finding); pool(z_cur); finding_global] → 5 classes.
+        self.progression_head = nn.Linear(3 * d_model, 5)
+
+    @staticmethod
+    def normalize_finding_texts(finding_texts):
+        return [((t or "").strip().lower()) for t in finding_texts]
+
+    def progression_logits(self, pred_patches, current_patches, finding_global):
+        """5-way logits from ``[pool(ẑ); pool(z_cur); finding]``."""
+        zhat = global_pool_normalize(pred_patches.float())
+        zcur = global_pool_normalize(current_patches.float())
+        find = F.normalize(finding_global.float(), dim=-1)
+        return self.progression_head(torch.cat([zhat, zcur, find], dim=-1))
 
     # --------------------------------------------------
     # FORWARD (NO LOSSES)
@@ -281,6 +301,7 @@ class TempCXRJEPA(nn.Module):
         current_reports,
         condition_texts,
         progression_prompts_flat=None,
+        finding_texts=None,
     ):
         """
         prior_imgs       : (B, 3, H, W)
@@ -294,22 +315,20 @@ class TempCXRJEPA(nn.Module):
                            per-finding ``"{finding} is {progression}"``
                            string (``"templated"``). The model treats
                            it as an opaque string either way.
+        finding_texts
+                           Optional ``list[str]`` of length ``B`` — one
+                           finding name per pair. Encoded with the same
+                           trained BioViL-T text encoder. The predictor
+                           is run again conditioned on this finding
+                           only; ``prog_logits`` is
+                           ``Linear([pool(ẑ); pool(z_cur); finding])``.
+                           Train and gold both use this path (no
+                           dynamic sentences on the head).
         progression_prompts_flat
-                           Optional ``list[str]`` of length ``B * C`` for
-                           the 4th (progression-classification) loss. The
-                           prompts are expected in **pair-major,
-                           class-minor** order — i.e. the first C entries
-                           are the 5 templated prompts for pair 0, the
-                           next C for pair 1, etc. ``C`` is inferred from
-                           ``len(progression_prompts_flat) // B``.
-
-                           When provided, the predictor is run a second
-                           time on ``z_prior.repeat_interleave(C, dim=0)``
-                           conditioned on these prompts, producing
-                           ``pred_progression_patches`` of shape
-                           ``(B, C, N, D)`` in the output dict. When
-                           ``None`` (e.g. inference / smoke test),
-                           ``pred_progression_patches`` is omitted.
+                           Optional archived ``list[str]`` of length
+                           ``B * C`` for the old 5-template cosine CE.
+                           Pair-major, class-minor. When provided,
+                           ``pred_progression_patches`` is ``(B, C, N, D)``.
 
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, unit-norm,
@@ -327,13 +346,11 @@ class TempCXRJEPA(nn.Module):
           - current_token_mask       (B, T)
           - condition_txt_local      (B, T, D)  unit-norm
           - condition_token_mask     (B, T)
-          - pred_progression_patches (B, C, N, D)  predictor outputs
-                                                ``ẑ_cur^c`` for each
-                                                progression class, one
-                                                per ``progression_prompts_flat``
-                                                entry (only present when
-                                                ``progression_prompts_flat
-                                                is not None``).
+          - pred_finding_patches     (B, N, D)  ẑ conditioned on finding
+                                                (only when ``finding_texts``)
+          - finding_txt_global       (B, D)     BioViL-T global finding
+          - prog_logits              (B, 5)     progression head
+          - pred_progression_patches (B, C, N, D)  archived 5-template ẑ^c
         """
 
         # ---- Online encoder on prior (gradients flow) ----
@@ -368,7 +385,19 @@ class TempCXRJEPA(nn.Module):
             n_prog = 0
             C = 0
 
-        _, all_txt_local, all_token_mask = (
+        finding_active = (
+            finding_texts is not None and len(finding_texts) > 0
+        )
+        if finding_active:
+            if len(finding_texts) != B:
+                raise ValueError(
+                    f"len(finding_texts)={len(finding_texts)} must "
+                    f"equal batch size B={B}"
+                )
+            finding_texts_norm = self.normalize_finding_texts(finding_texts)
+            all_reports = all_reports + finding_texts_norm
+
+        all_txt_global, all_txt_local, all_token_mask = (
             self.text_encoder.forward_contrastive(all_reports)
         )
         prior_txt_local = all_txt_local[:B]
@@ -428,6 +457,29 @@ class TempCXRJEPA(nn.Module):
             _, N, D = pred_prog_flat.shape
             out["pred_progression_patches"] = pred_prog_flat.view(B, C, N, D)
 
+        # ---- Finding-conditioned ẑ + linear progression head ----
+        # Same finding string at train and gold. Gradients flow through
+        # the trained text encoder (not a frozen/second copy), the
+        # predictor, and the prior image encoder. z_cur stays EMA /
+        # stop-grad.
+        if finding_active:
+            find_off = 3 * B + n_prog
+            find_txt_global = all_txt_global[find_off:find_off + B]
+            find_txt_local = all_txt_local[find_off:find_off + B]
+            find_token_mask = all_token_mask[find_off:find_off + B]
+            pred_finding = self.predictor(
+                prior_patches,
+                find_txt_local,
+                find_token_mask,
+            )
+            out["pred_finding_patches"] = pred_finding
+            out["finding_txt_global"] = find_txt_global
+            out["prog_logits"] = self.progression_logits(
+                pred_finding,
+                current_patches_target,
+                find_txt_global,
+            )
+
         return out
 
     # --------------------------------------------------
@@ -486,6 +538,7 @@ if __name__ == "__main__":
         current_reports,
         condition_texts,
         progression_prompts_flat=progression_prompts_flat,
+        finding_texts=prog_findings,
     )
 
     # --------------------------------------------------
@@ -508,9 +561,8 @@ if __name__ == "__main__":
         out["current_token_mask"],
     )
 
-    prog_loss = progression_classification_loss(
-        out["pred_progression_patches"],
-        out["current_patches_target"],
+    prog_loss = F.cross_entropy(
+        out["prog_logits"],
         prog_cls_idx,
     )
 
@@ -530,12 +582,14 @@ if __name__ == "__main__":
         "pred_progression_patches:",
         tuple(out["pred_progression_patches"].shape),
     )
+    print("pred_finding_patches:", tuple(out["pred_finding_patches"].shape))
+    print("prog_logits:", tuple(out["prog_logits"].shape))
     print("current_patches_target:", tuple(out["current_patches_target"].shape))
     print()
     print("JEPA cosine:", jepa_loss.item())
     print("Report (z_prior):", prior_loss.item())
     print("Report (ẑ_cur):", pred_loss.item())
-    print("Progression 5-way CE:", prog_loss.item())
+    print("Progression head CE:", prog_loss.item())
     print("Total:", total.item())
 
     total.backward()

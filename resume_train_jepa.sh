@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_wprog50
+#SBATCH --job-name=jepa_cbw99999_proghead
 #SBATCH -p batch
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
@@ -8,22 +8,23 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=2:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_wprog50_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_wprog50_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_proghead_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_proghead_%j.err
 
 # ============================================================
-# SLURM launcher: per-patch JEPA + per-patch progression CE
-# (``cbw99999_wprog50``) on Marlowe project m000081-pm06.
+# SLURM launcher: per-patch JEPA + [ẑ; z_cur; finding] head
+# (``cbw99999_proghead``) on Marlowe project m000081-pm06.
 #
-#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ[p], z_cur[p]))
-#   * W_PROG = 0.5 — mean_p cos(ẑ^c[p], z_cur[p])  (was 0.1)
+#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ_dyn[p], z_cur[p]))
+#   * W_PROG = 0.1 — Linear([pool(ẑ_find); pool(z_cur); finding]) → 5
+#   * Finding text: same trained BioViL-T encoder (not a 2nd copy)
 #   * W_ANAT_JEPA = 0 — no anatomy masks / filtering
-#   * Dynamic sentence condition for the JEPA loss
+#   * Dynamic sentence condition for the JEPA loss only
 #   * Report contrastive unchanged (W_REPORT_* = 0.1)
 #   * EPOCHS = 6
-#   * Writes to checkpoints_jepa_dynamic_cbw99999_wprog50/
+#   * Writes to checkpoints_jepa_dynamic_cbw99999_proghead/
 #   * Rank-0 gold set-match after each epoch (same tables as
-#     eval_progression_gold_setmatch.py --pooling perpatch).
+#     eval_progression_gold_setmatch.py --pooling head).
 #     Skip with: sbatch resume_train_jepa.sh --skip-gold
 #
 # Layout expected under scratch:

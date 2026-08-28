@@ -7,9 +7,9 @@
 #   - Losses:   JEPA per-patch cosine (1 - cos(ẑ, z_cur) mean over patches)
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.99999 in this run) — see the
-#                 ``CBW_*`` constants below.
+#               + Progression head CE on
+#                 [pool(ẑ_finding); pool(z_cur); finding], class-balanced
+#                 (Cui et al. 2019, β=0.99999) — see ``CBW_*`` below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
@@ -18,20 +18,18 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: from-scratch β=0.99999, 6 epochs, W_PROG=0.5
-# (``_wprog50`` dir tag). Per-patch JEPA **and** per-patch progression
-# CE (same as the 0.452 run, louder 5-way). Gold ``--pooling perpatch``.
+# Current run: from-scratch β=0.99999, 6 epochs, W_PROG=0.1
+# (``_proghead`` dir tag). Per-patch JEPA (dynamic sentences) plus a
+# linear head on [pool(ẑ); pool(z_cur); finding]. Finding text uses
+# the same trained BioViL-T encoder (not a second copy). Gold
+# ``--pooling head``. Cosine 5-way CE is off.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
-#   ``(prog_finding, prog_cls_idx)`` per epoch. The trainer builds 5
-#   templated prompts ``"{prog_finding} is {class}."`` (one per
-#   progression class), passes them to ``TempCXRJEPA.forward`` as
-#   ``progression_prompts_flat`` (length B*5, pair-major class-minor),
-#   and the model runs the predictor a second time on
-#   ``z_prior.repeat_interleave(5, dim=0)`` with these 5 text conditions
-#   to produce ``ẑ_cur^c`` for each class. The loss is
-#   ``F.cross_entropy(mean_p cos(ẑ_cur^c[p], z_cur[p]) / τ, silver_label,
+#   ``(prog_finding, prog_cls_idx)`` per epoch. The model encodes that
+#   finding name, runs the predictor conditioned on the finding only
+#   (same rule at gold — no dynamic sentences), and applies
+#   ``F.cross_entropy(Linear([pool(ẑ); pool(z_cur); finding]), label,
 #                     weight=class_weights)``.
 
 import os
@@ -273,14 +271,13 @@ SAVE_EVERY_N_EPOCHS = 1
 W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
-# 4th loss: 5-way image-image CE on the predictor's class-conditioned
-# ẑ_cur. Same magnitude bracket as the two contrastive heads; sweep if
-# it dominates or under-shoots at later epochs.
-W_PROG = 0.5
+# 4th loss: linear head on [pool(ẑ_finding); pool(z_cur); finding].
+# Same 0.1 weight as the original cosine 5-way (the 0.452 run).
+W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-# Progression logits: mean-over-patches cosine (same as JEPA / gold perpatch).
-PROG_POOLING = "perpatch"
+# Gold / in-training scores come from the head (not cosine).
+PROG_POOLING = "head"
 N_CLS = len(CLS_ORDER)
 
 # Anatomy dual-mask JEPA off for this run (per-patch full-grid only).
@@ -318,6 +315,7 @@ SPLIT_SEED = 42
 #   * ``cbw{beta_tag}_rpri{aa}_rpred{bb}`` — asymmetric report reweighting
 #   * ``..._globalpool``              — archived both-losses global-pool
 #   * ``..._progglobal``              — archived per-patch JEPA + global prog CE
+#   * ``..._proghead``                — per-patch JEPA + [ẑ; z_cur; finding] head
 #   * ``..._wprog{ww}``               — W_PROG != 0.1 (e.g. wprog50 = 0.5)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
@@ -367,6 +365,8 @@ if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0:
 
 if PROG_POOLING == "global":
     _SETTING_TAG = f"{_SETTING_TAG}_progglobal"
+elif PROG_POOLING == "head":
+    _SETTING_TAG = f"{_SETTING_TAG}_proghead"
 if W_PROG != 0.1:
     _SETTING_TAG = f"{_SETTING_TAG}_wprog{_report_weight_tag(W_PROG)}"
 
@@ -484,8 +484,8 @@ if local_rank == 0:
         f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
-        f"(JEPA = mean_p (1-cos(ẑ[p], z_cur[p])); "
-        f"prog = mean_p cos(ẑ^c[p], z_cur[p]))"
+        f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
+        f"prog = Linear([pool(ẑ_find); pool(z_cur); finding]) → 5)"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -672,8 +672,41 @@ def build_progression_prompts(prog_findings):
 
 
 @torch.no_grad()
+def _score_gold_pair_head(raw_model, prior_img, current_img, finding, text_cache):
+    """5-way head logits: [pool(ẑ_finding); pool(z_cur); finding]."""
+    key = finding.strip().lower()
+    if key in text_cache:
+        txt_global, txt_local, token_mask = text_cache[key]
+        txt_global = txt_global.to(DEVICE)
+        txt_local = txt_local.to(DEVICE)
+        token_mask = token_mask.to(DEVICE)
+    else:
+        txt_global, txt_local, token_mask = (
+            raw_model.text_encoder.forward_contrastive([key])
+        )
+        text_cache[key] = (
+            txt_global.detach().cpu(),
+            txt_local.detach().cpu(),
+            token_mask.detach().cpu(),
+        )
+    prior = prior_img.unsqueeze(0).to(DEVICE)
+    current = current_img.unsqueeze(0).to(DEVICE)
+    _, z_prior = raw_model.image_encoder(prior)
+    _, z_cur = raw_model.target_image_encoder(current)
+    zhat = raw_model.predictor(z_prior, txt_local, token_mask)
+    logits = raw_model.progression_logits(
+        zhat, z_cur.detach(), txt_global,
+    )
+    return logits[0].float().tolist()
+
+
+@torch.no_grad()
 def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
-    """5-way scores matching progression CE (PROG_POOLING)."""
+    """5-way scores matching the train progression rule (PROG_POOLING)."""
+    if PROG_POOLING == "head":
+        return _score_gold_pair_head(
+            raw_model, prior_img, current_img, finding, text_cache,
+        )
     prompts, txt_local, token_mask = _encode_prompts(
         raw_model, finding, JEPA_PROMPT_TEMPLATE, DEVICE, text_cache,
     )
@@ -823,15 +856,22 @@ def compute_jepa_losses(
         current_token_mask,
     )
 
-    # 5-way image-image CE on the predictor's class-conditioned ẑ_cur.
-    # Same per-patch cosine as JEPA. ``weight=`` uses Cui CBW.
-    prog = progression_classification_loss(
-        out["pred_progression_patches"].float(),
-        out["current_patches_target"].float(),
-        prog_cls_idx,
-        temperature=PROG_TEMP,
-        class_weights=PROG_CLASS_WEIGHTS,
-    )
+    # 5-way CE on the linear head (or archived cosine 5-way).
+    # ``weight=`` uses Cui CBW.
+    if "prog_logits" in out:
+        prog = F.cross_entropy(
+            out["prog_logits"].float(),
+            prog_cls_idx,
+            weight=PROG_CLASS_WEIGHTS,
+        )
+    else:
+        prog = progression_classification_loss(
+            out["pred_progression_patches"].float(),
+            out["current_patches_target"].float(),
+            prog_cls_idx,
+            temperature=PROG_TEMP,
+            class_weights=PROG_CLASS_WEIGHTS,
+        )
 
     # Anatomy dual-mask JEPA: prior anatomy → ẑ, current anatomy → z_cur.
     # When W_JEPA=0 this is the sole JEPA term.
@@ -897,7 +937,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
         current_reports = batch["current_report"]
         condition_texts = batch["condition_text"]
 
-        prog_prompts = build_progression_prompts(batch["prog_finding"])
         prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
         mask_w_prior = batch["mask_patch_weights_prior"].to(DEVICE)
         mask_w_curr = batch["mask_patch_weights_curr"].to(DEVICE)
@@ -930,7 +969,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 prior_reports,
                 current_reports,
                 condition_texts,
-                progression_prompts_flat=prog_prompts,
+                finding_texts=batch["prog_finding"],
             )
 
             loss, jepa_l, prior_l, pred_l, prog_l, anat_l = (
@@ -994,7 +1033,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
             current_reports = batch["current_report"]
             condition_texts = batch["condition_text"]
 
-            prog_prompts = build_progression_prompts(batch["prog_finding"])
             prog_cls_idx = batch["prog_cls_idx"].to(DEVICE)
             mask_w_prior = batch["mask_patch_weights_prior"].to(DEVICE)
             mask_w_curr = batch["mask_patch_weights_curr"].to(DEVICE)
@@ -1007,7 +1045,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     prior_reports,
                     current_reports,
                     condition_texts,
-                    progression_prompts_flat=prog_prompts,
+                    finding_texts=batch["prog_finding"],
                 )
 
                 total, jepa_l, prior_l, pred_l, prog_l, anat_l = (

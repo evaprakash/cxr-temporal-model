@@ -4,8 +4,9 @@ Run this on the cluster (anywhere ``python -m tempcxr.modules.jepa``
 runs) to verify the new 4th loss is wired correctly and all the safety
 properties the user asked about hold:
 
-  1. The model's forward pass returns ``pred_progression_patches`` with
-     shape ``(B, 5, N, D)``.
+  1. The model's forward pass returns ``prog_logits`` with shape
+     ``(B, 5)`` and (if requested) ``pred_progression_patches``
+     ``(B, 5, N, D)``.
   2. The EMA target encoder's parameters have ``requires_grad=False``
      and the ``current_patches_target`` tensor has ``requires_grad=False``
      (i.e. the actual current patches truly have no gradient path).
@@ -165,6 +166,7 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
         current_reports,
         condition_texts,
         progression_prompts_flat=progression_prompts_flat,
+        finding_texts=prog_findings,
     )
 
     shapes = {k: tuple(v.shape) for k, v in out.items() if torch.is_tensor(v)}
@@ -184,6 +186,16 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
             f"≠ expected {expected}"
         )
         failures.append("pred_progression_patches shape")
+
+    logits = out.get("prog_logits")
+    if logits is not None and tuple(logits.shape) == (B, len(CLS_ORDER)):
+        _pass(f"prog_logits is (B={B}, C={len(CLS_ORDER)})")
+    else:
+        _fail(
+            f"prog_logits missing or wrong shape: "
+            f"{None if logits is None else tuple(logits.shape)}"
+        )
+        failures.append("prog_logits shape")
 
     # ----------------------------------------------------------
     # 2. Stop-grad on the EMA target path
@@ -268,12 +280,7 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
         out["current_txt_local"],
         out["current_token_mask"],
     )
-    prog = progression_classification_loss(
-        out["pred_progression_patches"].float(),
-        out["current_patches_target"].float(),
-        prog_cls_idx,
-        temperature=0.1,
-    )
+    prog = F.cross_entropy(out["prog_logits"].float(), prog_cls_idx)
     total = 1.0 * jepa + 0.1 * prior + 0.1 * pred + 0.1 * prog
 
     _info(f"jepa  = {jepa.item():.4f}")
@@ -304,6 +311,7 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
     tg_norm, tg_n = grad_norm_and_count(model.target_image_encoder)
     txt_norm, txt_n = grad_norm_and_count(model.text_encoder)
     pred_norm, pred_n = grad_norm_and_count(model.predictor)
+    head_norm, head_n = grad_norm_and_count(model.progression_head)
 
     _info(f"||grad image_encoder (online)|| = {on_norm:>8.4f}  "
           f"({on_n} params with grad)")
@@ -313,6 +321,8 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
           f"({txt_n} params with grad)")
     _info(f"||grad predictor||              = {pred_norm:>8.4f}  "
           f"({pred_n} params with grad)")
+    _info(f"||grad progression_head||       = {head_norm:>8.4f}  "
+          f"({head_n} params with grad)")
 
     if tg_norm == 0.0 and tg_n == 0:
         _pass("EMA target encoder received ZERO gradient (no grad path)")
@@ -323,15 +333,16 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
         )
         failures.append("target encoder grad leak")
 
-    if on_norm > 0 and txt_norm > 0 and pred_norm > 0:
+    if on_norm > 0 and txt_norm > 0 and pred_norm > 0 and head_norm > 0:
         _pass(
-            "Online image encoder, text encoder, and predictor all "
-            "received non-zero gradient"
+            "Online image encoder, text encoder, predictor, and "
+            "progression head all received non-zero gradient"
         )
     else:
         _fail(
             f"Some trainable module received no gradient: "
-            f"online={on_norm}, text={txt_norm}, pred={pred_norm}"
+            f"online={on_norm}, text={txt_norm}, pred={pred_norm}, "
+            f"head={head_norm}"
         )
         failures.append("trainable modules grad flow")
 

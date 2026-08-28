@@ -18,7 +18,8 @@ Prints:
 Backends
 --------
 ``jepa``     — JEPA image–image cosine (default **per-patch**; use
-               ``--pooling global`` for global-pool checkpoints)
+               ``--pooling global`` for global-pool checkpoints, or
+               ``--pooling head`` for the [ẑ; z_cur; finding] head)
 ``biovilt``  — official BioViL-T image–text phrase-bank (max phrase
                cosine per class)
 
@@ -26,6 +27,10 @@ Usage
 -----
     python eval_progression_gold_setmatch.py --backend jepa --eval \\
         --ckpt checkpoints_jepa_dynamic_cbw99999/best.pt
+
+    python eval_progression_gold_setmatch.py --backend jepa --eval \\
+        --ckpt checkpoints_jepa_dynamic_cbw99999_proghead/epoch_5.pt \\
+        --pooling head
 
     python eval_progression_gold_setmatch.py --backend biovilt --eval
 
@@ -85,7 +90,38 @@ def jepa_score_one_pair(
     text_cache: Optional[Dict[str, Tuple]] = None,
     pooling: str = "perpatch",
 ) -> Dict:
-    """Return per-class cosines (per-patch or global-pool)."""
+    """Return per-class scores (cosine or progression-head logits)."""
+    if pooling == "head":
+        key = finding.strip().lower()
+        if text_cache is not None and key in text_cache:
+            txt_global, txt_local, token_mask = text_cache[key]
+            txt_global = txt_global.to(device)
+            txt_local = txt_local.to(device)
+            token_mask = token_mask.to(device)
+        else:
+            txt_global, txt_local, token_mask = (
+                model.text_encoder.forward_contrastive([key])
+            )
+            if text_cache is not None:
+                text_cache[key] = (
+                    txt_global.detach().cpu(),
+                    txt_local.detach().cpu(),
+                    token_mask.detach().cpu(),
+                )
+        prior = prior_img.unsqueeze(0).to(device)
+        current = current_img.unsqueeze(0).to(device)
+        _, z_prior = model.image_encoder(prior)
+        _, z_cur = model.target_image_encoder(current)
+        zhat = model.predictor(z_prior, txt_local, token_mask)
+        logits = model.progression_logits(zhat, z_cur.detach(), txt_global)
+        scores = logits[0].float().tolist()
+        pred_class = int(max(range(len(scores)), key=lambda k: scores[k]))
+        return {
+            "cos_class_scores": scores,
+            "pred_class": pred_class,
+            "prompts": [key],
+        }
+
     prompts, txt_local, token_mask = _encode_prompts(
         model, finding, template, device, text_cache,
     )
@@ -204,8 +240,9 @@ def main():
     parser.add_argument(
         "--pooling",
         default="perpatch",
-        choices=["perpatch", "global"],
-        help="JEPA similarity rule (ignored for biovilt).",
+        choices=["perpatch", "global", "head"],
+        help="JEPA similarity rule (ignored for biovilt). "
+             "``head`` = Linear([pool(ẑ); pool(z_cur); finding]).",
     )
     parser.add_argument(
         "--gold-parquet",
