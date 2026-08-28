@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --time=8:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_wprog50_%j.out
 #SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_wprog50_%j.err
 
