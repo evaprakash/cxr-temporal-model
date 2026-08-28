@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_progglobal
+#SBATCH --job-name=jepa_cbw99999_wprog50
 #SBATCH -p batch
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
@@ -7,22 +7,23 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_progglobal_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_progglobal_%j.err
+#SBATCH --time=8:00:00
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_wprog50_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_wprog50_%j.err
 
 # ============================================================
-# SLURM launcher: per-patch JEPA + global-pool progression CE
-# (``cbw99999_progglobal``) on Marlowe project m000081-pm06.
+# SLURM launcher: per-patch JEPA + per-patch progression CE
+# (``cbw99999_wprog50``) on Marlowe project m000081-pm06.
 #
-#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ[p], z_cur[p]))  (unchanged)
-#   * W_PROG = 0.1 — cos(pool(ẑ^c), pool(z_cur))
+#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ[p], z_cur[p]))
+#   * W_PROG = 0.5 — mean_p cos(ẑ^c[p], z_cur[p])  (was 0.1)
 #   * W_ANAT_JEPA = 0 — no anatomy masks / filtering
 #   * Dynamic sentence condition for the JEPA loss
 #   * Report contrastive unchanged (W_REPORT_* = 0.1)
-#   * Writes to checkpoints_jepa_dynamic_cbw99999_progglobal/
+#   * EPOCHS = 6
+#   * Writes to checkpoints_jepa_dynamic_cbw99999_wprog50/
 #   * Rank-0 gold set-match after each epoch (same tables as
-#     eval_progression_gold_setmatch.py --pooling global).
+#     eval_progression_gold_setmatch.py --pooling perpatch).
 #     Skip with: sbatch resume_train_jepa.sh --skip-gold
 #
 # Layout expected under scratch:

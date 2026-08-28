@@ -10,17 +10,16 @@ scale-invariant — so this module exposes:
     ``1 - cos(ẑ_cur, z_cur)`` averaged over patches.
   * ``progression_classification_loss`` for the 4th loss: a 5-way CE on
     image-image cosine *logits*, computed from N candidate ``ẑ_cur^c``
-    (one per progression class). Mean-pool each map, re-normalize, then
-    one ``cos(pool(ẑ^c), pool(z_cur))`` per class (not per-patch
-    cosine). Gold set-match for this run is ``--pooling global``.
-    Supports optional per-class weights (Cui et al. 2019).
+    (one per progression class). Mean-over-patches cosine, same as JEPA,
+    so train rule = gold set-match ``--pooling perpatch``. Supports
+    optional per-class weights (Cui et al. 2019).
   * ``anatomy_masked_pool_jepa_loss`` (optional / off on main): for each
     of 22 fixed CXAS anatomies, soft-pool ``ẑ`` with the prior anatomy
     mask and ``z_cur`` with the current anatomy mask, then take
     ``1 - cos(u, v)``. Kept for ablations; not used when per-patch
     JEPA is the main objective.
-  * ``global_pool_normalize`` used by progression CE and by eval
-    ``--pooling global``.
+  * ``global_pool_normalize`` helper for eval ``--pooling global``
+    ablations (not the main train rule).
   * ``change_localization_loss`` (legacy / other branches): concentrate
     prior-grid change energy inside a finding mask.
 
@@ -83,20 +82,18 @@ def progression_classification_loss(
     eps: float = 1e-8,
     class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """5-way image-image CE: global-pool each map, then one cosine.
+    """5-way image-image CE on per-patch-mean candidate latents.
 
     For each pair ``b`` and progression class ``c``:
 
-        logit[b, c] = cos(pool(ẑ_cur^c[b]), pool(z_cur[b]))
+        logit[b, c] = mean over patches of cos(ẑ_cur^c[b], z_cur[b])
 
-    where ``pool`` is mean over patches then L2-normalize, and
-    ``ẑ_cur^c[b]`` is the predictor's output when conditioned on the
+    where ``ẑ_cur^c[b]`` is the predictor's output when conditioned on the
     class-c prompt ``"{prog_finding[b]} is {class[c]}."``. CE is applied
     to ``logits / temperature`` against the silver progression label.
 
-    This is **not** the JEPA reduction (per-patch cosine, then mean).
-    It is one film-level cosine per class. Eval with
-    ``--pooling global``.
+    Mean-over-patches matches ``jepa_cosine_loss`` and gold set-match
+    ``--pooling perpatch``.
 
     Parameters
     ----------
@@ -137,11 +134,11 @@ def progression_classification_loss(
 
     pred = F.normalize(pred_progression_patches, dim=-1, eps=eps)
     target = F.normalize(current_patches_target, dim=-1, eps=eps)
-    # pred   : (B, C, N, D) → pool N → (B, C, D)
-    # target : (B, N, D)    → pool N → (B, D)
-    pred_g = global_pool_normalize(pred, eps=eps)
-    target_g = global_pool_normalize(target, eps=eps)
-    logits = (pred_g * target_g.unsqueeze(1)).sum(dim=-1)  # (B, C)
+    # Broadcast target over the candidate-class dim:
+    #   pred   : (B, C, N, D)
+    #   target : (B, 1, N, D)
+    cos_per_patch = (pred * target.unsqueeze(1)).sum(dim=-1)  # (B, C, N)
+    logits = cos_per_patch.mean(dim=-1)                        # (B, C)
     logits = logits / temperature
 
     return F.cross_entropy(logits, silver_labels, weight=class_weights)
