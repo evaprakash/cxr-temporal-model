@@ -8,20 +8,22 @@ No training. For each ``(pair, finding)`` group:
   3. Combine into one 5-vector, then the usual set-match
      (single = argmax, multi = top-|GT| Jaccard)
 
-Score scales differ (cosine vs logits), so the default mix is softmax
-on each side then a weighted average of probabilities. JEPA softmax
-uses temperature 0.1 to match training cosine CE; supervised uses 1.0.
+Score scales differ (cosine vs logits), so ``softmax`` mixes
+probabilities. ``gated`` uses JEPA's 5-vector when JEPA is confident
+``stable`` (argmax stable and margin ≥ ``--gate-margin``), otherwise
+the supervised 5-vector. That is meant to keep JEPA's ``stable`` skill
+and supervised's change classes.
 
 Usage
 -----
-    python eval_ensemble_gold_setmatch.py --eval
+    python eval_ensemble_gold_setmatch.py --eval --combine gated
 
     python eval_ensemble_gold_setmatch.py --eval \\
         --jepa-ckpt checkpoints_jepa_dynamic_cbw99999/epoch_5.pt \\
         --supervised-ckpt checkpoints_supervised_progression_unfrozen/epoch_5.pt
 
     # Smoke
-    python eval_ensemble_gold_setmatch.py --eval --limit 50
+    python eval_ensemble_gold_setmatch.py --eval --combine gated --limit 50
 """
 
 from __future__ import annotations
@@ -118,6 +120,21 @@ def load_supervised_model(ckpt_path: str, device: torch.device):
     return model
 
 
+def jepa_stable_gate(
+    jepa_scores: Sequence[float],
+    gate_margin: float,
+    gate_class: str = "stable",
+) -> bool:
+    """True if JEPA argmax is ``gate_class`` and beats the runner-up by ``gate_margin``."""
+    scores = [float(x) for x in jepa_scores]
+    pred = max(range(len(scores)), key=lambda k: scores[k])
+    if CLS_ORDER[pred] != gate_class:
+        return False
+    rest = [s for i, s in enumerate(scores) if i != pred]
+    margin = scores[pred] - (max(rest) if rest else scores[pred])
+    return margin >= gate_margin
+
+
 def combine_scores(
     jepa_scores: Sequence[float],
     sup_scores: Sequence[float],
@@ -126,6 +143,7 @@ def combine_scores(
     sup_weight: float,
     jepa_temp: float,
     sup_temp: float,
+    gate_margin: float = 0.02,
 ) -> List[float]:
     j = torch.tensor(list(jepa_scores), dtype=torch.float32)
     s = torch.tensor(list(sup_scores), dtype=torch.float32)
@@ -136,14 +154,18 @@ def combine_scores(
         pj = F.softmax(j / jepa_temp, dim=0)
         ps = F.softmax(s / sup_temp, dim=0)
         mix = (wj * pj + ws * ps) / (wj + ws)
-    elif combine == "zscore":
+        return mix.tolist()
+    if combine == "zscore":
         def _z(x: torch.Tensor) -> torch.Tensor:
             return (x - x.mean()) / (x.std(unbiased=False) + 1e-8)
 
         mix = (wj * _z(j) + ws * _z(s)) / (wj + ws)
-    else:
-        raise ValueError(f"unknown --combine {combine!r}")
-    return mix.tolist()
+        return mix.tolist()
+    if combine == "gated":
+        if jepa_stable_gate(jepa_scores, gate_margin):
+            return [float(x) for x in jepa_scores]
+        return [float(x) for x in sup_scores]
+    raise ValueError(f"unknown --combine {combine!r}")
 
 
 @torch.no_grad()
@@ -166,11 +188,15 @@ def run_eval(args, groups, image_roots, device):
     jepa: TempCXRJEPA = load_jepa_model(args.jepa_ckpt, device)
     sup = load_supervised_model(args.supervised_ckpt, device)
 
+    extra = ""
+    if args.combine == "gated":
+        extra = f", gate_class=stable gate_margin={args.gate_margin}"
     print(
         f"\n[eval] ensemble set-match on {len(groups)} groups "
         f"(jepa pooling={args.pooling}, combine={args.combine}, "
         f"w_jepa={args.jepa_weight}, w_sup={args.supervised_weight}, "
-        f"jepa_temp={args.jepa_temp}, sup_temp={args.supervised_temp})"
+        f"jepa_temp={args.jepa_temp}, sup_temp={args.supervised_temp}"
+        f"{extra})"
     )
     print(
         "[eval] running: combined = mean of group scores "
@@ -181,6 +207,8 @@ def run_eval(args, groups, image_roots, device):
     skipped = 0
     jepa_cache: Dict[str, Tuple] = {}
     n_agree = 0
+    n_jepa_gate = 0
+    n_sup_gate = 0
 
     for i in range(len(groups)):
         row = groups.iloc[i]
@@ -213,7 +241,13 @@ def run_eval(args, groups, image_roots, device):
             sup_weight=args.supervised_weight,
             jepa_temp=args.jepa_temp,
             sup_temp=args.supervised_temp,
+            gate_margin=args.gate_margin,
         )
+        if args.combine == "gated":
+            if jepa_stable_gate(jepa_out["cos_class_scores"], args.gate_margin):
+                n_jepa_gate += 1
+            else:
+                n_sup_gate += 1
         pred_j = int(
             max(range(len(CLS_ORDER)), key=lambda k: jepa_out["cos_class_scores"][k])
         )
@@ -240,10 +274,23 @@ def run_eval(args, groups, image_roots, device):
         f"[ensemble] single-argmax agreement JEPA vs supervised: "
         f"{n_agree}/{len(results)} = {n_agree / len(results):.4f}"
     )
-    note = (
-        f", {args.combine} w_jepa={args.jepa_weight} "
-        f"w_sup={args.supervised_weight} pooling={args.pooling}"
-    )
+    if args.combine == "gated" and results:
+        print(
+            f"[ensemble] gated: used JEPA on {n_jepa_gate}/{len(results)} "
+            f"= {n_jepa_gate / len(results):.4f} "
+            f"(confident stable, margin>={args.gate_margin}); "
+            f"supervised on {n_sup_gate}/{len(results)}"
+        )
+    if args.combine == "gated":
+        note = (
+            f", gated stable margin>={args.gate_margin} "
+            f"pooling={args.pooling}"
+        )
+    else:
+        note = (
+            f", {args.combine} w_jepa={args.jepa_weight} "
+            f"w_sup={args.supervised_weight} pooling={args.pooling}"
+        )
     print_setmatch_report(results, "ensemble", note)
 
 
@@ -270,8 +317,15 @@ def main():
     parser.add_argument(
         "--combine",
         default="softmax",
-        choices=["softmax", "zscore"],
-        help="How to mix the two 5-vectors (default: softmax then average).",
+        choices=["softmax", "zscore", "gated"],
+        help="softmax/zscore mix, or gated: JEPA if confident stable, "
+             "else supervised.",
+    )
+    parser.add_argument(
+        "--gate-margin",
+        type=float,
+        default=0.02,
+        help="Gated: JEPA (stable − runner-up) cosine margin to take JEPA.",
     )
     parser.add_argument("--jepa-weight", type=float, default=0.5)
     parser.add_argument("--supervised-weight", type=float, default=0.5)

@@ -13,6 +13,7 @@
 
 # ============================================================
 # Gold set-match ensemble: JEPA per-patch cosine + supervised logits.
+# Default combine=gated (JEPA if confident stable, else supervised).
 #
 #   sbatch eval_ensemble_gold_setmatch.sh
 #
@@ -20,7 +21,8 @@
 #   JEPA_CKPT=... SUPERVISED_CKPT=... sbatch eval_ensemble_gold_setmatch.sh
 #
 # Extra flags after sbatch are forwarded, e.g.:
-#   sbatch eval_ensemble_gold_setmatch.sh --combine zscore
+#   sbatch eval_ensemble_gold_setmatch.sh --combine softmax
+#   sbatch eval_ensemble_gold_setmatch.sh --gate-margin 0.03
 #   sbatch eval_ensemble_gold_setmatch.sh --limit 50
 # ============================================================
 
@@ -73,5 +75,5 @@ python eval_ensemble_gold_setmatch.py --eval \
     --jepa-ckpt "$JEPA_CKPT" \
     --supervised-ckpt "$SUP_CKPT" \
     --pooling perpatch \
-    --combine softmax \
+    --combine gated \
     "$@"
