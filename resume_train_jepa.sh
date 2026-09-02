@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_featstd
+#SBATCH --job-name=jepa_cbw99999_featstd50
 #SBATCH -p batch
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
@@ -7,22 +7,22 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --time=6:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_featstd_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_featstd_%j.err
+#SBATCH --time=18:00:00
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_featstd50_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_featstd50_%j.err
 
 # ============================================================
-# SLURM launcher: reported per-patch JEPA (0.452 recipe) + feat-std
-# monitoring. Does NOT overwrite checkpoints_jepa_dynamic_cbw99999/.
+# SLURM launcher: 0.452 recipe on the original 50-epoch schedule
+# plus patch-token std. Fresh dir — will not resume the 5-epoch
+# _featstd run or overwrite checkpoints_jepa_dynamic_cbw99999/.
 #
 #   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ_dyn[p], z_cur[p]))
 #   * W_PROG = 0.1 — per-patch-mean cosine 5-way CE
 #   * Dynamic sentence condition for the JEPA loss
 #   * Report contrastive unchanged (W_REPORT_* = 0.1)
-#   * EPOCHS = 5
-#   * Writes to checkpoints_jepa_dynamic_cbw99999_featstd/
+#   * EPOCHS = 50  (ep5 ≈ mid-schedule, same as the 0.452 ckpt)
+#   * Writes to checkpoints_jepa_dynamic_cbw99999_featstd50/
 #   * Patch-token std every 20 train steps → feat_std_jepa.csv
-#     (plus per-epoch val_metrics_jepa.csv). No W&B.
 #   * Rank-0 gold set-match after each epoch (--pooling perpatch).
 #     Skip with: sbatch resume_train_jepa.sh --skip-gold
 #

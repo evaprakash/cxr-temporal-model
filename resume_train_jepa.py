@@ -17,11 +17,11 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: reported per-patch JEPA (dynamic sentences, W_PROG=0.1
-# cosine 5-way, gold ``--pooling perpatch``) plus patch-token std
-# monitoring (``_featstd`` dir tag). Same recipe as the 0.452 run;
-# writes a new dir so ``checkpoints_jepa_dynamic_cbw99999/`` is not
-# overwritten. Rank-0 gold set-match after every epoch.
+# Current run: same recipe as the 0.452 job (per-patch JEPA, dynamic
+# sentences, W_PROG=0.1, ``EPOCHS=50`` so ep5 is mid-schedule) plus
+# patch-token std (``_featstd50`` dir tag). Does not overwrite
+# ``checkpoints_jepa_dynamic_cbw99999/`` or the 5-epoch ``_featstd``
+# run. Rank-0 gold set-match after every epoch.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -264,7 +264,7 @@ WEIGHT_DECAY = 0.01
 # All 4 losses scale the same way, so this doesn't change the loss
 # balance — only the number of pairs per gradient step.
 BATCH_SIZE = 24
-EPOCHS = 5
+EPOCHS = 50
 WARMUP_RATIO = 0.03
 
 # Checkpoint schedule: save epoch_N.pt every SAVE_EVERY_N_EPOCHS epochs
@@ -321,8 +321,8 @@ SPLIT_SEED = 42
 #   * ``..._progglobal``              — archived per-patch JEPA + global prog CE
 #   * ``..._proghead``                — per-patch JEPA + [ẑ; z_cur; finding] head
 #   * ``..._wprog{ww}``               — W_PROG != 0.1 (e.g. wprog50 = 0.5)
-#   * ``..._featstd``                 — same recipe as the 0.452 run,
-#                                       plus patch-token std logging
+#   * ``..._featstd``                 — 5-epoch anneal + std (archive)
+#   * ``..._featstd50``               — 50-epoch schedule + std (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -375,9 +375,9 @@ elif PROG_POOLING == "head":
     _SETTING_TAG = f"{_SETTING_TAG}_proghead"
 if W_PROG != 0.1:
     _SETTING_TAG = f"{_SETTING_TAG}_wprog{_report_weight_tag(W_PROG)}"
-# Monitored retrain of the reported per-patch recipe. Do not drop this
-# suffix or ``sbatch`` will write into the archived 0.452 checkpoint dir.
-_SETTING_TAG = f"{_SETTING_TAG}_featstd"
+# 50-epoch monitored retrain. Separate from ``_featstd`` (the 5-epoch
+# anneal) and from the archived 0.452 dir.
+_SETTING_TAG = f"{_SETTING_TAG}_featstd50"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
