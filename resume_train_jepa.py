@@ -7,8 +7,7 @@
 #   - Losses:   JEPA per-patch cosine (1 - cos(ẑ, z_cur) mean over patches)
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression head CE on
-#                 [pool(ẑ_finding); pool(z_cur); finding], class-balanced
+#               + Progression 5-way image-image CE, class-balanced
 #                 (Cui et al. 2019, β=0.99999) — see ``CBW_*`` below.
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -18,19 +17,19 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: from-scratch β=0.99999, 6 epochs, W_PROG=0.1
-# (``_proghead`` dir tag). Per-patch JEPA (dynamic sentences) plus a
-# linear head on [pool(ẑ); pool(z_cur); finding]. Finding text uses
-# the same trained BioViL-T encoder (not a second copy). Gold
-# ``--pooling head``. Cosine 5-way CE is off.
+# Current run: reported per-patch JEPA (dynamic sentences, W_PROG=0.1
+# cosine 5-way, gold ``--pooling perpatch``) plus patch-token std
+# monitoring (``_featstd`` dir tag). Same recipe as the 0.452 run;
+# writes a new dir so ``checkpoints_jepa_dynamic_cbw99999/`` is not
+# overwritten. Rank-0 gold set-match after every epoch.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
-#   ``(prog_finding, prog_cls_idx)`` per epoch. The model encodes that
-#   finding name, runs the predictor conditioned on the finding only
-#   (same rule at gold — no dynamic sentences), and applies
-#   ``F.cross_entropy(Linear([pool(ẑ); pool(z_cur); finding]), label,
-#                     weight=class_weights)``.
+#   ``(prog_finding, prog_cls_idx)`` per epoch. The model produces
+#   ``ẑ_cur^c`` for each of the 5 class prompts
+#   ``"{prog_finding} is {class}."`` and applies
+#   ``F.cross_entropy(cos(ẑ_cur^c, z_cur) / τ, silver_label,
+#                     weight=class_weights)`` (mean-over-patches cosine).
 
 import os
 import glob
@@ -80,6 +79,7 @@ from losses_jepa import (
     anatomy_masked_pool_jepa_loss,
     global_pool_normalize,
     jepa_cosine_loss,
+    patch_token_feature_stats,
     progression_classification_loss,
 )
 from silver_masks import N_ANATOMY_MASKS, default_anatomy_masks_root
@@ -132,6 +132,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # templated prompts ``"{prog_finding} is {class}."`` regardless of
 # ``CONDITION_MODE`` — it needs all 5 candidate-class prompts at every
 # step to score the image-image cosine logits.
+#
+# Patch-token std (Chong's collapse check) is logged every
+# ``WANDB_LOG_EVERY`` train steps and at the end of each val epoch.
+# W&B is optional: missing install or no login still trains. Default
+# ``WANDB_MODE=offline`` writes a local run dir you can ``wandb sync``.
+WANDB_LOG_EVERY = int(os.environ.get("WANDB_LOG_EVERY", "20"))
 CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 
 # Cui et al. 2019 "Class-Balanced Loss" hyperparameter for the 4th
@@ -259,7 +265,7 @@ WEIGHT_DECAY = 0.01
 # All 4 losses scale the same way, so this doesn't change the loss
 # balance — only the number of pairs per gradient step.
 BATCH_SIZE = 24
-EPOCHS = 6
+EPOCHS = 5
 WARMUP_RATIO = 0.03
 
 # Checkpoint schedule: save epoch_N.pt every SAVE_EVERY_N_EPOCHS epochs
@@ -271,13 +277,12 @@ SAVE_EVERY_N_EPOCHS = 1
 W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
-# 4th loss: linear head on [pool(ẑ_finding); pool(z_cur); finding].
-# Same 0.1 weight as the original cosine 5-way (the 0.452 run).
+# 4th loss: per-patch-mean cosine 5-way (same as the 0.452 run).
 W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-# Gold / in-training scores come from the head (not cosine).
-PROG_POOLING = "head"
+# Gold / in-training scores: mean_p cos(ẑ^c[p], z_cur[p]).
+PROG_POOLING = "perpatch"
 N_CLS = len(CLS_ORDER)
 
 # Anatomy dual-mask JEPA off for this run (per-patch full-grid only).
@@ -317,6 +322,8 @@ SPLIT_SEED = 42
 #   * ``..._progglobal``              — archived per-patch JEPA + global prog CE
 #   * ``..._proghead``                — per-patch JEPA + [ẑ; z_cur; finding] head
 #   * ``..._wprog{ww}``               — W_PROG != 0.1 (e.g. wprog50 = 0.5)
+#   * ``..._featstd``                 — same recipe as the 0.452 run,
+#                                       plus patch-token std logging
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -369,6 +376,9 @@ elif PROG_POOLING == "head":
     _SETTING_TAG = f"{_SETTING_TAG}_proghead"
 if W_PROG != 0.1:
     _SETTING_TAG = f"{_SETTING_TAG}_wprog{_report_weight_tag(W_PROG)}"
+# Monitored retrain of the reported per-patch recipe. Do not drop this
+# suffix or ``sbatch`` will write into the archived 0.452 checkpoint dir.
+_SETTING_TAG = f"{_SETTING_TAG}_featstd"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -485,7 +495,7 @@ if local_rank == 0:
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
         f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
-        f"prog = Linear([pool(ẑ_find); pool(z_cur); finding]) → 5)"
+        f"prog = per-patch-mean cos 5-way CE)"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -613,13 +623,68 @@ if args.resume is not None:
 # ============================================================
 # CSV HEADER
 # ============================================================
+FEAT_CSV_LOG = os.path.join(LOG_DIR, "feat_std_jepa.csv")
+
 if local_rank == 0 and not os.path.exists(CSV_LOG):
     with open(CSV_LOG, "w") as f:
         f.write(
             "epoch,val_total,val_jepa,val_report_prior,val_report_pred,"
             "val_prog,val_anatjepa,"
+            "val_zhat_std,val_zcur_std,val_zprior_std,"
+            "val_zhat_offdiag_cos,"
             "gold_combined,gold_single,gold_multi\n"
         )
+if local_rank == 0 and not os.path.exists(FEAT_CSV_LOG):
+    with open(FEAT_CSV_LOG, "w") as f:
+        f.write(
+            "step,epoch,zhat_std_over_patches,zcur_std_over_patches,"
+            "zprior_std_over_patches,zhat_mean_offdiag_cos\n"
+        )
+
+
+def _init_wandb():
+    """Rank-0 W&B run, or None if wandb is missing / disabled."""
+    if local_rank != 0:
+        return None
+    if os.environ.get("WANDB_DISABLED", "").lower() in ("1", "true", "yes"):
+        print("[train] WANDB_DISABLED=1 — feat std still goes to CSV / stdout")
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("[train] wandb not installed; feat std still goes to CSV / stdout")
+        return None
+    try:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "cxr-jepa"),
+            name=os.path.basename(CHECKPOINT_DIR.rstrip("/")),
+            mode=os.environ.get("WANDB_MODE", "offline"),
+            dir=os.environ.get("WANDB_DIR", LOG_DIR),
+            config={
+                "condition_mode": CONDITION_MODE,
+                "prog_pooling": PROG_POOLING,
+                "w_jepa": W_JEPA,
+                "w_prog": W_PROG,
+                "w_report_prior": W_REPORT_PRIOR,
+                "w_report_pred": W_REPORT_PRED,
+                "cbw_beta": CBW_BETA,
+                "epochs": EPOCHS,
+                "batch_size": BATCH_SIZE,
+                "lr": LR,
+                "checkpoint_dir": CHECKPOINT_DIR,
+            },
+        )
+    except Exception as exc:
+        print(f"[train] wandb.init failed ({exc}); feat std still goes to CSV")
+        return None
+    print(
+        f"[train] wandb project={os.environ.get('WANDB_PROJECT', 'cxr-jepa')} "
+        f"mode={os.environ.get('WANDB_MODE', 'offline')}"
+    )
+    return wandb
+
+
+wb = _init_wandb()
 
 
 # ============================================================
@@ -969,7 +1034,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 prior_reports,
                 current_reports,
                 condition_texts,
-                finding_texts=batch["prog_finding"],
+                progression_prompts_flat=build_progression_prompts(
+                    batch["prog_finding"]
+                ),
             )
 
             loss, jepa_l, prior_l, pred_l, prog_l, anat_l = (
@@ -997,17 +1064,49 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         running_total += loss.item()
         running_batches += 1
+        global_step = (epoch - 1) * len(train_loader) + batch_idx + 1
+
+        zhat_stats = patch_token_feature_stats(out["pred_current_patches"])
+        zcur_stats = patch_token_feature_stats(out["current_patches_target"])
+        zprior_stats = patch_token_feature_stats(out["prior_patches"])
+        zhat_std = float(zhat_stats["std_over_patches"])
+        zcur_std = float(zcur_stats["std_over_patches"])
+        zprior_std = float(zprior_stats["std_over_patches"])
+        zhat_cos = float(zhat_stats["mean_offdiag_cos"])
 
         if local_rank == 0:
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
-                "anat": f"{anat_l.item():.4f}",
-                "mask": f"{mask_active.float().mean().item():.2f}",
+                "zhat_std": f"{zhat_std:.3f}",
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
             })
+            if global_step % WANDB_LOG_EVERY == 0:
+                with open(FEAT_CSV_LOG, "a") as f:
+                    f.write(
+                        f"{global_step},{epoch},{zhat_std},{zcur_std},"
+                        f"{zprior_std},{zhat_cos}\n"
+                    )
+                if wb is not None:
+                    wb.log(
+                        {
+                            "train/loss": loss.item(),
+                            "train/jepa": jepa_l.item(),
+                            "train/report_prior": prior_l.item(),
+                            "train/report_pred": pred_l.item(),
+                            "train/prog": prog_l.item(),
+                            "train/zhat_std_over_patches": zhat_std,
+                            "train/zcur_std_over_patches": zcur_std,
+                            "train/zprior_std_over_patches": zprior_std,
+                            "train/zhat_mean_offdiag_cos": zhat_cos,
+                            "train/lr": scheduler.get_last_lr()[0],
+                            "train/ema_m": m,
+                            "epoch": epoch,
+                        },
+                        step=global_step,
+                    )
 
     if local_rank == 0:
         print(
@@ -1021,6 +1120,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # ============================================================
     model.eval()
     val_total = val_jepa = val_prior = val_pred = val_prog = val_anatjepa = 0.0
+    val_zhat_std = val_zcur_std = val_zprior_std = val_zhat_cos = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -1045,7 +1145,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     prior_reports,
                     current_reports,
                     condition_texts,
-                    finding_texts=batch["prog_finding"],
+                    progression_prompts_flat=build_progression_prompts(
+                        batch["prog_finding"]
+                    ),
                 )
 
                 total, jepa_l, prior_l, pred_l, prog_l, anat_l = (
@@ -1065,6 +1167,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
             val_pred += pred_l.item()
             val_prog += prog_l.item()
             val_anatjepa += anat_l.item()
+            zs = patch_token_feature_stats(out["pred_current_patches"])
+            zc = patch_token_feature_stats(out["current_patches_target"])
+            zp = patch_token_feature_stats(out["prior_patches"])
+            val_zhat_std += float(zs["std_over_patches"])
+            val_zcur_std += float(zc["std_over_patches"])
+            val_zprior_std += float(zp["std_over_patches"])
+            val_zhat_cos += float(zs["mean_offdiag_cos"])
             val_batches += 1
 
     val_total /= max(val_batches, 1)
@@ -1073,6 +1182,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
     val_pred /= max(val_batches, 1)
     val_prog /= max(val_batches, 1)
     val_anatjepa /= max(val_batches, 1)
+    val_zhat_std /= max(val_batches, 1)
+    val_zcur_std /= max(val_batches, 1)
+    val_zprior_std /= max(val_batches, 1)
+    val_zhat_cos /= max(val_batches, 1)
 
     val_total = ddp_reduce(val_total)
     val_jepa = ddp_reduce(val_jepa)
@@ -1080,6 +1193,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
     val_pred = ddp_reduce(val_pred)
     val_prog = ddp_reduce(val_prog)
     val_anatjepa = ddp_reduce(val_anatjepa)
+    val_zhat_std = ddp_reduce(val_zhat_std)
+    val_zcur_std = ddp_reduce(val_zcur_std)
+    val_zprior_std = ddp_reduce(val_zprior_std)
+    val_zhat_cos = ddp_reduce(val_zhat_cos)
 
     if local_rank == 0:
 
@@ -1090,7 +1207,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"PriorReport={val_prior:.4f} | "
             f"PredReport={val_pred:.4f} | "
             f"Prog={val_prog:.4f} | "
-            f"AnatJEPA={val_anatjepa:.4f}"
+            f"AnatJEPA={val_anatjepa:.4f} | "
+            f"zhat_std={val_zhat_std:.4f} | "
+            f"zhat_offdiag_cos={val_zhat_cos:.4f}"
         )
 
         ckpt = {
@@ -1129,10 +1248,32 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f.write(
                 f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred},"
                 f"{val_prog},{val_anatjepa},"
+                f"{val_zhat_std},{val_zcur_std},{val_zprior_std},"
+                f"{val_zhat_cos},"
                 f"{gold_combined},{gold_single},{gold_multi}\n"
             )
+        if wb is not None:
+            payload = {
+                "val/total": val_total,
+                "val/jepa": val_jepa,
+                "val/report_prior": val_prior,
+                "val/report_pred": val_pred,
+                "val/prog": val_prog,
+                "val/zhat_std_over_patches": val_zhat_std,
+                "val/zcur_std_over_patches": val_zcur_std,
+                "val/zprior_std_over_patches": val_zprior_std,
+                "val/zhat_mean_offdiag_cos": val_zhat_cos,
+                "epoch": epoch,
+            }
+            if gold_combined != "":
+                payload["gold/combined"] = float(gold_combined)
+                payload["gold/single"] = float(gold_single)
+                payload["gold/multi"] = float(gold_multi)
+            wb.log(payload, step=epoch * len(train_loader))
 
     if WORLD_SIZE > 1:
         dist.barrier()
 
+if wb is not None:
+    wb.finish()
 dist.destroy_process_group()

@@ -28,7 +28,7 @@ unchanged; they re-L2-normalize their inputs internally, so passing
 already-unit-norm patches is a no-op.
 """
 
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -69,6 +69,44 @@ def jepa_cosine_loss(
     target = F.normalize(target, dim=-1, eps=eps)
     cos_per_patch = (pred * target).sum(dim=-1)  # (B, N)
     return (1.0 - cos_per_patch).mean()
+
+
+@torch.no_grad()
+def patch_token_feature_stats(
+    patches: torch.Tensor,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """Detect JEPA token collapse on a ``(B, N, D)`` patch grid.
+
+    Collapse looks like a low JEPA cosine loss *and* every patch token
+    becoming the same vector. That shows up as:
+
+      * ``std_over_patches`` → 0  (std over N, then mean over B, D)
+      * ``mean_offdiag_cos`` → 1  (patches are interchangeable)
+
+    ``std_over_batch`` is the std of each dim over all ``B*N`` tokens
+    (overall feature diversity). Cheap; no extra encoder pass.
+    """
+    z = patches.detach().float()
+    zero = z.new_zeros(())
+    if z.ndim != 3 or z.size(1) < 2 or z.numel() == 0:
+        return {
+            "std_over_patches": zero,
+            "std_over_batch": zero,
+            "mean_offdiag_cos": zero,
+        }
+    B, N, D = z.shape
+    std_over_patches = z.std(dim=1, unbiased=False).mean()
+    std_over_batch = z.reshape(-1, D).std(dim=0, unbiased=False).mean()
+    zn = F.normalize(z, dim=-1, eps=eps)
+    sim = torch.bmm(zn, zn.transpose(1, 2))
+    off = sim.sum() - sim.diagonal(dim1=-2, dim2=-1).sum()
+    mean_offdiag_cos = off / float(B * N * (N - 1))
+    return {
+        "std_over_patches": std_over_patches,
+        "std_over_batch": std_over_batch,
+        "mean_offdiag_cos": mean_offdiag_cos,
+    }
 
 
 # =========================================================

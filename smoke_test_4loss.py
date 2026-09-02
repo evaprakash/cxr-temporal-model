@@ -49,7 +49,11 @@ import torch
 import torch.nn.functional as F
 
 from losses import local_contrastive_loss
-from losses_jepa import jepa_cosine_loss, progression_classification_loss
+from losses_jepa import (
+    jepa_cosine_loss,
+    patch_token_feature_stats,
+    progression_classification_loss,
+)
 from progression_phrases import CLS_ORDER
 from tempcxr.modules.jepa import TempCXRJEPA
 
@@ -501,6 +505,34 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
             f"pair-major class-minor or the model has random state."
         )
         failures.append("prompt ordering")
+
+    # ----------------------------------------------------------
+    # 9. Patch-token std flags identical tokens as collapse
+    # ----------------------------------------------------------
+    _section("9. Patch-token feature std (collapse monitor)")
+    diverse = torch.randn(2, 16, 8)
+    collapsed = torch.zeros(2, 16, 8)
+    collapsed[:, :, 0] = 1.0
+    d = patch_token_feature_stats(diverse)
+    c = patch_token_feature_stats(collapsed)
+    _info(
+        f"diverse std_over_patches={float(d['std_over_patches']):.4f}  "
+        f"offdiag_cos={float(d['mean_offdiag_cos']):.4f}"
+    )
+    _info(
+        f"collapsed std_over_patches={float(c['std_over_patches']):.4f}  "
+        f"offdiag_cos={float(c['mean_offdiag_cos']):.4f}"
+    )
+    if float(c["std_over_patches"]) < 1e-6 and float(c["mean_offdiag_cos"]) > 0.99:
+        _pass("identical patch tokens → std≈0 and offdiag cos≈1")
+    else:
+        _fail("collapse monitor missed the constant-token case")
+        failures.append("feat std collapse")
+    if float(d["std_over_patches"]) > float(c["std_over_patches"]):
+        _pass("diverse tokens have larger std_over_patches than collapsed")
+    else:
+        _fail("diverse tokens did not outrank collapsed on std")
+        failures.append("feat std diverse")
 
     # ----------------------------------------------------------
     # SUMMARY
