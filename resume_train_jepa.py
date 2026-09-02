@@ -133,11 +133,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # ``CONDITION_MODE`` — it needs all 5 candidate-class prompts at every
 # step to score the image-image cosine logits.
 #
-# Patch-token std (Chong's collapse check) is logged every
-# ``WANDB_LOG_EVERY`` train steps and at the end of each val epoch.
-# W&B is optional: missing install or no login still trains. Default
-# ``WANDB_MODE=offline`` writes a local run dir you can ``wandb sync``.
-WANDB_LOG_EVERY = int(os.environ.get("WANDB_LOG_EVERY", "20"))
+# Patch-token std (Chong's collapse check) is written to
+# ``feat_std_jepa.csv`` every ``FEAT_LOG_EVERY`` train steps, and to
+# ``val_metrics_jepa.csv`` at the end of each val epoch. No W&B.
+FEAT_LOG_EVERY = int(os.environ.get("FEAT_LOG_EVERY", "20"))
 CONDITION_MODE = os.environ.get("CONDITION_MODE", "dynamic")
 
 # Cui et al. 2019 "Class-Balanced Loss" hyperparameter for the 4th
@@ -640,51 +639,7 @@ if local_rank == 0 and not os.path.exists(FEAT_CSV_LOG):
             "step,epoch,zhat_std_over_patches,zcur_std_over_patches,"
             "zprior_std_over_patches,zhat_mean_offdiag_cos\n"
         )
-
-
-def _init_wandb():
-    """Rank-0 W&B run, or None if wandb is missing / disabled."""
-    if local_rank != 0:
-        return None
-    if os.environ.get("WANDB_DISABLED", "").lower() in ("1", "true", "yes"):
-        print("[train] WANDB_DISABLED=1 — feat std still goes to CSV / stdout")
-        return None
-    try:
-        import wandb
-    except ImportError:
-        print("[train] wandb not installed; feat std still goes to CSV / stdout")
-        return None
-    try:
-        wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "cxr-jepa"),
-            name=os.path.basename(CHECKPOINT_DIR.rstrip("/")),
-            mode=os.environ.get("WANDB_MODE", "offline"),
-            dir=os.environ.get("WANDB_DIR", LOG_DIR),
-            config={
-                "condition_mode": CONDITION_MODE,
-                "prog_pooling": PROG_POOLING,
-                "w_jepa": W_JEPA,
-                "w_prog": W_PROG,
-                "w_report_prior": W_REPORT_PRIOR,
-                "w_report_pred": W_REPORT_PRED,
-                "cbw_beta": CBW_BETA,
-                "epochs": EPOCHS,
-                "batch_size": BATCH_SIZE,
-                "lr": LR,
-                "checkpoint_dir": CHECKPOINT_DIR,
-            },
-        )
-    except Exception as exc:
-        print(f"[train] wandb.init failed ({exc}); feat std still goes to CSV")
-        return None
-    print(
-        f"[train] wandb project={os.environ.get('WANDB_PROJECT', 'cxr-jepa')} "
-        f"mode={os.environ.get('WANDB_MODE', 'offline')}"
-    )
-    return wandb
-
-
-wb = _init_wandb()
+    print(f"[train] feat-std CSV: {FEAT_CSV_LOG} (every {FEAT_LOG_EVERY} steps)")
 
 
 # ============================================================
@@ -1083,29 +1038,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
             })
-            if global_step % WANDB_LOG_EVERY == 0:
+            if global_step % FEAT_LOG_EVERY == 0:
                 with open(FEAT_CSV_LOG, "a") as f:
                     f.write(
                         f"{global_step},{epoch},{zhat_std},{zcur_std},"
                         f"{zprior_std},{zhat_cos}\n"
-                    )
-                if wb is not None:
-                    wb.log(
-                        {
-                            "train/loss": loss.item(),
-                            "train/jepa": jepa_l.item(),
-                            "train/report_prior": prior_l.item(),
-                            "train/report_pred": pred_l.item(),
-                            "train/prog": prog_l.item(),
-                            "train/zhat_std_over_patches": zhat_std,
-                            "train/zcur_std_over_patches": zcur_std,
-                            "train/zprior_std_over_patches": zprior_std,
-                            "train/zhat_mean_offdiag_cos": zhat_cos,
-                            "train/lr": scheduler.get_last_lr()[0],
-                            "train/ema_m": m,
-                            "epoch": epoch,
-                        },
-                        step=global_step,
                     )
 
     if local_rank == 0:
@@ -1252,28 +1189,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 f"{val_zhat_cos},"
                 f"{gold_combined},{gold_single},{gold_multi}\n"
             )
-        if wb is not None:
-            payload = {
-                "val/total": val_total,
-                "val/jepa": val_jepa,
-                "val/report_prior": val_prior,
-                "val/report_pred": val_pred,
-                "val/prog": val_prog,
-                "val/zhat_std_over_patches": val_zhat_std,
-                "val/zcur_std_over_patches": val_zcur_std,
-                "val/zprior_std_over_patches": val_zprior_std,
-                "val/zhat_mean_offdiag_cos": val_zhat_cos,
-                "epoch": epoch,
-            }
-            if gold_combined != "":
-                payload["gold/combined"] = float(gold_combined)
-                payload["gold/single"] = float(gold_single)
-                payload["gold/multi"] = float(gold_multi)
-            wb.log(payload, step=epoch * len(train_loader))
 
     if WORLD_SIZE > 1:
         dist.barrier()
 
-if wb is not None:
-    wb.finish()
 dist.destroy_process_group()

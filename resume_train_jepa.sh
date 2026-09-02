@@ -21,7 +21,8 @@
 #   * Report contrastive unchanged (W_REPORT_* = 0.1)
 #   * EPOCHS = 5
 #   * Writes to checkpoints_jepa_dynamic_cbw99999_featstd/
-#   * Patch-token std every WANDB_LOG_EVERY train steps (CSV + W&B)
+#   * Patch-token std every 20 train steps → feat_std_jepa.csv
+#     (plus per-epoch val_metrics_jepa.csv). No W&B.
 #   * Rank-0 gold set-match after each epoch (--pooling perpatch).
 #     Skip with: sbatch resume_train_jepa.sh --skip-gold
 #
@@ -44,12 +45,6 @@ export NCCL_P2P_DISABLE=1
 export PYTHONFAULTHANDLER=1
 export PYTHONUNBUFFERED=1
 
-# W&B: offline by default so the job does not need a login. Sync later
-# with: wandb sync logs_dynamic_cbw99999_featstd/wandb/offline-run-*
-export WANDB_MODE="${WANDB_MODE:-offline}"
-export WANDB_PROJECT="${WANDB_PROJECT:-cxr-jepa}"
-export WANDB_LOG_EVERY="${WANDB_LOG_EVERY:-20}"
-
 SCRATCH_BASE="${SCRATCH_BASE:-/scratch/m000081-pm06/eprakash}"
 PROJECT_DIR="${PROJECT_DIR:-$SCRATCH_BASE/cxr-temporal-model}"
 cd "$PROJECT_DIR" || {
@@ -70,11 +65,8 @@ export PYTHONPATH="${HI_ML_SRC}${PYTHONPATH:+:$PYTHONPATH}"
 
 export CHEXTEMPORAL_DIR="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
 export JEPA_IMAGE_ROOTS_DIR="${JEPA_IMAGE_ROOTS_DIR:-$SCRATCH_BASE/all_data}"
-export WANDB_DIR="${WANDB_DIR:-$PROJECT_DIR/logs_dynamic_cbw99999_featstd}"
 echo "[slurm] CHEXTEMPORAL_DIR     = $CHEXTEMPORAL_DIR"
 echo "[slurm] JEPA_IMAGE_ROOTS_DIR = $JEPA_IMAGE_ROOTS_DIR"
-echo "[slurm] WANDB_MODE           = $WANDB_MODE"
-echo "[slurm] WANDB_PROJECT        = $WANDB_PROJECT"
 for d in \
     "$JEPA_IMAGE_ROOTS_DIR/mimic" \
     "$JEPA_IMAGE_ROOTS_DIR/chexpert/train" \
@@ -85,6 +77,6 @@ do
     fi
 done
 
-mkdir -p "$SCRATCH_BASE/logs" "$WANDB_DIR"
+mkdir -p "$SCRATCH_BASE/logs"
 
 torchrun --nproc_per_node=4 resume_train_jepa.py "$@"
