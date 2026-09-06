@@ -17,11 +17,11 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: same recipe as the 0.452 job (per-patch JEPA, dynamic
-# sentences, W_PROG=0.1, ``EPOCHS=50`` so ep5 is mid-schedule) plus
-# patch-token std (``_featstd50`` dir tag). Does not overwrite
-# ``checkpoints_jepa_dynamic_cbw99999/`` or the 5-epoch ``_featstd``
-# run. Rank-0 gold set-match after every epoch.
+# Current run: 0.452 recipe with GLoRIA report contrastive off
+# (W_REPORT_PRIOR = W_REPORT_PRED = 0). Everything else unchanged:
+# per-patch JEPA, dynamic sentences, W_PROG=0.1, EPOCHS=50, gold
+# set-match after every epoch. Dir tag ``_rp00`` so this does not
+# resume ``_featstd50`` or overwrite the 0.452 ckpts.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -271,11 +271,11 @@ WARMUP_RATIO = 0.03
 # (1 = every epoch), plus best.pt whenever val total improves.
 SAVE_EVERY_N_EPOCHS = 1
 
-# Loss weights (baseline report contrastive = 0.10).
-# Per-patch JEPA: mean over patches of 1 - cos(ẑ[p], z_cur[p]).
+# Loss weights. GLoRIA local contrastive is off for this ablation
+# (is it load-bearing for 5-way?). Per-patch JEPA unchanged.
 W_JEPA = 1.0
-W_REPORT_PRIOR = 0.1
-W_REPORT_PRED = 0.1
+W_REPORT_PRIOR = 0.0
+W_REPORT_PRED = 0.0
 # 4th loss: per-patch-mean cosine 5-way (same as the 0.452 run).
 W_PROG = 0.1
 PROG_TEMP = 0.1
@@ -322,7 +322,8 @@ SPLIT_SEED = 42
 #   * ``..._proghead``                — per-patch JEPA + [ẑ; z_cur; finding] head
 #   * ``..._wprog{ww}``               — W_PROG != 0.1 (e.g. wprog50 = 0.5)
 #   * ``..._featstd``                 — 5-epoch anneal + std (archive)
-#   * ``..._featstd50``               — 50-epoch schedule + std (this run)
+#   * ``..._featstd50``               — 50-epoch schedule + std (archive)
+#   * ``..._rp00``                    — GLoRIA off (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -375,9 +376,6 @@ elif PROG_POOLING == "head":
     _SETTING_TAG = f"{_SETTING_TAG}_proghead"
 if W_PROG != 0.1:
     _SETTING_TAG = f"{_SETTING_TAG}_wprog{_report_weight_tag(W_PROG)}"
-# 50-epoch monitored retrain. Separate from ``_featstd`` (the 5-epoch
-# anneal) and from the archived 0.452 dir.
-_SETTING_TAG = f"{_SETTING_TAG}_featstd50"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -490,6 +488,7 @@ if local_rank == 0:
     print(
         f"[train] per-patch JEPA + {PROG_POOLING} prog CE: "
         f"W_JEPA={W_JEPA} W_PROG={W_PROG} "
+        f"W_REPORT_PRIOR={W_REPORT_PRIOR} W_REPORT_PRED={W_REPORT_PRED} "
         f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
