@@ -17,11 +17,11 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: 0.452 recipe with GLoRIA report contrastive off
-# (W_REPORT_PRIOR = W_REPORT_PRED = 0). Everything else unchanged:
-# per-patch JEPA, dynamic sentences, W_PROG=0.1, EPOCHS=50, gold
-# set-match after every epoch. Dir tag ``_rp00`` so this does not
-# resume ``_featstd50`` or overwrite the 0.452 ckpts.
+# Current run: 0.452 recipe with GLoRIA on and the full text encoder
+# frozen (CXR-BERT + 768→128 proj, eval-mode dropout off). Image
+# encoder + predictor still train; images walk toward fixed official
+# BioViL-T word vectors. Dir tag ``_txtfrz`` so this does not resume
+# ``_rp00`` / ``_featstd50`` or overwrite the 0.452 ckpts.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -271,11 +271,13 @@ WARMUP_RATIO = 0.03
 # (1 = every epoch), plus best.pt whenever val total improves.
 SAVE_EVERY_N_EPOCHS = 1
 
-# Loss weights. GLoRIA local contrastive is off for this ablation
-# (is it load-bearing for 5-way?). Per-patch JEPA unchanged.
+# Loss weights. GLoRIA local contrastive back on (images → frozen
+# official report tokens). Per-patch JEPA unchanged.
 W_JEPA = 1.0
-W_REPORT_PRIOR = 0.0
-W_REPORT_PRED = 0.0
+W_REPORT_PRIOR = 0.1
+W_REPORT_PRED = 0.1
+# Full text encoder (BERT + projection) is a frozen conditioner.
+FREEZE_TEXT_ENCODER = True
 # 4th loss: per-patch-mean cosine 5-way (same as the 0.452 run).
 W_PROG = 0.1
 PROG_TEMP = 0.1
@@ -323,7 +325,8 @@ SPLIT_SEED = 42
 #   * ``..._wprog{ww}``               — W_PROG != 0.1 (e.g. wprog50 = 0.5)
 #   * ``..._featstd``                 — 5-epoch anneal + std (archive)
 #   * ``..._featstd50``               — 50-epoch schedule + std (archive)
-#   * ``..._rp00``                    — GLoRIA off (this run)
+#   * ``..._rp00``                    — GLoRIA off, text trained (archive)
+#   * ``..._txtfrz``                  — GLoRIA on, full text frozen (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -376,6 +379,8 @@ elif PROG_POOLING == "head":
     _SETTING_TAG = f"{_SETTING_TAG}_proghead"
 if W_PROG != 0.1:
     _SETTING_TAG = f"{_SETTING_TAG}_wprog{_report_weight_tag(W_PROG)}"
+if FREEZE_TEXT_ENCODER:
+    _SETTING_TAG = f"{_SETTING_TAG}_txtfrz"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -489,6 +494,7 @@ if local_rank == 0:
         f"[train] per-patch JEPA + {PROG_POOLING} prog CE: "
         f"W_JEPA={W_JEPA} W_PROG={W_PROG} "
         f"W_REPORT_PRIOR={W_REPORT_PRIOR} W_REPORT_PRED={W_REPORT_PRED} "
+        f"freeze_text_encoder={FREEZE_TEXT_ENCODER} "
         f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
@@ -550,7 +556,18 @@ val_loader = DataLoader(
 # ============================================================
 # MODEL
 # ============================================================
-model = TempCXRJEPA().to(DEVICE)
+model = TempCXRJEPA(freeze_text_encoder=FREEZE_TEXT_ENCODER).to(DEVICE)
+if FREEZE_TEXT_ENCODER:
+    n_txt = sum(p.numel() for p in model.text_encoder.parameters())
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_all = sum(p.numel() for p in model.parameters())
+    if any(p.requires_grad for p in model.text_encoder.parameters()):
+        raise RuntimeError("text encoder still has trainable params")
+    if local_rank == 0:
+        print(
+            f"[train] text encoder FROZEN ({n_txt:,} params, eval-mode). "
+            f"trainable {n_train:,} / {n_all:,}"
+        )
 model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
 optimizer = AdamW(

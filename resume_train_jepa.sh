@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_rp00
+#SBATCH --job-name=jepa_cbw99999_txtfrz
 #SBATCH -p batch
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
@@ -8,18 +8,19 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=18:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_rp00_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_rp00_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_txtfrz_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_txtfrz_%j.err
 
 # ============================================================
-# SLURM launcher: 0.452 recipe with GLoRIA contrastive off.
+# SLURM launcher: 0.452 recipe, GLoRIA on, full text encoder frozen.
 #
 #   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ_dyn[p], z_cur[p]))
 #   * W_PROG = 0.1 — per-patch-mean cosine 5-way CE
-#   * W_REPORT_PRIOR = W_REPORT_PRED = 0  (no local contrastive)
+#   * W_REPORT_PRIOR = W_REPORT_PRED = 0.1  (GLoRIA on)
+#   * Text encoder frozen (CXR-BERT + projection, eval-mode)
 #   * Dynamic sentence condition for the JEPA loss
 #   * EPOCHS = 50
-#   * Writes to checkpoints_jepa_dynamic_cbw99999_rp00/
+#   * Writes to checkpoints_jepa_dynamic_cbw99999_txtfrz/
 #   * Rank-0 gold set-match after each epoch (--pooling perpatch).
 #     Skip with: sbatch resume_train_jepa.sh --skip-gold
 #

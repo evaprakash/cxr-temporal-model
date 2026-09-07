@@ -230,7 +230,10 @@ class TempCXRJEPA(nn.Module):
     Holds:
       - ``image_encoder``        : online BioViL-T (raw, no L2) — trained.
       - ``target_image_encoder`` : EMA copy of ``image_encoder`` — frozen.
-      - ``text_encoder``         : BioViL-T text encoder — trained.
+      - ``text_encoder``         : BioViL-T text encoder (CXR-BERT +
+                                   768→128 proj). Frozen when
+                                   ``freeze_text_encoder=True`` (kept
+                                   in ``eval`` so dropout is off).
       - ``predictor``            : IJEPATemporalPredictor — trained.
 
     Returns a dict of representations; losses live in ``losses.py`` and
@@ -254,6 +257,7 @@ class TempCXRJEPA(nn.Module):
         d_model: int = 128,
         predictor_depth: int = 6,
         predictor_heads: int = 4,
+        freeze_text_encoder: bool = False,
     ):
         super().__init__()
 
@@ -278,6 +282,22 @@ class TempCXRJEPA(nn.Module):
         # Supervised-style linear readout on the JEPA pair:
         # [pool(ẑ_finding); pool(z_cur); finding_global] → 5 classes.
         self.progression_head = nn.Linear(3 * d_model, 5)
+        self._text_encoder_frozen = False
+        if freeze_text_encoder:
+            self.freeze_text_encoder()
+
+    def freeze_text_encoder(self) -> None:
+        """Freeze CXR-BERT + projection; keep the module in eval."""
+        for p in self.text_encoder.parameters():
+            p.requires_grad_(False)
+        self.text_encoder.eval()
+        self._text_encoder_frozen = True
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self._text_encoder_frozen:
+            self.text_encoder.eval()
+        return self
 
     @staticmethod
     def normalize_finding_texts(finding_texts):
