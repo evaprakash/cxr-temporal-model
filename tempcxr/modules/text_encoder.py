@@ -121,9 +121,14 @@ class BioViLTTextEncoder(nn.Module):
         self.proj_dim = self.model.config.projection_size    # 128
 
         # ------------------------------------------------------------
-        # φ_txt projection (same as CLS projection head)
+        # Local 768→128 map. BioViL-T only ships ``cls_projection_head``
+        # (used for the CLS global). There is no separate local head, so
+        # we instantiate the same module class and copy those official
+        # weights. GLoRIA + the JEPA predictor consume this, not a
+        # random Linear.
         # ------------------------------------------------------------
         self.text_projection = BertProjectionHead(self.model.config)
+        self._init_local_proj_from_official_cls(model_name)
 
         # ------------------------------------------------------------
         # Unprojection back to BERT hidden space (for MLM)
@@ -134,6 +139,91 @@ class BioViLTTextEncoder(nn.Module):
         # Image-guided cross-attention (joint space)
         # ------------------------------------------------------------
         self.cross_attn = ImageGuidedCrossAttention(dim=self.proj_dim)
+
+    def _load_pretrained_cls_proj_tensors(self, model_name: str) -> dict:
+        """``cls_projection_head.*`` tensors from the on-disk BioViL-T ckpt."""
+        candidates = (
+            os.path.join(model_name, "model.safetensors"),
+            os.path.join(model_name, "pytorch_model.bin"),
+        )
+        path = next((p for p in candidates if os.path.isfile(p)), None)
+        if path is None:
+            raise RuntimeError(
+                f"no BioViL-T weights at {model_name} "
+                f"(looked for model.safetensors / pytorch_model.bin)"
+            )
+        if path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            blob = load_file(path)
+        else:
+            try:
+                try:
+                blob = torch.load(path, map_location="cpu", weights_only=True)
+            except TypeError:
+                blob = torch.load(path, map_location="cpu")
+            except TypeError:
+                blob = torch.load(path, map_location="cpu")
+        prefix = "cls_projection_head."
+        tensors = {
+            k[len(prefix):]: v for k, v in blob.items() if k.startswith(prefix)
+        }
+        if not tensors:
+            raise RuntimeError(
+                f"{path} has no '{prefix}*' keys; cannot init local "
+                f"text_projection from official BioViL-T. "
+                f"keys sample: {list(blob)[:8]}"
+            )
+        return tensors
+
+    def _init_local_proj_from_official_cls(self, model_name: str) -> None:
+        """Copy official ``cls_projection_head`` into ``text_projection``.
+
+        Verifies the live CXR-BERT head matches the file on disk, then
+        copies it. Raises if either step would leave a random proj.
+        """
+        src = getattr(self.model, "cls_projection_head", None)
+        if src is None:
+            raise RuntimeError(
+                "CXRBertModel has no cls_projection_head after "
+                "from_pretrained; refusing to leave text_projection random"
+            )
+        file_tensors = self._load_pretrained_cls_proj_tensors(model_name)
+        live = {k: v.detach().cpu() for k, v in src.state_dict().items()}
+        if set(live) != set(file_tensors):
+            raise RuntimeError(
+                f"cls_projection_head keys != checkpoint: "
+                f"live={sorted(live)} file={sorted(file_tensors)}"
+            )
+        for k in live:
+            if not torch.allclose(live[k].float(), file_tensors[k].float()):
+                raise RuntimeError(
+                    f"live cls_projection_head.{k} does not match "
+                    f"{model_name} (from_pretrained did not load official proj)"
+                )
+        incompatible = self.text_projection.load_state_dict(src.state_dict(), strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"text_projection load_state_dict mismatch: {incompatible}"
+            )
+        self.assert_local_proj_matches_official_cls()
+
+    def assert_local_proj_matches_official_cls(self) -> None:
+        """Fail if local 768→128 weights != official CLS projector."""
+        src = self.model.cls_projection_head
+        dst = self.text_projection
+        src_sd = src.state_dict()
+        dst_sd = dst.state_dict()
+        if set(src_sd) != set(dst_sd):
+            raise RuntimeError(
+                f"proj key mismatch: cls={sorted(src_sd)} "
+                f"local={sorted(dst_sd)}"
+            )
+        for k in src_sd:
+            if not torch.equal(src_sd[k], dst_sd[k]):
+                raise RuntimeError(
+                    f"text_projection.{k} != cls_projection_head.{k} "
+                    f"(local proj is not the official BioViL-T head)"
+                )
 
     # ============================================================
     # CONTRASTIVE FORWARD (TEXT ONLY)

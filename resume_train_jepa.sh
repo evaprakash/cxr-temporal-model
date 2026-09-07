@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_cbw99999_txtfrz
+#SBATCH --job-name=jepa_cbw99999_txtfrzcls
 #SBATCH -p batch
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
@@ -7,23 +7,21 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --time=18:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_txtfrz_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_txtfrz_%j.err
+#SBATCH --time=3:00:00
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_txtfrzcls_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_cbw99999_txtfrzcls_%j.err
 
 # ============================================================
-# SLURM launcher: 0.452 recipe, GLoRIA on, full text encoder frozen.
+# SLURM launcher: GLoRIA on, text frozen, official CLS proj copied.
 #
 #   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ_dyn[p], z_cur[p]))
 #   * W_PROG = 0.1 — per-patch-mean cosine 5-way CE
 #   * W_REPORT_PRIOR = W_REPORT_PRED = 0.1  (GLoRIA on)
-#   * Text encoder frozen (CXR-BERT + projection, eval-mode)
+#   * Text frozen (CXR-BERT + local 768→128 = official cls_projection_head)
 #   * EMA 0.996 → 1.0 (I-JEPA default)
-#   * Dynamic sentence condition for the JEPA loss
-#   * EPOCHS = 50
-#   * Writes to checkpoints_jepa_dynamic_cbw99999_txtfrz/
+#   * Writes to checkpoints_jepa_dynamic_cbw99999_txtfrzcls/
+#     (does NOT resume _txtfrz, which froze a random local proj)
 #   * Rank-0 gold set-match after each epoch (--pooling perpatch).
-#     Skip with: sbatch resume_train_jepa.sh --skip-gold
 #
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model

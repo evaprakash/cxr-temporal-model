@@ -17,12 +17,10 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: 0.452 recipe with GLoRIA on and the full text encoder
-# frozen (CXR-BERT + 768→128 proj, eval-mode dropout off). Image
-# encoder + predictor still train; images walk toward fixed official
-# BioViL-T word vectors. EMA stays I-JEPA 0.996 → 1.0. Dir tag
-# ``_txtfrz`` so this does not resume ``_rp00`` / ``_featstd50`` or
-# overwrite the 0.452 ckpts.
+# Current run: GLoRIA on, text frozen, local 768→128 = official
+# BioViL-T ``cls_projection_head`` (copied from the pretrained file,
+# not a random BertProjectionHead). Dir tag ``_txtfrzcls`` so this
+# does not resume the broken ``_txtfrz`` (random local proj) run.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -327,7 +325,8 @@ SPLIT_SEED = 42
 #   * ``..._featstd``                 — 5-epoch anneal + std (archive)
 #   * ``..._featstd50``               — 50-epoch schedule + std (archive)
 #   * ``..._rp00``                    — GLoRIA off, text trained (archive)
-#   * ``..._txtfrz``                  — GLoRIA on, full text frozen (this run)
+#   * ``..._txtfrz``                  — GLoRIA on, text frozen, random local proj (archive)
+#   * ``..._txtfrzcls``               — same + official CLS proj copied (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -381,7 +380,7 @@ elif PROG_POOLING == "head":
 if W_PROG != 0.1:
     _SETTING_TAG = f"{_SETTING_TAG}_wprog{_report_weight_tag(W_PROG)}"
 if FREEZE_TEXT_ENCODER:
-    _SETTING_TAG = f"{_SETTING_TAG}_txtfrz"
+    _SETTING_TAG = f"{_SETTING_TAG}_txtfrzcls"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -558,6 +557,15 @@ val_loader = DataLoader(
 # MODEL
 # ============================================================
 model = TempCXRJEPA(freeze_text_encoder=FREEZE_TEXT_ENCODER).to(DEVICE)
+model.text_encoder.assert_local_proj_matches_official_cls()
+_w = model.text_encoder.text_projection.dense_to_hidden.weight
+_w_cls = model.text_encoder.model.cls_projection_head.dense_to_hidden.weight
+if local_rank == 0:
+    print(
+        f"[train] text_projection == official cls_projection_head "
+        f"(dense_to_hidden {tuple(_w.shape)} ||W||={_w.norm().item():.4f} "
+        f"match={bool(torch.equal(_w, _w_cls))})"
+    )
 if FREEZE_TEXT_ENCODER:
     n_txt = sum(p.numel() for p in model.text_encoder.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)

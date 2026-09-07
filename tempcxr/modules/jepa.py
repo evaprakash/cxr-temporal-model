@@ -230,10 +230,11 @@ class TempCXRJEPA(nn.Module):
     Holds:
       - ``image_encoder``        : online BioViL-T (raw, no L2) — trained.
       - ``target_image_encoder`` : EMA copy of ``image_encoder`` — frozen.
-      - ``text_encoder``         : BioViL-T text encoder (CXR-BERT +
-                                   768→128 proj). Frozen when
-                                   ``freeze_text_encoder=True`` (kept
-                                   in ``eval`` so dropout is off).
+      - ``text_encoder``         : BioViL-T text encoder. Local 768→128
+                                   is a copy of official
+                                   ``cls_projection_head`` (not random).
+                                   Frozen when ``freeze_text_encoder=True``
+                                   (kept in ``eval`` so dropout is off).
       - ``predictor``            : IJEPATemporalPredictor — trained.
 
     Returns a dict of representations; losses live in ``losses.py`` and
@@ -287,7 +288,8 @@ class TempCXRJEPA(nn.Module):
             self.freeze_text_encoder()
 
     def freeze_text_encoder(self) -> None:
-        """Freeze CXR-BERT + projection; keep the module in eval."""
+        """Freeze CXR-BERT + official CLS-copied local proj; stay in eval."""
+        self.text_encoder.assert_local_proj_matches_official_cls()
         for p in self.text_encoder.parameters():
             p.requires_grad_(False)
         self.text_encoder.eval()
