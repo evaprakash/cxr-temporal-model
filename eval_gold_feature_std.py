@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
-"""Patch-token feature std on CheXTemporal gold (inference, no training).
+"""Feature std on CheXTemporal gold (inference, no training).
 
-Same Chong check as training: for a ``(B, N, D)`` L2-normalized grid,
-``std_over_patches`` = std over N, then mean over D (and the batch),
-plus mean off-diagonal cosine. Also reports ``std * sqrt(D)`` so 128-d
-unit vectors are comparable if you later add 768-d Rad-DINO.
+Patch check (Chong): for a ``(1, N, D)`` L2-normalized grid,
+``std_over_patches`` = std over N tiles, then mean over D.
+Also mean off-diagonal tile cosine. ``std * sqrt(D)`` is for 128 vs 768.
 
-Models (all BioViL-T 128-d, L2-normed patches):
+Global check (across films): one 128-d vector per gold pair. Std over
+the 738 films (mean over D), plus mean pairwise cosine between films.
+That asks whether *studies* look different, not whether *regions* do.
 
-  * ``biovilt``    — official weights, no finetune
-  * ``supervised`` — unfrozen pair-CE image encoder
-  * ``jepa``       — trained JEPA: encoder ``z_cur`` / ``z_prior`` and
-                     predictor ``ẑ`` (finding name as condition)
+Models (all BioViL-T 128-d, L2-normed):
 
-Current-image patches are the fair encoder comparison. JEPA ``ẑ`` is
-extra (predictor, needs a finding). Supervised is also scored as a
-pair encoder ``(current, prior)`` — that is how it is trained.
+  * ``biovilt``    — official weights: single-image and pair ``(curr, prior)``
+  * ``supervised`` — unfrozen pair-CE image encoder (single + pair)
+  * ``jepa``       — ``z_cur`` / ``z_prior`` encoders and predictor ``ẑ``
+                     (finding name as condition; global ``ẑ`` = mean-pool)
 
 Usage
 -----
     python eval_gold_feature_std.py --eval
-
-    python eval_gold_feature_std.py --eval \\
-        --jepa-ckpt checkpoints_jepa_dynamic_cbw99999/epoch_5.pt \\
-        --supervised-ckpt checkpoints_supervised_progression_unfrozen/epoch_5.pt
 
     python eval_gold_feature_std.py --eval --limit 40
 """
@@ -36,8 +31,10 @@ import os
 from typing import Dict, List
 
 import torch
+import torch.nn.functional as F
 
 import tempcxr.modules.image_encoder_jepa as image_encoder_jepa
+from dataset_combined_jepa import DEFAULT_FINDINGS
 from eval_progression_biovilt import BioViLTPairModel, load_supervised_encoders
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
 from losses_jepa import patch_token_feature_stats
@@ -48,7 +45,6 @@ from progression_classify import (
     load_gold_pairs,
     load_image_tensor,
 )
-from dataset_combined_jepa import DEFAULT_FINDINGS
 
 image_encoder_jepa.DEBUG = False
 
@@ -60,7 +56,6 @@ def _stats_row(name: str, patches: torch.Tensor) -> Dict[str, float]:
     s = patch_token_feature_stats(patches)
     std = float(s["std_over_patches"])
     off = float(s["mean_offdiag_cos"])
-    batch_std = float(s["std_over_batch"])
     d = int(patches.shape[-1])
     return {
         "name": name,
@@ -68,7 +63,6 @@ def _stats_row(name: str, patches: torch.Tensor) -> Dict[str, float]:
         "d": d,
         "std_over_patches": std,
         "std_x_sqrt_d": std * math.sqrt(d),
-        "std_over_batch": batch_std,
         "mean_offdiag_cos": off,
         "n_patches": int(patches.shape[1]),
     }
@@ -82,18 +76,12 @@ def _add(acc: Dict[str, Dict[str, float]], row: Dict[str, float]) -> None:
             "d": float(row["d"]),
             "std_over_patches": 0.0,
             "std_x_sqrt_d": 0.0,
-            "std_over_batch": 0.0,
             "mean_offdiag_cos": 0.0,
             "n_patches": float(row["n_patches"]),
         },
     )
     slot["n"] += 1.0
-    for k in (
-        "std_over_patches",
-        "std_x_sqrt_d",
-        "std_over_batch",
-        "mean_offdiag_cos",
-    ):
+    for k in ("std_over_patches", "std_x_sqrt_d", "mean_offdiag_cos"):
         slot[k] += row[k]
 
 
@@ -109,35 +97,72 @@ def _mean_table(acc: Dict[str, Dict[str, float]]) -> List[Dict[str, float]]:
                 "n_patches": int(slot["n_patches"]),
                 "std_over_patches": slot["std_over_patches"] / n,
                 "std_x_sqrt_d": slot["std_x_sqrt_d"] / n,
-                "std_over_batch": slot["std_over_batch"] / n,
                 "mean_offdiag_cos": slot["mean_offdiag_cos"] / n,
             }
         )
     return out
 
 
-def _print_table(rows: List[Dict[str, float]]) -> None:
+def _print_patch_table(rows: List[Dict[str, float]]) -> None:
     print()
+    print("=== Patch tokens (std over 196 tiles on one film; then mean over films) ===")
     print(
-        f"{'representation':<36} {'n':>5} {'D':>4} "
-        f"{'std_patches':>12} {'std*sqrt(D)':>12} "
-        f"{'offdiag_cos':>12} {'std_batch':>10}"
+        f"{'representation':<40} {'n':>5} {'D':>4} "
+        f"{'std_patches':>12} {'std*sqrt(D)':>12} {'offdiag_cos':>12}"
     )
-    print("-" * 100)
+    print("-" * 90)
     for r in rows:
         print(
-            f"{r['name']:<36} {r['n']:>5d} {r['d']:>4d} "
+            f"{r['name']:<40} {r['n']:>5d} {r['d']:>4d} "
             f"{r['std_over_patches']:>12.4f} {r['std_x_sqrt_d']:>12.4f} "
-            f"{r['mean_offdiag_cos']:>12.4f} {r['std_over_batch']:>10.4f}"
+            f"{r['mean_offdiag_cos']:>12.4f}"
         )
     print()
     print(
-        "std_patches = mean over dims of std over N patches (Chong check). "
-        "Collapse on the unit sphere: std → 0 and offdiag_cos → 1."
+        "std_patches: do regions of one chest differ? "
+        "Collapse: std → 0 and offdiag_cos → 1."
     )
+
+
+def _global_set_stats(name: str, vecs: List[torch.Tensor]) -> Dict[str, float]:
+    """Std / pairwise cosine of one global vector per gold pair."""
+    z = torch.stack([v.detach().float().reshape(-1) for v in vecs], dim=0)
+    z = F.normalize(z, dim=-1, eps=1e-8)
+    n, d = z.shape
+    std = float(z.std(dim=0, unbiased=False).mean())
+    if n < 2:
+        off = float("nan")
+    else:
+        sim = z @ z.T
+        off = float((sim.sum() - sim.trace()) / (n * (n - 1)))
+    return {
+        "name": name,
+        "n": n,
+        "d": d,
+        "std_over_set": std,
+        "std_x_sqrt_d": std * math.sqrt(d),
+        "mean_offdiag_cos": off,
+    }
+
+
+def _print_global_table(rows: List[Dict[str, float]]) -> None:
+    print()
+    print("=== Global vectors (one 128-d code per film; std / cosine across films) ===")
     print(
-        "std*sqrt(D) rescales so a 128-d unit grid (~0.06–0.08) is "
-        "comparable to a 768-d unit grid."
+        f"{'representation':<40} {'n':>5} {'D':>4} "
+        f"{'std_over_set':>12} {'std*sqrt(D)':>12} {'offdiag_cos':>12}"
+    )
+    print("-" * 90)
+    for r in rows:
+        print(
+            f"{r['name']:<40} {r['n']:>5d} {r['d']:>4d} "
+            f"{r['std_over_set']:>12.4f} {r['std_x_sqrt_d']:>12.4f} "
+            f"{r['mean_offdiag_cos']:>12.4f}"
+        )
+    print()
+    print(
+        "std_over_set: do different studies look different? "
+        "offdiag_cos → 1 means every film's global code is the same direction."
     )
 
 
@@ -155,8 +180,12 @@ def run_eval(args, pairs, image_roots, device: torch.device) -> None:
         jepa = load_jepa_model(args.jepa_ckpt, device)
 
     acc: Dict[str, Dict[str, float]] = {}
+    globals_acc: Dict[str, List[torch.Tensor]] = {}
     skipped = 0
     text_cache: Dict[str, tuple] = {}
+
+    def _keep_global(name: str, g: torch.Tensor) -> None:
+        globals_acc.setdefault(name, []).append(g.detach().float().cpu().reshape(-1))
 
     for i, row in enumerate(pairs):
         try:
@@ -172,31 +201,40 @@ def run_eval(args, pairs, image_roots, device: torch.device) -> None:
         prior_b = prior.unsqueeze(0).to(device)
         current_b = current.unsqueeze(0).to(device)
 
-        _, bio_cur = biovilt.image_encoder(current_b)
-        _, bio_pri = biovilt.image_encoder(prior_b)
+        bio_g_cur, bio_cur = biovilt.image_encoder(current_b)
+        bio_g_pri, bio_pri = biovilt.image_encoder(prior_b)
+        bio_g_pair, bio_pair = biovilt.image_encoder(current_b, prior_b)
         _add(acc, _stats_row("biovilt/z_cur (single, official)", bio_cur))
         _add(acc, _stats_row("biovilt/z_prior (single, official)", bio_pri))
+        _add(acc, _stats_row("biovilt/z_cur (pair, official)", bio_pair))
+        _keep_global("biovilt/global_cur (single, official)", bio_g_cur)
+        _keep_global("biovilt/global_prior (single, official)", bio_g_pri)
+        _keep_global("biovilt/global_cur (pair, official)", bio_g_pair)
 
         if supervised is not None:
-            _, sup_cur = supervised.image_encoder(current_b)
-            _, sup_pair = supervised.image_encoder(current_b, prior_b)
+            sup_g_cur, sup_cur = supervised.image_encoder(current_b)
+            sup_g_pair, sup_pair = supervised.image_encoder(current_b, prior_b)
             _add(acc, _stats_row("supervised/z_cur (single)", sup_cur))
             _add(acc, _stats_row("supervised/z_cur (pair)", sup_pair))
+            _keep_global("supervised/global_cur (single)", sup_g_cur)
+            _keep_global("supervised/global_cur (pair)", sup_g_pair)
 
         if jepa is not None:
-            _, z_prior = jepa.image_encoder(prior_b)
-            _, z_cur = jepa.target_image_encoder(current_b)
+            g_prior, z_prior = jepa.image_encoder(prior_b)
+            g_cur, z_cur = jepa.target_image_encoder(current_b)
             _add(acc, _stats_row("jepa/z_cur (EMA encoder)", z_cur))
             _add(acc, _stats_row("jepa/z_prior (online encoder)", z_prior))
+            _keep_global("jepa/global_cur (EMA encoder)", g_cur)
+            _keep_global("jepa/global_prior (online encoder)", g_prior)
             finding = str(row.get("finding") or "finding").strip().lower()
             if finding not in text_cache:
                 _, loc, mask = jepa.text_encoder.forward_contrastive([finding])
                 text_cache[finding] = (loc.cpu(), mask.cpu())
             loc, mask = text_cache[finding]
-            zhat = jepa.predictor(
-                z_prior, loc.to(device), mask.to(device),
-            )
+            zhat = jepa.predictor(z_prior, loc.to(device), mask.to(device))
             _add(acc, _stats_row("jepa/zhat (predictor, finding)", zhat))
+            zhat_g = F.normalize(zhat.float().mean(dim=1), dim=-1)
+            _keep_global("jepa/global_zhat (mean-pool ẑ)", zhat_g)
 
         if (i + 1) % 50 == 0 or i == 0:
             print(
@@ -204,26 +242,38 @@ def run_eval(args, pairs, image_roots, device: torch.device) -> None:
                 flush=True,
             )
 
-    rows = _mean_table(acc)
+    patch_rows = _mean_table(acc)
+    global_rows = [
+        _global_set_stats(name, vecs) for name, vecs in globals_acc.items()
+    ]
+
     print(f"\n[featstd] unique gold pairs={len(pairs)} skipped={skipped}")
     if args.jepa_ckpt:
         print(f"[featstd] jepa ckpt        = {args.jepa_ckpt}")
     if args.supervised_ckpt:
         print(f"[featstd] supervised ckpt  = {args.supervised_ckpt}")
-    _print_table(rows)
+    _print_patch_table(patch_rows)
+    _print_global_table(global_rows)
 
     if args.csv:
-        os.makedirs(os.path.dirname(os.path.abspath(args.csv)) or ".", exist_ok=True)
+        parent = os.path.dirname(os.path.abspath(args.csv))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(args.csv, "w") as f:
             f.write(
-                "name,n,d,n_patches,std_over_patches,std_x_sqrt_d,"
-                "mean_offdiag_cos,std_over_batch\n"
+                "kind,name,n,d,n_patches,std,std_x_sqrt_d,mean_offdiag_cos\n"
             )
-            for r in rows:
+            for r in patch_rows:
                 f.write(
-                    f"{r['name']},{r['n']},{r['d']},{r['n_patches']},"
+                    f"patch,{r['name']},{r['n']},{r['d']},{r['n_patches']},"
                     f"{r['std_over_patches']:.6f},{r['std_x_sqrt_d']:.6f},"
-                    f"{r['mean_offdiag_cos']:.6f},{r['std_over_batch']:.6f}\n"
+                    f"{r['mean_offdiag_cos']:.6f}\n"
+                )
+            for r in global_rows:
+                f.write(
+                    f"global,{r['name']},{r['n']},{r['d']},1,"
+                    f"{r['std_over_set']:.6f},{r['std_x_sqrt_d']:.6f},"
+                    f"{r['mean_offdiag_cos']:.6f}\n"
                 )
         print(f"[featstd] wrote {args.csv}")
 
@@ -248,15 +298,8 @@ def main() -> None:
         "--csv",
         default="logs_gold_feature_std/gold_feature_std.csv",
     )
-    parser.add_argument(
-        "--skip-jepa",
-        action="store_true",
-        help="Only score BioViL-T ± supervised.",
-    )
-    parser.add_argument(
-        "--skip-supervised",
-        action="store_true",
-    )
+    parser.add_argument("--skip-jepa", action="store_true")
+    parser.add_argument("--skip-supervised", action="store_true")
     args = parser.parse_args()
     if args.skip_jepa:
         args.jepa_ckpt = ""
@@ -291,9 +334,7 @@ def main() -> None:
             f"{len(pairs_df)} unique image pairs"
         )
 
-    pairs = pairs_df.to_dict("records")
-    device = torch.device(args.device)
-    run_eval(args, pairs, image_roots, device)
+    run_eval(args, pairs_df.to_dict("records"), image_roots, torch.device(args.device))
 
 
 if __name__ == "__main__":

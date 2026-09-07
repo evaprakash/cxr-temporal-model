@@ -11,7 +11,8 @@
 #SBATCH --output=/scratch/m000081-pm06/eprakash/logs/gold_featstd_%j.out
 #SBATCH --error=/scratch/m000081-pm06/eprakash/logs/gold_featstd_%j.err
 
-# Gold-set patch-token std: official BioViL-T vs supervised vs JEPA.
+# Gold-set feature std: official BioViL-T (single + pair) vs supervised
+# vs JEPA. Patch-tile std and global-across-film std.
 # Defaults: paper JEPA epoch_5.pt and unfrozen supervised epoch_5.pt.
 #
 #   sbatch eval_gold_feature_std.sh
