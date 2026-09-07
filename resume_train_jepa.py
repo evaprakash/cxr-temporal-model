@@ -17,10 +17,10 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: GLoRIA on, text frozen, local 768→128 = official
-# BioViL-T ``cls_projection_head`` (copied from the pretrained file,
-# not a random BertProjectionHead). Dir tag ``_txtfrzcls`` so this
-# does not resume the broken ``_txtfrz`` (random local proj) run.
+# Current run: GLoRIA on, text frozen (full CXR-BERT + official
+# CLS-copied local 768→128), EMA 0.999 → 1.0. Dir tag
+# ``_txtfrzcls_ema999`` so this does not resume ``_txtfrzcls``
+# (EMA 0.996) or the broken ``_txtfrz`` (random local proj).
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -326,7 +326,8 @@ SPLIT_SEED = 42
 #   * ``..._featstd50``               — 50-epoch schedule + std (archive)
 #   * ``..._rp00``                    — GLoRIA off, text trained (archive)
 #   * ``..._txtfrz``                  — GLoRIA on, text frozen, random local proj (archive)
-#   * ``..._txtfrzcls``               — same + official CLS proj copied (this run)
+#   * ``..._txtfrzcls``               — GLoRIA on, text frozen, official CLS, EMA 0.996
+#   * ``..._txtfrzcls_ema999``        — same + EMA 0.999 → 1.0 (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -381,6 +382,8 @@ if W_PROG != 0.1:
     _SETTING_TAG = f"{_SETTING_TAG}_wprog{_report_weight_tag(W_PROG)}"
 if FREEZE_TEXT_ENCODER:
     _SETTING_TAG = f"{_SETTING_TAG}_txtfrzcls"
+if abs(EMA_START - 0.996) > 1e-12:
+    _SETTING_TAG = f"{_SETTING_TAG}_ema{_cbw_beta_tag(EMA_START)}"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -495,6 +498,7 @@ if local_rank == 0:
         f"W_JEPA={W_JEPA} W_PROG={W_PROG} "
         f"W_REPORT_PRIOR={W_REPORT_PRIOR} W_REPORT_PRED={W_REPORT_PRED} "
         f"freeze_text_encoder={FREEZE_TEXT_ENCODER} "
+        f"ema={EMA_START}→{EMA_END} "
         f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "

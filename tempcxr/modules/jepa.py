@@ -77,7 +77,7 @@ from losses_jepa import (
 # =========================================================
 # EMA HELPERS
 # =========================================================
-EMA_START = 0.996
+EMA_START = 0.999
 EMA_END = 1.0
 
 
@@ -108,7 +108,7 @@ def make_momentum_scheduler(
     """Linear ramp m_start → m_end over ``total_iters`` steps (I-JEPA style).
 
     Usage:
-        sched = make_momentum_scheduler(0.996, 1.0, total_iters=ipe*epochs)
+        sched = make_momentum_scheduler(0.999, 1.0, total_iters=ipe*epochs)
         ...
         optimizer.step()
         model.update_ema(momentum=next(sched))
