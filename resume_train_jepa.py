@@ -17,9 +17,12 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: GLoRIA on, full text encoder frozen, EMA start 0.99999
-# (still ramps to 1.0). Dir tag ``_txtfrz_ema99999`` so this does not
-# resume ``_txtfrz`` / ``_rp00`` / the 0.452 ckpts.
+# Current run: 0.452 recipe with GLoRIA on and the full text encoder
+# frozen (CXR-BERT + 768→128 proj, eval-mode dropout off). Image
+# encoder + predictor still train; images walk toward fixed official
+# BioViL-T word vectors. EMA stays I-JEPA 0.996 → 1.0. Dir tag
+# ``_txtfrz`` so this does not resume ``_rp00`` / ``_featstd50`` or
+# overwrite the 0.452 ckpts.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -276,10 +279,6 @@ W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
 # Full text encoder (BERT + projection) is a frozen conditioner.
 FREEZE_TEXT_ENCODER = True
-# EMA target momentum. I-JEPA default is 0.996 → 1.0; this run starts
-# at 0.99999 so the teacher barely moves (half-life ~60 epochs).
-EMA_MOMENTUM_START = 0.99999
-EMA_MOMENTUM_END = EMA_END
 # 4th loss: per-patch-mean cosine 5-way (same as the 0.452 run).
 W_PROG = 0.1
 PROG_TEMP = 0.1
@@ -328,8 +327,7 @@ SPLIT_SEED = 42
 #   * ``..._featstd``                 — 5-epoch anneal + std (archive)
 #   * ``..._featstd50``               — 50-epoch schedule + std (archive)
 #   * ``..._rp00``                    — GLoRIA off, text trained (archive)
-#   * ``..._txtfrz``                  — GLoRIA on, full text frozen
-#   * ``..._txtfrz_ema99999``         — same + EMA start 0.99999 (this run)
+#   * ``..._txtfrz``                  — GLoRIA on, full text frozen (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -384,8 +382,6 @@ if W_PROG != 0.1:
     _SETTING_TAG = f"{_SETTING_TAG}_wprog{_report_weight_tag(W_PROG)}"
 if FREEZE_TEXT_ENCODER:
     _SETTING_TAG = f"{_SETTING_TAG}_txtfrz"
-if abs(EMA_MOMENTUM_START - 0.996) > 1e-12:
-    _SETTING_TAG = f"{_SETTING_TAG}_ema{_cbw_beta_tag(EMA_MOMENTUM_START)}"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -500,7 +496,6 @@ if local_rank == 0:
         f"W_JEPA={W_JEPA} W_PROG={W_PROG} "
         f"W_REPORT_PRIOR={W_REPORT_PRIOR} W_REPORT_PRED={W_REPORT_PRED} "
         f"freeze_text_encoder={FREEZE_TEXT_ENCODER} "
-        f"ema={EMA_MOMENTUM_START}->{EMA_MOMENTUM_END} "
         f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
@@ -591,8 +586,8 @@ scheduler = get_linear_schedule_with_warmup(
 )
 
 momentum_scheduler = make_momentum_scheduler(
-    m_start=EMA_MOMENTUM_START,
-    m_end=EMA_MOMENTUM_END,
+    m_start=EMA_START,
+    m_end=EMA_END,
     total_iters=num_steps,
 )
 
@@ -1057,7 +1052,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
                 "zhat_std": f"{zhat_std:.3f}",
-                "ema_m": f"{m:.6f}",
+                "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
             })
             if global_step % FEAT_LOG_EVERY == 0:
