@@ -157,10 +157,7 @@ class BioViLTTextEncoder(nn.Module):
             blob = load_file(path)
         else:
             try:
-                try:
                 blob = torch.load(path, map_location="cpu", weights_only=True)
-            except TypeError:
-                blob = torch.load(path, map_location="cpu")
             except TypeError:
                 blob = torch.load(path, map_location="cpu")
         prefix = "cls_projection_head."
