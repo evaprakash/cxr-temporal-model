@@ -9,12 +9,15 @@ Global check (across films): one 128-d vector per gold pair. Std over
 the 738 films (mean over D), plus mean pairwise cosine between films.
 That asks whether *studies* look different, not whether *regions* do.
 
-Models (all BioViL-T 128-d, L2-normed):
+Models (BioViL-T family is 128-d; Rad DINO is 768-d; all L2-normed):
 
   * ``biovilt``    — official weights: single-image and pair ``(curr, prior)``
   * ``supervised`` — unfrozen pair-CE image encoder (single + pair)
   * ``jepa``       — ``z_cur`` / ``z_prior`` encoders and predictor ``ẑ``
                      (finding name as condition; global ``ẑ`` = mean-pool)
+  * ``raddino``    — official ``microsoft/rad-dino`` (single-image ViT-B/14).
+                     Uses the HF processor on the raw gold PNG, not the
+                     BioViL-T 448 crop. Compare ``std*sqrt(D)`` across D.
 
 Usage
 -----
@@ -41,15 +44,45 @@ from losses_jepa import patch_token_feature_stats
 from progression_classify import (
     DATASETS,
     DEFAULT_GOLD_PARQUET,
+    _resolve_with_fallbacks,
     discover_gold_image_roots,
     load_gold_pairs,
     load_image_tensor,
 )
+from PIL import Image
 
 image_encoder_jepa.DEBUG = False
 
 DEFAULT_JEPA_CKPT = "checkpoints_jepa_dynamic_cbw99999/epoch_5.pt"
 DEFAULT_SUP_CKPT = "checkpoints_supervised_progression_unfrozen/epoch_5.pt"
+DEFAULT_RADDINO_MODEL = os.environ.get("RAD_DINO_MODEL", "microsoft/rad-dino")
+
+
+class RadDinoEncoder:
+    """Official Rad DINO (DINOv2-B CXR). Single-image 768-d CLS + patches."""
+
+    def __init__(self, model_id: str, device: torch.device):
+        from transformers import AutoImageProcessor, AutoModel
+
+        print(f"[raddino] loading {model_id} …", flush=True)
+        self.processor = AutoImageProcessor.from_pretrained(model_id)
+        self.model = AutoModel.from_pretrained(model_id).to(device)
+        self.model.eval()
+        self.device = device
+        print("[raddino] ready", flush=True)
+
+    @torch.no_grad()
+    def encode_pil(self, image: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
+        inputs = self.processor(images=image.convert("RGB"), return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        hidden = self.model(**inputs).last_hidden_state
+        cls = F.normalize(hidden[:, 0], dim=-1)
+        patches = F.normalize(hidden[:, 1:], dim=-1)
+        return cls, patches
+
+
+def _load_gold_pil(dataset: str, rel_path: str, roots: Dict[str, str]) -> Image.Image:
+    return Image.open(_resolve_with_fallbacks(dataset, rel_path, roots)).convert("RGB")
 
 
 def _stats_row(name: str, patches: torch.Tensor) -> Dict[str, float]:
@@ -105,15 +138,15 @@ def _mean_table(acc: Dict[str, Dict[str, float]]) -> List[Dict[str, float]]:
 
 def _print_patch_table(rows: List[Dict[str, float]]) -> None:
     print()
-    print("=== Patch tokens (std over 196 tiles on one film; then mean over films) ===")
+    print("=== Patch tokens (std over tiles on one film; then mean over films) ===")
     print(
-        f"{'representation':<40} {'n':>5} {'D':>4} "
+        f"{'representation':<40} {'n':>5} {'D':>4} {'P':>5} "
         f"{'std_patches':>12} {'std*sqrt(D)':>12} {'offdiag_cos':>12}"
     )
-    print("-" * 90)
+    print("-" * 98)
     for r in rows:
         print(
-            f"{r['name']:<40} {r['n']:>5d} {r['d']:>4d} "
+            f"{r['name']:<40} {r['n']:>5d} {r['d']:>4d} {r['n_patches']:>5d} "
             f"{r['std_over_patches']:>12.4f} {r['std_x_sqrt_d']:>12.4f} "
             f"{r['mean_offdiag_cos']:>12.4f}"
         )
@@ -147,7 +180,7 @@ def _global_set_stats(name: str, vecs: List[torch.Tensor]) -> Dict[str, float]:
 
 def _print_global_table(rows: List[Dict[str, float]]) -> None:
     print()
-    print("=== Global vectors (one 128-d code per film; std / cosine across films) ===")
+    print("=== Global vectors (one code per film; std / cosine across films) ===")
     print(
         f"{'representation':<40} {'n':>5} {'D':>4} "
         f"{'std_over_set':>12} {'std*sqrt(D)':>12} {'offdiag_cos':>12}"
@@ -178,6 +211,10 @@ def run_eval(args, pairs, image_roots, device: torch.device) -> None:
     jepa = None
     if args.jepa_ckpt:
         jepa = load_jepa_model(args.jepa_ckpt, device)
+
+    raddino = None
+    if args.raddino_model:
+        raddino = RadDinoEncoder(args.raddino_model, device)
 
     acc: Dict[str, Dict[str, float]] = {}
     globals_acc: Dict[str, List[torch.Tensor]] = {}
@@ -236,6 +273,18 @@ def run_eval(args, pairs, image_roots, device: torch.device) -> None:
             zhat_g = F.normalize(zhat.float().mean(dim=1), dim=-1)
             _keep_global("jepa/global_zhat (mean-pool ẑ)", zhat_g)
 
+        if raddino is not None:
+            rd_g_cur, rd_cur = raddino.encode_pil(
+                _load_gold_pil(row["dataset"], row["parent_image_curr"], image_roots)
+            )
+            rd_g_pri, rd_pri = raddino.encode_pil(
+                _load_gold_pil(row["dataset"], row["parent_image_prev"], image_roots)
+            )
+            _add(acc, _stats_row("raddino/z_cur (single, official)", rd_cur))
+            _add(acc, _stats_row("raddino/z_prior (single, official)", rd_pri))
+            _keep_global("raddino/global_cur (CLS, official)", rd_g_cur)
+            _keep_global("raddino/global_prior (CLS, official)", rd_g_pri)
+
         if (i + 1) % 50 == 0 or i == 0:
             print(
                 f"[featstd] {i + 1}/{len(pairs)}  skipped={skipped}",
@@ -252,6 +301,8 @@ def run_eval(args, pairs, image_roots, device: torch.device) -> None:
         print(f"[featstd] jepa ckpt        = {args.jepa_ckpt}")
     if args.supervised_ckpt:
         print(f"[featstd] supervised ckpt  = {args.supervised_ckpt}")
+    if args.raddino_model:
+        print(f"[featstd] raddino model    = {args.raddino_model}")
     _print_patch_table(patch_rows)
     _print_global_table(global_rows)
 
@@ -298,13 +349,20 @@ def main() -> None:
         "--csv",
         default="logs_gold_feature_std/gold_feature_std.csv",
     )
+    parser.add_argument(
+        "--raddino-model",
+        default=os.environ.get("RAD_DINO_MODEL", DEFAULT_RADDINO_MODEL),
+    )
     parser.add_argument("--skip-jepa", action="store_true")
     parser.add_argument("--skip-supervised", action="store_true")
+    parser.add_argument("--skip-raddino", action="store_true")
     args = parser.parse_args()
     if args.skip_jepa:
         args.jepa_ckpt = ""
     if args.skip_supervised:
         args.supervised_ckpt = ""
+    if args.skip_raddino:
+        args.raddino_model = ""
 
     parquet_dir = os.path.dirname(os.path.abspath(args.gold_parquet))
     auto_gold_roots = discover_gold_image_roots(parquet_dir)

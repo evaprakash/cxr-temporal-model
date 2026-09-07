@@ -7,13 +7,15 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=/scratch/m000081-pm06/eprakash/logs/gold_featstd_%j.out
 #SBATCH --error=/scratch/m000081-pm06/eprakash/logs/gold_featstd_%j.err
 
 # Gold-set feature std: official BioViL-T (single + pair) vs supervised
-# vs JEPA. Patch-tile std and global-across-film std.
+# vs JEPA vs official Rad DINO patches (microsoft/rad-dino, not finetuned).
+# Patch-tile std and global-across-film std.
 # Defaults: paper JEPA epoch_5.pt and unfrozen supervised epoch_5.pt.
+# Skip Rad DINO with: sbatch eval_gold_feature_std.sh --skip-raddino
 #
 #   sbatch eval_gold_feature_std.sh
 #   sbatch eval_gold_feature_std.sh --limit 40
@@ -54,6 +56,7 @@ SUP_CKPT="${SUPERVISED_CKPT:-$PROJECT_DIR/checkpoints_supervised_progression_unf
 
 echo "[slurm] JEPA_CKPT       = $JEPA_CKPT"
 echo "[slurm] SUPERVISED_CKPT = $SUP_CKPT"
+echo "[slurm] RAD_DINO_MODEL  = ${RAD_DINO_MODEL:-microsoft/rad-dino}"
 
 mkdir -p "$SCRATCH_BASE/logs" "$PROJECT_DIR/logs_gold_feature_std"
 
