@@ -35,6 +35,13 @@ export PYTHONFAULTHANDLER=1
 export PYTHONUNBUFFERED=1
 
 SCRATCH_BASE="${SCRATCH_BASE:-/scratch/m000081-pm06/eprakash}"
+# Old /scratch/m000081/ quota is full; do not use $HOME or that tree.
+export HF_HOME="$SCRATCH_BASE/.cache/huggingface"
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_CACHE="$HF_HOME/hub"
+mkdir -p "$TRANSFORMERS_CACHE" "$HUGGINGFACE_HUB_CACHE"
+
 PROJECT_DIR="${PROJECT_DIR:-$SCRATCH_BASE/cxr-temporal-model}"
 cd "$PROJECT_DIR" || {
     echo "[slurm] ERROR: PROJECT_DIR not found: $PROJECT_DIR" >&2
@@ -57,6 +64,7 @@ SUP_CKPT="${SUPERVISED_CKPT:-$PROJECT_DIR/checkpoints_supervised_progression_unf
 echo "[slurm] JEPA_CKPT       = $JEPA_CKPT"
 echo "[slurm] SUPERVISED_CKPT = $SUP_CKPT"
 echo "[slurm] RAD_DINO_MODEL  = ${RAD_DINO_MODEL:-microsoft/rad-dino}"
+echo "[slurm] HF_HOME         = $HF_HOME"
 
 mkdir -p "$SCRATCH_BASE/logs" "$PROJECT_DIR/logs_gold_feature_std"
 
