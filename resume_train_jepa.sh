@@ -1,18 +1,20 @@
 #!/bin/bash
 #SBATCH --job-name=jepa_eqw1_preempt
 #SBATCH -p preempt
-#SBATCH -A marlowe-m000081-pm06
+#SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --time=8:00:00
+#SBATCH --time=4:00:00
 #SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_eqw1_preempt_%j.out
 #SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_eqw1_preempt_%j.err
 
 # ============================================================
 # SLURM launcher: preempt queue (batch is down for the hero run).
+# Marlowe: preempt uses the bare project account (no -pm06) and
+# max wall time 4h. -pm06 is a batch QOS and sbatch rejects it here.
 # GLoRIA on, full text frozen, official CLS proj, EMA 0.996 → 1.0,
 # all four live losses at weight 1.0.
 #
@@ -30,7 +32,7 @@
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
 #     git pull
-#     # cancel the old batch 0.5/0.5 job if it is still PD
+#     scancel <old-batch-jobid>   # if the 0.5/0.5 batch job is still PD
 #     sbatch resume_train_jepa.sh
 # ============================================================
 
