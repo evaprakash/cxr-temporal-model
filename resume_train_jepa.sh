@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_txtfrzcls_wprog50
-#SBATCH -p batch
+#SBATCH --job-name=jepa_eqw1_preempt
+#SBATCH -p preempt
 #SBATCH -A marlowe-m000081-pm06
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -8,26 +8,29 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=8:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_txtfrzcls_wprog50_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_txtfrzcls_wprog50_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_eqw1_preempt_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_eqw1_preempt_%j.err
 
 # ============================================================
-# SLURM launcher: GLoRIA on, full text frozen, official CLS proj,
-# EMA 0.996 → 1.0, W_JEPA=W_PROG=0.5.
+# SLURM launcher: preempt queue (batch is down for the hero run).
+# GLoRIA on, full text frozen, official CLS proj, EMA 0.996 → 1.0,
+# all four live losses at weight 1.0.
 #
-#   * W_JEPA = 0.5 — mean_p (1 - cos(ẑ_dyn[p], z_cur[p]))
-#   * W_PROG = 0.5 — per-patch-mean cosine 5-way CE
-#   * W_REPORT_PRIOR = W_REPORT_PRED = 0.1  (GLoRIA on)
+#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ_dyn[p], z_cur[p]))
+#   * W_PROG = 1.0 — per-patch-mean cosine 5-way CE
+#   * W_REPORT_PRIOR = W_REPORT_PRED = 1.0  (GLoRIA; was 0.1)
 #   * Text frozen in full: CXR-BERT + local 768→128
 #     (= official cls_projection_head, not a random head)
-#   * EMA 0.996 → 1.0 (reverted from 0.999)
-#   * Writes to checkpoints_jepa_dynamic_cbw99999_wjepa50_wprog50_txtfrzcls/
-#     (does NOT resume _txtfrzcls or _txtfrzcls_ema999)
+#   * EMA 0.996 → 1.0
+#   * Writes to checkpoints_jepa_dynamic_cbw99999_rp100_wprog100_txtfrzcls/
+#     (does NOT resume _txtfrzcls, _wjepa50_wprog50, or _ema999)
+#   * Auto-resumes latest epoch_N.pt in that dir if preempted.
 #   * Rank-0 gold set-match after each epoch (--pooling perpatch).
 #
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
 #     git pull
+#     # cancel the old batch 0.5/0.5 job if it is still PD
 #     sbatch resume_train_jepa.sh
 # ============================================================
 
@@ -53,6 +56,7 @@ cd "$PROJECT_DIR" || {
 echo "[slurm] PROJECT_DIR = $PROJECT_DIR"
 echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<not a git checkout>')"
 echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n/a>')"
+echo "[slurm] partition   = ${SLURM_JOB_PARTITION:-unknown}"
 
 HI_ML_SRC="$PROJECT_DIR/tempcxr/modules/hi-ml/hi-ml-multimodal/src"
 if [ ! -d "$HI_ML_SRC/health_multimodal" ]; then

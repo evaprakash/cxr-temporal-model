@@ -17,10 +17,12 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: GLoRIA on, text frozen (official CLS), EMA back to
-# I-JEPA 0.996 → 1.0, W_JEPA=W_PROG=0.5. Dir tag
-# ``_wjepa50_wprog50_txtfrzcls`` so this does not resume
-# ``_txtfrzcls`` (1.0/0.1) or ``_txtfrzcls_ema999``.
+# Current run: GLoRIA on, text frozen (official CLS), EMA 0.996 → 1.0,
+# all four live losses at weight 1.0 (JEPA, prog CE, GLoRIA prior,
+# GLoRIA pred). Anatomy off. Same mix as 1/N; unnormalized 1.0 keeps
+# the JEPA term on the paper LR scale. Dir tag
+# ``_rp100_wprog100_txtfrzcls`` so this does not resume ``_txtfrzcls``,
+# ``_wjepa50_wprog50_txtfrzcls``, or ``_txtfrzcls_ema999``.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -270,15 +272,15 @@ WARMUP_RATIO = 0.03
 # (1 = every epoch), plus best.pt whenever val total improves.
 SAVE_EVERY_N_EPOCHS = 1
 
-# Loss weights. GLoRIA local contrastive back on (images → frozen
-# official report tokens). Equal JEPA / progression CE (was 1.0 / 0.1).
-W_JEPA = 0.5
-W_REPORT_PRIOR = 0.1
-W_REPORT_PRED = 0.1
+# Loss weights. Four live terms, equal unnormalized weight (not 1/N).
+# Anatomy stays 0. GLoRIA: images → frozen official report tokens.
+W_JEPA = 1.0
+W_REPORT_PRIOR = 1.0
+W_REPORT_PRED = 1.0
 # Full text encoder (BERT + projection) is a frozen conditioner.
 FREEZE_TEXT_ENCODER = True
 # 4th loss: per-patch-mean cosine 5-way (same as the 0.452 run).
-W_PROG = 0.5
+W_PROG = 1.0
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
 # Gold / in-training scores: mean_p cos(ẑ^c[p], z_cur[p]).
@@ -329,7 +331,8 @@ SPLIT_SEED = 42
 #   * ``..._txtfrz``                  — GLoRIA on, text frozen, random local proj (archive)
 #   * ``..._txtfrzcls``               — GLoRIA on, text frozen, official CLS, EMA 0.996
 #   * ``..._txtfrzcls_ema999``        — same + EMA 0.999 → 1.0 (archive)
-#   * ``..._wjepa50_wprog50_txtfrzcls`` — this run: 0.5/0.5, EMA 0.996
+#   * ``..._wjepa50_wprog50_txtfrzcls`` — 0.5/0.5 JEPA/CE, GLoRIA 0.1 (archive)
+#   * ``..._rp100_wprog100_txtfrzcls`` — this run: all four live losses = 1.0
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
