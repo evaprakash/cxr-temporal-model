@@ -311,8 +311,8 @@ def main():
     parser.add_argument(
         "--pooling",
         default="perpatch",
-        choices=["perpatch", "global", "head"],
-        help="JEPA score rule. Use perpatch for the 0.452 checkpoint.",
+        choices=["perpatch", "global", "head", "findquery"],
+        help="JEPA score rule. Use findquery for the finding-query run.",
     )
     parser.add_argument(
         "--combine",

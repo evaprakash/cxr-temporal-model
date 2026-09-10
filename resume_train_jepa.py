@@ -20,18 +20,19 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: GLoRIA on, text frozen (official CLS), EMA 0.996 → 1.0,
-# joint current target, W_JEPA=W_PROG=1.0, GLoRIA 0.1/0.1. Anatomy off.
-# Tests whether eqw collapse was loud GLoRIA (not prog=1). Dir tag
-# ``_wprog100_txtfrzcls_jointtgt`` so this does not resume the eqw
-# joint dir (``_rp100_..._jointtgt``) or paper ``_txtfrzcls``.
+# joint current target, paper weights 1 / 0.1 / 0.1 / 0.1, finding-query
+# attention pool on both ẑ^c and z_pair. Anatomy off. Dir tag
+# ``_txtfrzcls_jointtgt_findq`` so this does not resume
+# ``_wprog100_txtfrzcls_jointtgt`` or paper ``_txtfrzcls``.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
 #   ``(prog_finding, prog_cls_idx)`` per epoch. The model produces
 #   ``ẑ_cur^c`` for each of the 5 class prompts
-#   ``"{prog_finding} is {class}."`` and applies
-#   ``F.cross_entropy(cos(ẑ_cur^c, z_pair) / τ, silver_label,
-#                     weight=class_weights)`` (mean-over-patches cosine).
+#   ``"{prog_finding} is {class}."``. Frozen BioViL-T CLS of the
+#   finding name is Q. Softmax-attention pool Q(ẑ^c) and Q(z_pair);
+#   ``F.cross_entropy(cos(Q(ẑ^c), Q(z_pair)) / τ, silver_label,
+#                     weight=class_weights)``.
 #   ``z_pair`` = EMA pair encoder ``(current, prior)``. Predictor input
 #   prior is still single-image.
 
@@ -58,6 +59,10 @@ from dataset_combined_jepa import (
 )
 from eval_progression_jepa import PROMPT_TEMPLATE as JEPA_PROMPT_TEMPLATE
 from eval_progression_jepa import _encode_prompts
+from gold_jepa_diagnostics import (
+    five_forecast_offdiag_cos,
+    print_jepa_score_diagnostics,
+)
 from gold_progression_setmatch import (
     format_running_setmatch,
     group_gold_by_pair_finding,
@@ -80,7 +85,9 @@ from tempcxr.modules.jepa import (
 )
 from losses import local_contrastive_loss
 from losses_jepa import (
+    FINDING_QUERY_ATTN_TEMP,
     anatomy_masked_pool_jepa_loss,
+    finding_query_pool,
     global_pool_normalize,
     jepa_cosine_loss,
     patch_token_feature_stats,
@@ -282,12 +289,14 @@ W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
 # Full text encoder (BERT + projection) is a frozen conditioner.
 FREEZE_TEXT_ENCODER = True
-# 4th loss: per-patch-mean cosine 5-way vs joint z_pair.
-W_PROG = 1.0
+# 4th loss: finding-query attention-pool cosine 5-way vs joint z_pair.
+# Paper mix: quiet CE so five ẑ^c are not all trained to copy z_pair.
+W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-# Gold / in-training scores: mean_p cos(ẑ^c[p], z_pair[p]).
-PROG_POOLING = "perpatch"
+# Gold / in-training scores: cos(Q(ẑ^c), Q(z_pair)), Q = frozen finding CLS.
+PROG_POOLING = "findquery"
+FINDING_QUERY_ATTN = FINDING_QUERY_ATTN_TEMP
 N_CLS = len(CLS_ORDER)
 # Both JEPA and prog CE match ẑ to pair-mode current (given prior).
 JOINT_CURRENT_TARGET = True
@@ -340,6 +349,7 @@ SPLIT_SEED = 42
 #   * ``..._rp100_wprog100_txtfrzcls`` — eqw, single-image current target
 #   * ``..._rp100_wprog100_txtfrzcls_jointtgt`` — eqw, pair-mode current target
 #   * ``..._wprog100_txtfrzcls_jointtgt`` — joint, JEPA/prog 1.0, GLoRIA 0.1
+#   * ``..._txtfrzcls_jointtgt_findq`` — paper 1/0.1/0.1/0.1 + finding query
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -400,6 +410,8 @@ if abs(EMA_START - 0.996) > 1e-12:
     _SETTING_TAG = f"{_SETTING_TAG}_ema{_cbw_beta_tag(EMA_START)}"
 if JOINT_CURRENT_TARGET:
     _SETTING_TAG = f"{_SETTING_TAG}_jointtgt"
+if PROG_POOLING == "findquery":
+    _SETTING_TAG = f"{_SETTING_TAG}_findq"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -520,7 +532,8 @@ if local_rank == 0:
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
         f"joint_current_target={JOINT_CURRENT_TARGET} "
         f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_pair[p])); "
-        f"prog = per-patch-mean cos(ẑ^c, z_pair) 5-way CE; "
+        f"prog = cos(Q(ẑ^c), Q(z_pair)) 5-way CE, "
+        f"Q=frozen BioViL-T CLS of finding; "
         f"z_pair = EMA encoder(current, prior))"
     )
     print(
@@ -769,10 +782,17 @@ def _score_gold_pair_head(raw_model, prior_img, current_img, finding, text_cache
 
 @torch.no_grad()
 def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
-    """5-way scores matching the train progression rule (PROG_POOLING)."""
+    """5-way scores matching the train progression rule (PROG_POOLING).
+
+    Returns ``(scores, zhat_offdiag)``. ``zhat_offdiag`` is mean
+    ``cos(ẑ^i, ẑ^j)`` over the five forecasts (None for the head path).
+    """
     if PROG_POOLING == "head":
-        return _score_gold_pair_head(
-            raw_model, prior_img, current_img, finding, text_cache,
+        return (
+            _score_gold_pair_head(
+                raw_model, prior_img, current_img, finding, text_cache,
+            ),
+            None,
         )
     prompts, txt_local, token_mask = _encode_prompts(
         raw_model, finding, JEPA_PROMPT_TEMPLATE, DEVICE, text_cache,
@@ -787,7 +807,24 @@ def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
     preds = raw_model.predictor(z_prior_b, txt_local, token_mask)
     pred_f = preds.float()
     target_f = z_cur.float()
-    if PROG_POOLING == "global":
+    zhat_off = five_forecast_offdiag_cos(pred_f)
+    if PROG_POOLING == "findquery":
+        q_key = f"__findq__:{finding.strip().lower()}"
+        if q_key in text_cache:
+            q = text_cache[q_key].to(DEVICE)
+        else:
+            q, _, _ = raw_model.text_encoder.forward_contrastive(
+                [finding.strip().lower()]
+            )
+            text_cache[q_key] = q.detach().cpu()
+        u = finding_query_pool(
+            pred_f, q, attn_temp=FINDING_QUERY_ATTN,
+        )
+        v = finding_query_pool(
+            target_f, q, attn_temp=FINDING_QUERY_ATTN,
+        )
+        scores = (u * v).sum(dim=-1).tolist()
+    elif PROG_POOLING == "global":
         pred_g = global_pool_normalize(pred_f)
         target_g = global_pool_normalize(target_f)
         scores = F.cosine_similarity(
@@ -798,7 +835,7 @@ def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
             pred_f, target_f.expand_as(pred_f), dim=-1,
         )
         scores = cos_per_patch.mean(dim=1).tolist()
-    return scores
+    return scores, zhat_off
 
 
 @torch.no_grad()
@@ -806,6 +843,7 @@ def eval_gold_setmatch(raw_model, groups, image_roots, epoch):
     """Rank-0 CheXTemporal gold set-match (same tables as standalone eval)."""
     raw_model.eval()
     results = []
+    diag_rows = []
     skipped = 0
     text_cache = {}
     pbar = tqdm(
@@ -830,7 +868,7 @@ def eval_gold_setmatch(raw_model, groups, image_roots, epoch):
                 metrics=format_running_setmatch(results),
             )
             continue
-        scores = _score_gold_pair(
+        scores, zhat_off = _score_gold_pair(
             raw_model, prior, current, str(row["finding"]), text_cache,
         )
         results.append(
@@ -840,6 +878,13 @@ def eval_gold_setmatch(raw_model, groups, image_roots, epoch):
                 CLS_ORDER,
                 finding=str(row["finding"]),
             )
+        )
+        diag_rows.append(
+            {
+                "scores": scores,
+                "gt_labels": list(row["gt_labels"]),
+                "zhat_offdiag": zhat_off,
+            }
         )
         pbar.set_postfix(
             skipped=skipped,
@@ -857,6 +902,7 @@ def eval_gold_setmatch(raw_model, groups, image_roots, epoch):
         f", pooling={PROG_POOLING}, joint_tgt={JOINT_CURRENT_TARGET}, "
         f"epoch={epoch} (in-training)",
     )
+    print_jepa_score_diagnostics(diag_rows)
     return summarize_setmatch(results)
 
 
@@ -924,8 +970,8 @@ def compute_jepa_losses(
         current_token_mask,
     )
 
-    # 5-way CE on the linear head (or archived cosine 5-way).
-    # ``weight=`` uses Cui CBW.
+    # 5-way CE on find-query cosine (or archived head / mean-patch).
+    # ``weight=`` uses Cui CBW. JEPA stays per-patch (not query-pooled).
     if "prog_logits" in out:
         prog = F.cross_entropy(
             out["prog_logits"].float(),
@@ -933,12 +979,25 @@ def compute_jepa_losses(
             weight=PROG_CLASS_WEIGHTS,
         )
     else:
+        finding_query = out.get("finding_query")
+        if PROG_POOLING == "findquery":
+            if finding_query is None:
+                raise RuntimeError(
+                    "PROG_POOLING=findquery but finding_query is missing; "
+                    "pass finding_texts into the model forward"
+                )
+        else:
+            finding_query = None
         prog = progression_classification_loss(
             out["pred_progression_patches"].float(),
             out["current_patches_target"].float(),
             prog_cls_idx,
             temperature=PROG_TEMP,
             class_weights=PROG_CLASS_WEIGHTS,
+            finding_query=(
+                finding_query.float() if finding_query is not None else None
+            ),
+            attn_temp=FINDING_QUERY_ATTN,
         )
 
     # Anatomy dual-mask JEPA: prior anatomy → ẑ, current anatomy → z_cur.
@@ -1040,6 +1099,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 progression_prompts_flat=build_progression_prompts(
                     batch["prog_finding"]
                 ),
+                finding_texts=batch["prog_finding"],
             )
 
             loss, jepa_l, prior_l, pred_l, prog_l, anat_l = (
@@ -1133,6 +1193,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     progression_prompts_flat=build_progression_prompts(
                         batch["prog_finding"]
                     ),
+                    finding_texts=batch["prog_finding"],
                 )
 
                 total, jepa_l, prior_l, pred_l, prog_l, anat_l = (

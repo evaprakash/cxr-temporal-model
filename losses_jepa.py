@@ -9,10 +9,9 @@ scale-invariant — so this module exposes:
   * ``jepa_cosine_loss`` for the main JEPA invariant:
     ``1 - cos(ẑ_cur, z_cur)`` averaged over patches.
   * ``progression_classification_loss`` for the 4th loss: a 5-way CE on
-    image-image cosine *logits*, computed from N candidate ``ẑ_cur^c``
-    (one per progression class). Mean-over-patches cosine, same as JEPA,
-    so train rule = gold set-match ``--pooling perpatch``. Supports
-    optional per-class weights (Cui et al. 2019).
+    image-image cosine *logits* from N candidate ``ẑ_cur^c``. With a
+    finding query, logits are ``cos(Q(ẑ^c), Q(z_pair))`` (attention
+    pool). Without, mean-over-patches cosine. Supports Cui CBW.
   * ``anatomy_masked_pool_jepa_loss`` (optional / off on main): for each
     of 22 fixed CXAS anatomies, soft-pool ``ẑ`` with the prior anatomy
     mask and ``z_cur`` with the current anatomy mask, then take
@@ -110,6 +109,41 @@ def patch_token_feature_stats(
 
 
 # =========================================================
+# FINDING QUERY (FROZEN BIOVIL-T CLS OF THE FINDING NAME)
+# =========================================================
+FINDING_QUERY_ATTN_TEMP = 0.07
+
+
+def finding_query_pool(
+    patches: torch.Tensor,
+    query: torch.Tensor,
+    attn_temp: float = FINDING_QUERY_ATTN_TEMP,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Softmax-attention pool of a patch grid with a finding vector.
+
+    ``Q`` is the frozen BioViL-T **global** embedding of ``\"edema\"``
+    (official CLS, 128-d, unit-norm). Patches are ``ẑ^c`` or ``z_pair``.
+
+    Attention (same Q on predicted and actual current)::
+
+        a[n] = softmax_n( (patches[n] · Q) / attn_temp )
+        Q(z) = normalize( Σ_n a[n] patches[n] )
+
+    ``patches`` is ``(..., N, D)``; ``query`` is ``(..., D)`` broadcast
+    over leading dims (e.g. ``(B, D)`` with ``(B, C, N, D)``).
+    """
+    p = F.normalize(patches, dim=-1, eps=eps)
+    q = F.normalize(query, dim=-1, eps=eps)
+    while q.ndim < p.ndim:
+        q = q.unsqueeze(-2)
+    logits = (p * q).sum(dim=-1) / max(float(attn_temp), eps)
+    weights = torch.softmax(logits, dim=-1)
+    pooled = (weights.unsqueeze(-1) * p).sum(dim=-2)
+    return F.normalize(pooled, dim=-1, eps=eps)
+
+
+# =========================================================
 # 4TH LOSS — PROGRESSION CLASSIFICATION (IMAGE–IMAGE 5-WAY CE)
 # =========================================================
 def progression_classification_loss(
@@ -119,21 +153,18 @@ def progression_classification_loss(
     temperature: float = 0.1,
     eps: float = 1e-8,
     class_weights: Optional[torch.Tensor] = None,
+    finding_query: Optional[torch.Tensor] = None,
+    attn_temp: float = FINDING_QUERY_ATTN_TEMP,
 ) -> torch.Tensor:
-    """5-way image-image CE on per-patch-mean candidate latents.
+    """5-way image-image CE on candidate latents vs pair-mode current.
 
-    For each pair ``b`` and progression class ``c``:
+    Default (no query): ``logit[b,c] = mean_p cos(ẑ^c[p], z_pair[p])``.
 
-        logit[b, c] = mean over patches of cos(ẑ_cur^c[b], z_cur[b])
+    With ``finding_query`` ``Q`` (frozen BioViL-T CLS of the finding)::
 
-    where ``ẑ_cur^c[b]`` is the predictor's output when conditioned on the
-    class-c prompt ``"{prog_finding[b]} is {class[c]}."``. ``z_cur`` is
-    the EMA pair-mode current (``encoder(current, prior)``). CE is
-    applied to ``logits / temperature`` against the silver progression
-    label.
+        logit[b,c] = cos( Q(ẑ^c), Q(z_pair) )
 
-    Mean-over-patches matches ``jepa_cosine_loss`` and gold set-match
-    ``--pooling perpatch``.
+    Same ``Q`` on predicted and actual current. CE on ``logits / τ``.
 
     Parameters
     ----------
@@ -174,11 +205,13 @@ def progression_classification_loss(
 
     pred = F.normalize(pred_progression_patches, dim=-1, eps=eps)
     target = F.normalize(current_patches_target, dim=-1, eps=eps)
-    # Broadcast target over the candidate-class dim:
-    #   pred   : (B, C, N, D)
-    #   target : (B, 1, N, D)
-    cos_per_patch = (pred * target.unsqueeze(1)).sum(dim=-1)  # (B, C, N)
-    logits = cos_per_patch.mean(dim=-1)                        # (B, C)
+    if finding_query is not None:
+        u = finding_query_pool(pred, finding_query, attn_temp=attn_temp, eps=eps)
+        v = finding_query_pool(target, finding_query, attn_temp=attn_temp, eps=eps)
+        logits = (u * v.unsqueeze(1)).sum(dim=-1)
+    else:
+        cos_per_patch = (pred * target.unsqueeze(1)).sum(dim=-1)
+        logits = cos_per_patch.mean(dim=-1)
     logits = logits / temperature
 
     return F.cross_entropy(logits, silver_labels, weight=class_weights)

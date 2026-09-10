@@ -171,6 +171,7 @@ def run_smoke_test(B: int, n_sampling_trials: int) -> int:
         condition_texts,
         progression_prompts_flat=progression_prompts_flat,
         finding_texts=prog_findings,
+        use_finding_head=True,
     )
 
     shapes = {k: tuple(v.shape) for k, v in out.items() if torch.is_tensor(v)}

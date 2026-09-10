@@ -18,8 +18,8 @@ Prints:
 Backends
 --------
 ``jepa``     — JEPA image–image cosine (default **per-patch**; use
-               ``--pooling global`` for global-pool checkpoints, or
-               ``--pooling head`` for the [ẑ; z_cur; finding] head)
+               ``--pooling findquery`` for frozen BioViL-T finding-query
+               attention, ``--pooling global``, or ``--pooling head``)
 ``biovilt``  — official BioViL-T image–text phrase-bank (max phrase
                cosine per class)
 
@@ -57,6 +57,10 @@ from eval_progression_jepa import (
     PROMPT_TEMPLATE as JEPA_PROMPT_TEMPLATE,
     _encode_prompts,
 )
+from gold_jepa_diagnostics import (
+    five_forecast_offdiag_cos,
+    print_jepa_score_diagnostics,
+)
 from gold_progression_setmatch import (
     format_running_setmatch,
     group_gold_by_pair_finding,
@@ -64,7 +68,11 @@ from gold_progression_setmatch import (
     topk_set_match,
 )
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
-from losses_jepa import global_pool_normalize
+from losses_jepa import (
+    FINDING_QUERY_ATTN_TEMP,
+    finding_query_pool,
+    global_pool_normalize,
+)
 from progression_classify import (
     DATASETS,
     DEFAULT_GOLD_PARQUET,
@@ -120,6 +128,7 @@ def jepa_score_one_pair(
             "cos_class_scores": scores,
             "pred_class": pred_class,
             "prompts": [key],
+            "zhat_offdiag": None,
         }
 
     prompts, txt_local, token_mask = _encode_prompts(
@@ -137,8 +146,24 @@ def jepa_score_one_pair(
     preds = model.predictor(z_prior_b, txt_local, token_mask)
     pred_f = preds.float()
     target_f = z_cur.float()
+    zhat_off = five_forecast_offdiag_cos(pred_f)
 
-    if pooling == "global":
+    if pooling == "findquery":
+        q_key = finding.strip().lower()
+        if text_cache is not None and f"__findq__:{q_key}" in text_cache:
+            q = text_cache[f"__findq__:{q_key}"].to(device)
+        else:
+            q, _, _ = model.text_encoder.forward_contrastive([q_key])
+            if text_cache is not None:
+                text_cache[f"__findq__:{q_key}"] = q.detach().cpu()
+        u = finding_query_pool(
+            pred_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
+        )
+        v = finding_query_pool(
+            target_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
+        )
+        cos_class_scores = (u * v).sum(dim=-1).tolist()
+    elif pooling == "global":
         pred_g = global_pool_normalize(pred_f)
         target_g = global_pool_normalize(target_f)
         cos_class_scores = F.cosine_similarity(
@@ -155,11 +180,13 @@ def jepa_score_one_pair(
         "cos_class_scores": cos_class_scores,
         "pred_class": pred_class,
         "prompts": prompts,
+        "zhat_offdiag": zhat_off,
     }
 
 
 def run_eval(args, score_fn, groups, device):
     results = []
+    diag_rows = []
     skipped = 0
     text_cache: Dict[str, Tuple] = {}
 
@@ -199,6 +226,13 @@ def run_eval(args, score_fn, groups, device):
             finding=finding,
         )
         results.append(sm)
+        diag_rows.append(
+            {
+                "scores": list(out["cos_class_scores"]),
+                "gt_labels": list(gt_labels),
+                "zhat_offdiag": out.get("zhat_offdiag"),
+            }
+        )
 
         if (i + 1) % max(1, len(groups) // 20) == 0:
             print(
@@ -216,6 +250,8 @@ def run_eval(args, score_fn, groups, device):
     if args.backend == "jepa":
         note = f", pooling={args.pooling}"
     print_setmatch_report(results, args.backend, note)
+    if args.backend == "jepa":
+        print_jepa_score_diagnostics(diag_rows)
 
 
 def main():
@@ -240,8 +276,10 @@ def main():
     parser.add_argument(
         "--pooling",
         default="perpatch",
-        choices=["perpatch", "global", "head"],
+        choices=["perpatch", "global", "head", "findquery"],
         help="JEPA similarity rule (ignored for biovilt). "
+             "``findquery`` = cos(Q(ẑ^c), Q(z_pair)) with frozen "
+             "BioViL-T finding CLS. "
              "``head`` = Linear([pool(ẑ); pool(z_cur); finding]).",
     )
     parser.add_argument(
