@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_eqw1_jointtgt
+#SBATCH --job-name=jepa_wprog100_jointtgt
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,33 +8,32 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_eqw1_jointtgt_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_eqw1_jointtgt_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_wprog100_jointtgt_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_wprog100_jointtgt_%j.err
 
 # ============================================================
 # SLURM launcher: preempt queue (batch is down for the hero run).
 # Marlowe: preempt uses the bare project account (no -pm06) and
 # max wall time 4h. -pm06 is a batch QOS and sbatch rejects it here.
 # GLoRIA on, full text frozen, official CLS proj, EMA 0.996 → 1.0,
-# all four live losses at weight 1.0.
+# joint current target, JEPA/prog 1.0, GLoRIA 0.1/0.1.
 #
 #   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ_dyn[p], z_pair[p]))
 #   * W_PROG = 1.0 — per-patch-mean cosine 5-way CE vs z_pair
 #   * z_pair = EMA encoder(current, prior); prior input stays single-image
-#   * W_REPORT_PRIOR = W_REPORT_PRED = 1.0  (GLoRIA)
+#   * W_REPORT_PRIOR = W_REPORT_PRED = 0.1  (GLoRIA quiet)
 #   * Text frozen in full: CXR-BERT + local 768→128
 #     (= official cls_projection_head, not a random head)
 #   * EMA 0.996 → 1.0
 #   * Writes to
-#     checkpoints_jepa_dynamic_cbw99999_rp100_wprog100_txtfrzcls_jointtgt/
-#     (does NOT resume the single-image-target eqw dir)
+#     checkpoints_jepa_dynamic_cbw99999_wprog100_txtfrzcls_jointtgt/
+#     (does NOT resume the eqw joint dir)
 #   * Auto-resumes latest epoch_N.pt in that dir if preempted.
 #   * Rank-0 gold set-match after each epoch (--pooling perpatch).
 #
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
 #     git pull
-#     scancel <old-batch-jobid>   # if the 0.5/0.5 batch job is still PD
 #     sbatch resume_train_jepa.sh
 # ============================================================
 

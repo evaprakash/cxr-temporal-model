@@ -20,11 +20,10 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: GLoRIA on, text frozen (official CLS), EMA 0.996 → 1.0,
-# all four live losses at weight 1.0 (JEPA, prog CE, GLoRIA prior,
-# GLoRIA pred). Anatomy off. Same mix as 1/N; unnormalized 1.0 keeps
-# the JEPA term on the paper LR scale. Dir tag
-# ``_rp100_wprog100_txtfrzcls_jointtgt`` so this does not resume the
-# single-image-target eqw dir or ``_txtfrzcls``.
+# joint current target, W_JEPA=W_PROG=1.0, GLoRIA 0.1/0.1. Anatomy off.
+# Tests whether eqw collapse was loud GLoRIA (not prog=1). Dir tag
+# ``_wprog100_txtfrzcls_jointtgt`` so this does not resume the eqw
+# joint dir (``_rp100_..._jointtgt``) or paper ``_txtfrzcls``.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -276,14 +275,14 @@ WARMUP_RATIO = 0.03
 # (1 = every epoch), plus best.pt whenever val total improves.
 SAVE_EVERY_N_EPOCHS = 1
 
-# Loss weights. Four live terms, equal unnormalized weight (not 1/N).
+# Loss weights. JEPA and prog CE on the paper JEPA scale; GLoRIA quiet.
 # Anatomy stays 0. GLoRIA: images → frozen official report tokens.
 W_JEPA = 1.0
-W_REPORT_PRIOR = 1.0
-W_REPORT_PRED = 1.0
+W_REPORT_PRIOR = 0.1
+W_REPORT_PRED = 0.1
 # Full text encoder (BERT + projection) is a frozen conditioner.
 FREEZE_TEXT_ENCODER = True
-# 4th loss: per-patch-mean cosine 5-way (same as the 0.452 run).
+# 4th loss: per-patch-mean cosine 5-way vs joint z_pair.
 W_PROG = 1.0
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
@@ -340,6 +339,7 @@ SPLIT_SEED = 42
 #   * ``..._wjepa50_wprog50_txtfrzcls`` — 0.5/0.5 JEPA/CE, GLoRIA 0.1 (archive)
 #   * ``..._rp100_wprog100_txtfrzcls`` — eqw, single-image current target
 #   * ``..._rp100_wprog100_txtfrzcls_jointtgt`` — eqw, pair-mode current target
+#   * ``..._wprog100_txtfrzcls_jointtgt`` — joint, JEPA/prog 1.0, GLoRIA 0.1
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
