@@ -32,7 +32,8 @@ string either way.
 The live 4th (progression) loss is 5-template cosine CE. The trainer
 passes ``finding_texts`` (length B) so the same frozen BioViL-T CLS of
 the finding name is available as ``finding_query`` ``Q``. The caller
-attention-pools both ``ẑ^c`` and ``z_pair`` with that ``Q``.
+computes attention on ``z_pair`` with that ``Q`` and applies the
+same weights to both ``ẑ^c`` and ``z_pair``.
 
 Optional ``use_finding_head=True`` still runs a finding-conditioned
 predictor pass and ``Linear([pool(ẑ); pool(z_cur); finding])``.
@@ -44,7 +45,7 @@ Losses (computed by the caller):
     - JEPA cosine                              : 1 − cos(ẑ_cur, z_cur) mean over patches
     - GLoRIA local contrastive                 : z_prior ↔ τ_prior
     - GLoRIA local contrastive                 : ẑ_cur ↔ τ_current
-    - Progression 5-way CE                     : cos(Q(ẑ^c), Q(z_pair)) or mean-patch cos
+    - Progression 5-way CE                     : attn from z_pair·Q, then cos of pooled films
 """
 
 import copy
@@ -487,9 +488,9 @@ class TempCXRJEPA(nn.Module):
             _, N, D = pred_prog_flat.shape
             out["pred_progression_patches"] = pred_prog_flat.view(B, C, N, D)
 
-        # Frozen BioViL-T CLS of the finding name. Same Q is later used
-        # to attention-pool ẑ^c and z_pair. Detach so Q is a constant
-        # (text encoder is already frozen on the live run).
+        # Frozen BioViL-T CLS of the finding name. Q scores tiles on
+        # z_pair only; those weights later pool both ẑ^c and z_pair.
+        # Detach so Q is a constant (text encoder is already frozen).
         if finding_active:
             find_off = 3 * B + n_prog
             find_txt_global = all_txt_global[find_off:find_off + B]

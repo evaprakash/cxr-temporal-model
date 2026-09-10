@@ -17,10 +17,11 @@
 # max wall time 4h. -pm06 is a batch QOS and sbatch rejects it here.
 # GLoRIA on, full text frozen, official CLS proj, EMA 0.996 → 1.0,
 # joint current target, paper weights 1 / 0.1 / 0.1 / 0.1,
-# frozen BioViL-T finding-query attention on ẑ^c and z_pair.
+# frozen BioViL-T finding query: attn from z_pair only, same
+# weights pool ẑ^c and z_pair.
 #
 #   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ_dyn[p], z_pair[p]))
-#   * W_PROG = 0.1 — cos(Q(ẑ^c), Q(z_pair)) 5-way CE
+#   * W_PROG = 0.1 — cos(pool_a(ẑ^c), pool_a(z_pair)), a = softmax(z_pair·Q)
 #   * Q = frozen official CLS of the finding name
 #   * z_pair = EMA encoder(current, prior); prior input stays single-image
 #   * W_REPORT_PRIOR = W_REPORT_PRED = 0.1  (GLoRIA quiet)

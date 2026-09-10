@@ -30,8 +30,9 @@
 #   ``(prog_finding, prog_cls_idx)`` per epoch. The model produces
 #   ``ẑ_cur^c`` for each of the 5 class prompts
 #   ``"{prog_finding} is {class}."``. Frozen BioViL-T CLS of the
-#   finding name is Q. Softmax-attention pool Q(ẑ^c) and Q(z_pair);
-#   ``F.cross_entropy(cos(Q(ẑ^c), Q(z_pair)) / τ, silver_label,
+#   finding name is Q. Attention from z_pair only:
+#   a[n] = softmax(z_pair[n] · Q); same a pools ẑ^c and z_pair.
+#   ``F.cross_entropy(cos(pool_a(ẑ^c), pool_a(z_pair)) / τ, silver_label,
 #                     weight=class_weights)``.
 #   ``z_pair`` = EMA pair encoder ``(current, prior)``. Predictor input
 #   prior is still single-image.
@@ -87,7 +88,7 @@ from losses import local_contrastive_loss
 from losses_jepa import (
     FINDING_QUERY_ATTN_TEMP,
     anatomy_masked_pool_jepa_loss,
-    finding_query_pool,
+    finding_query_pool_from_actual,
     global_pool_normalize,
     jepa_cosine_loss,
     patch_token_feature_stats,
@@ -294,7 +295,7 @@ FREEZE_TEXT_ENCODER = True
 W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-# Gold / in-training scores: cos(Q(ẑ^c), Q(z_pair)), Q = frozen finding CLS.
+# Gold / in-training scores: attn from z_pair · Q, same weights on ẑ^c.
 PROG_POOLING = "findquery"
 FINDING_QUERY_ATTN = FINDING_QUERY_ATTN_TEMP
 N_CLS = len(CLS_ORDER)
@@ -532,8 +533,8 @@ if local_rank == 0:
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
         f"joint_current_target={JOINT_CURRENT_TARGET} "
         f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_pair[p])); "
-        f"prog = cos(Q(ẑ^c), Q(z_pair)) 5-way CE, "
-        f"Q=frozen BioViL-T CLS of finding; "
+        f"prog = cos(pool_a(ẑ^c), pool_a(z_pair)) 5-way CE, "
+        f"a=softmax(z_pair·Q), Q=frozen BioViL-T CLS of finding; "
         f"z_pair = EMA encoder(current, prior))"
     )
     print(
@@ -817,11 +818,8 @@ def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
                 [finding.strip().lower()]
             )
             text_cache[q_key] = q.detach().cpu()
-        u = finding_query_pool(
-            pred_f, q, attn_temp=FINDING_QUERY_ATTN,
-        )
-        v = finding_query_pool(
-            target_f, q, attn_temp=FINDING_QUERY_ATTN,
+        u, v = finding_query_pool_from_actual(
+            pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN,
         )
         scores = (u * v).sum(dim=-1).tolist()
     elif PROG_POOLING == "global":

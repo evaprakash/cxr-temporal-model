@@ -70,7 +70,7 @@ from gold_progression_setmatch import (
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
 from losses_jepa import (
     FINDING_QUERY_ATTN_TEMP,
-    finding_query_pool,
+    finding_query_pool_from_actual,
     global_pool_normalize,
 )
 from progression_classify import (
@@ -156,11 +156,8 @@ def jepa_score_one_pair(
             q, _, _ = model.text_encoder.forward_contrastive([q_key])
             if text_cache is not None:
                 text_cache[f"__findq__:{q_key}"] = q.detach().cpu()
-        u = finding_query_pool(
-            pred_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
-        )
-        v = finding_query_pool(
-            target_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
+        u, v = finding_query_pool_from_actual(
+            pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
         )
         cos_class_scores = (u * v).sum(dim=-1).tolist()
     elif pooling == "global":
@@ -278,8 +275,8 @@ def main():
         default="perpatch",
         choices=["perpatch", "global", "head", "findquery"],
         help="JEPA similarity rule (ignored for biovilt). "
-             "``findquery`` = cos(Q(ẑ^c), Q(z_pair)) with frozen "
-             "BioViL-T finding CLS. "
+             "``findquery`` = attn from z_pair·Q, same weights pool "
+             "ẑ^c and z_pair. "
              "``head`` = Linear([pool(ẑ); pool(z_cur); finding]).",
     )
     parser.add_argument(
