@@ -185,8 +185,8 @@ def score_one_pair(
     # Encode images once. Encoders already L2-normalize their outputs
     # along the feature dim, so ``z_prior`` and ``z_cur`` live on the
     # unit sphere.
-    _, z_prior = model.image_encoder(prior)               # (1, N, D)
-    _, z_cur = model.target_image_encoder(current)        # (1, N, D)
+    _, z_prior = model.image_encoder(prior)               # (1, N, D) single
+    _, z_cur = model.target_image_encoder(current, prior)  # (1, N, D) pair
     z_cur = z_cur.detach()
 
     # Batch the predictor across all prompts by broadcasting the same

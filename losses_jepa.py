@@ -127,8 +127,10 @@ def progression_classification_loss(
         logit[b, c] = mean over patches of cos(ẑ_cur^c[b], z_cur[b])
 
     where ``ẑ_cur^c[b]`` is the predictor's output when conditioned on the
-    class-c prompt ``"{prog_finding[b]} is {class[c]}."``. CE is applied
-    to ``logits / temperature`` against the silver progression label.
+    class-c prompt ``"{prog_finding[b]} is {class[c]}."``. ``z_cur`` is
+    the EMA pair-mode current (``encoder(current, prior)``). CE is
+    applied to ``logits / temperature`` against the silver progression
+    label.
 
     Mean-over-patches matches ``jepa_cosine_loss`` and gold set-match
     ``--pooling perpatch``.

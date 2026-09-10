@@ -4,11 +4,13 @@
 #
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
 #   - Model:    TempCXRJEPA (online + EMA + predictor) — unit-sphere
-#   - Losses:   JEPA per-patch cosine (1 - cos(ẑ, z_cur) mean over patches)
+#   - Losses:   JEPA per-patch cosine
+#               (1 - cos(ẑ, z_pair) mean over patches), z_pair =
+#               EMA ``encoder(current, prior)``
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE, class-balanced
-#                 (Cui et al. 2019, β=0.99999) — see ``CBW_*`` below.
+#               + Progression 5-way image-image CE vs the same z_pair,
+#                 class-balanced (Cui et al. 2019, β=0.99999)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
@@ -21,16 +23,18 @@
 # all four live losses at weight 1.0 (JEPA, prog CE, GLoRIA prior,
 # GLoRIA pred). Anatomy off. Same mix as 1/N; unnormalized 1.0 keeps
 # the JEPA term on the paper LR scale. Dir tag
-# ``_rp100_wprog100_txtfrzcls`` so this does not resume ``_txtfrzcls``,
-# ``_wjepa50_wprog50_txtfrzcls``, or ``_txtfrzcls_ema999``.
+# ``_rp100_wprog100_txtfrzcls_jointtgt`` so this does not resume the
+# single-image-target eqw dir or ``_txtfrzcls``.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
 #   ``(prog_finding, prog_cls_idx)`` per epoch. The model produces
 #   ``ẑ_cur^c`` for each of the 5 class prompts
 #   ``"{prog_finding} is {class}."`` and applies
-#   ``F.cross_entropy(cos(ẑ_cur^c, z_cur) / τ, silver_label,
+#   ``F.cross_entropy(cos(ẑ_cur^c, z_pair) / τ, silver_label,
 #                     weight=class_weights)`` (mean-over-patches cosine).
+#   ``z_pair`` = EMA pair encoder ``(current, prior)``. Predictor input
+#   prior is still single-image.
 
 import os
 import glob
@@ -283,9 +287,11 @@ FREEZE_TEXT_ENCODER = True
 W_PROG = 1.0
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-# Gold / in-training scores: mean_p cos(ẑ^c[p], z_cur[p]).
+# Gold / in-training scores: mean_p cos(ẑ^c[p], z_pair[p]).
 PROG_POOLING = "perpatch"
 N_CLS = len(CLS_ORDER)
+# Both JEPA and prog CE match ẑ to pair-mode current (given prior).
+JOINT_CURRENT_TARGET = True
 
 # Anatomy dual-mask JEPA off for this run (per-patch full-grid only).
 W_ANAT_JEPA = 0.0
@@ -332,7 +338,8 @@ SPLIT_SEED = 42
 #   * ``..._txtfrzcls``               — GLoRIA on, text frozen, official CLS, EMA 0.996
 #   * ``..._txtfrzcls_ema999``        — same + EMA 0.999 → 1.0 (archive)
 #   * ``..._wjepa50_wprog50_txtfrzcls`` — 0.5/0.5 JEPA/CE, GLoRIA 0.1 (archive)
-#   * ``..._rp100_wprog100_txtfrzcls`` — this run: all four live losses = 1.0
+#   * ``..._rp100_wprog100_txtfrzcls`` — eqw, single-image current target
+#   * ``..._rp100_wprog100_txtfrzcls_jointtgt`` — eqw, pair-mode current target
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -391,6 +398,8 @@ if FREEZE_TEXT_ENCODER:
     _SETTING_TAG = f"{_SETTING_TAG}_txtfrzcls"
 if abs(EMA_START - 0.996) > 1e-12:
     _SETTING_TAG = f"{_SETTING_TAG}_ema{_cbw_beta_tag(EMA_START)}"
+if JOINT_CURRENT_TARGET:
+    _SETTING_TAG = f"{_SETTING_TAG}_jointtgt"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -509,8 +518,10 @@ if local_rank == 0:
         f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
-        f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
-        f"prog = per-patch-mean cos 5-way CE)"
+        f"joint_current_target={JOINT_CURRENT_TARGET} "
+        f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_pair[p])); "
+        f"prog = per-patch-mean cos(ẑ^c, z_pair) 5-way CE; "
+        f"z_pair = EMA encoder(current, prior))"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -748,7 +759,7 @@ def _score_gold_pair_head(raw_model, prior_img, current_img, finding, text_cache
     prior = prior_img.unsqueeze(0).to(DEVICE)
     current = current_img.unsqueeze(0).to(DEVICE)
     _, z_prior = raw_model.image_encoder(prior)
-    _, z_cur = raw_model.target_image_encoder(current)
+    _, z_cur = raw_model.target_image_encoder(current, prior)
     zhat = raw_model.predictor(z_prior, txt_local, token_mask)
     logits = raw_model.progression_logits(
         zhat, z_cur.detach(), txt_global,
@@ -770,7 +781,7 @@ def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
     prior = prior_img.unsqueeze(0).to(DEVICE)
     current = current_img.unsqueeze(0).to(DEVICE)
     _, z_prior = raw_model.image_encoder(prior)
-    _, z_cur = raw_model.target_image_encoder(current)
+    _, z_cur = raw_model.target_image_encoder(current, prior)
     z_cur = z_cur.detach()
     z_prior_b = z_prior.expand(n_prompts, -1, -1).contiguous()
     preds = raw_model.predictor(z_prior_b, txt_local, token_mask)
@@ -843,7 +854,8 @@ def eval_gold_setmatch(raw_model, groups, image_roots, epoch):
     print_setmatch_report(
         results,
         "jepa",
-        f", pooling={PROG_POOLING}, epoch={epoch} (in-training)",
+        f", pooling={PROG_POOLING}, joint_tgt={JOINT_CURRENT_TARGET}, "
+        f"epoch={epoch} (in-training)",
     )
     return summarize_setmatch(results)
 

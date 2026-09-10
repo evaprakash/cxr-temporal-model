@@ -111,7 +111,7 @@ def jepa_score_one_pair(
         prior = prior_img.unsqueeze(0).to(device)
         current = current_img.unsqueeze(0).to(device)
         _, z_prior = model.image_encoder(prior)
-        _, z_cur = model.target_image_encoder(current)
+        _, z_cur = model.target_image_encoder(current, prior)
         zhat = model.predictor(z_prior, txt_local, token_mask)
         logits = model.progression_logits(zhat, z_cur.detach(), txt_global)
         scores = logits[0].float().tolist()
@@ -130,7 +130,7 @@ def jepa_score_one_pair(
     current = current_img.unsqueeze(0).to(device)
 
     _, z_prior = model.image_encoder(prior)
-    _, z_cur = model.target_image_encoder(current)
+    _, z_cur = model.target_image_encoder(current, prior)
     z_cur = z_cur.detach()
 
     z_prior_b = z_prior.expand(n_prompts, -1, -1).contiguous()

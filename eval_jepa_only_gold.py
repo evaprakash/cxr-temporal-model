@@ -126,7 +126,7 @@ def run_eval(args, groups, image_roots, device: torch.device) -> None:
         prior_b = prior.unsqueeze(0).to(device)
         current_b = current.unsqueeze(0).to(device)
         _, z_prior = model.image_encoder(prior_b)
-        _, z_cur = model.target_image_encoder(current_b)
+        _, z_cur = model.target_image_encoder(current_b, prior_b)
         z_cur = z_cur.detach()
         z_prior_b = z_prior.expand(N_CLS, -1, -1).contiguous()
         zhats = model.predictor(z_prior_b, txt_local, token_mask)

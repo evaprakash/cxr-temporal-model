@@ -98,7 +98,7 @@ def score_one_pair(
     current = current_img.unsqueeze(0).to(device)
 
     _, z_prior = model.image_encoder(prior)
-    _, z_cur = model.target_image_encoder(current)
+    _, z_cur = model.target_image_encoder(current, prior)
     z_cur = z_cur.detach()
 
     z_prior_b = z_prior.expand(n_prompts, -1, -1).contiguous()

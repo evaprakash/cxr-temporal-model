@@ -355,7 +355,9 @@ class TempCXRJEPA(nn.Module):
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, unit-norm,
                                                 with grad
-          - current_patches_target   (B, N, D)  EMA target encoder,
+          - current_patches_target   (B, N, D)  EMA target encoder in
+                                                pair mode
+                                                ``encoder(current, prior)``,
                                                 unit-norm, detached
                                                 (stop-gradient)
           - pred_current_patches     (B, N, D)  predictor output ẑ_cur
@@ -432,13 +434,16 @@ class TempCXRJEPA(nn.Module):
             prog_txt_local = all_txt_local[3 * B:3 * B + n_prog]
             prog_token_mask = all_token_mask[3 * B:3 * B + n_prog]
 
-        # ---- Target encoder on current image: stop-gradient ----
-        # The target encoder is a frozen EMA copy of the online encoder
-        # and inherits the same L2-norm at its output, so the target
-        # also lives on the unit sphere — no extra normalization needed
-        # here. Detach to harden the stop-gradient.
+        # ---- Target encoder on current given prior: stop-gradient ----
+        # Pair mode: current patches after the temporal transformer has
+        # seen the prior (BioViL-T P_curr || P_diff → 128-d). Same
+        # target for dynamic JEPA and progression CE. Prior stays
+        # single-image on the online encoder (no current leak). Detach
+        # to harden the stop-gradient.
         with torch.no_grad():
-            _, current_patches_target = self.target_image_encoder(current_imgs)
+            _, current_patches_target = self.target_image_encoder(
+                current_imgs, prior_imgs,
+            )
         current_patches_target = current_patches_target.detach()
 
         # ---- Predictor pass #1: ẑ_cur from prior + condition text ----
