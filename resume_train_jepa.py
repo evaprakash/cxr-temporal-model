@@ -8,8 +8,9 @@
 #               (1 - cos(ẑ, z_cur) mean over patches)
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE (finding-query pool),
-#                 class-balanced (Cui et al. 2019, β=0.99999)
+#               + Progression 5-way image-image CE (finding-weighted
+#                 mean of tile cosines), class-balanced (Cui et al. 2019,
+#                 β=0.99999)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
 #   - Text condition (predictor input for JEPA loss): ``dynamic`` by
@@ -18,21 +19,22 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: paper recipe + finding-query prog CE only.
+# Current run: paper recipe + finding-weighted mean of tile cosines.
 # Trainable text, single-image current (no prior context), local
 # 768→128 inited from official CLS then trained, weights
 # 1 / 0.1 / 0.1 / 0.1, EMA 0.996 → 1.0. Writes to
-# ``checkpoints_jepa_dynamic_cbw99999_findq/`` (does not touch paper
-# ``cbw99999/`` or the old freeze+joint findq dir).
+# ``checkpoints_jepa_dynamic_cbw99999_findqwmean/`` (does not touch
+# paper ``cbw99999/`` or the collapsed-pool ``_findq`` dir).
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
 #   ``(prog_finding, prog_cls_idx)`` per epoch. The model produces
 #   ``ẑ_cur^c`` for each of the 5 class prompts
 #   ``"{prog_finding} is {class}."``. Attention from actual current
-#   only: a[n] = softmax(z_cur[n] · Q); same a pools ẑ^c and z_cur.
-#   Q = detached text CLS of the finding name (text still trains).
-#   ``F.cross_entropy(cos(pool_a(ẑ^c), pool_a(z_cur)) / τ, silver_label,
+#   only: a[n] = softmax(z_cur[n] · Q). Paper geometry: match then
+#   average, with a weighting the mean. Q = detached text CLS of the
+#   finding name (text still trains).
+#   ``F.cross_entropy(Σ_n a[n] cos(ẑ^c[n], z_cur[n]) / τ, silver_label,
 #                     weight=class_weights)``.
 
 import os
@@ -87,6 +89,7 @@ from losses_jepa import (
     FINDING_QUERY_ATTN_TEMP,
     anatomy_masked_pool_jepa_loss,
     finding_query_pool_from_actual,
+    finding_query_weighted_cos_from_actual,
     global_pool_normalize,
     jepa_cosine_loss,
     patch_token_feature_stats,
@@ -288,11 +291,12 @@ W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
 # Paper: text trains (report GLoRIA + class-sentence prompts).
 FREEZE_TEXT_ENCODER = False
-# 4th loss: finding-query pool 5-way (only change vs paper).
+# 4th loss: paper mean-of-tile-cosines, finding-weighted (not pooled).
 W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-PROG_POOLING = "findquery"
+PROG_POOLING = "findquery_wmean"
+_FINDQ_POOLINGS = ("findquery", "findquery_wmean")
 FINDING_QUERY_ATTN = FINDING_QUERY_ATTN_TEMP
 N_CLS = len(CLS_ORDER)
 # Paper: single-image current. Must stay False; the encoder call in
@@ -348,7 +352,8 @@ SPLIT_SEED = 42
 #   * ``..._rp100_wprog100_txtfrzcls_jointtgt`` — eqw, pair-mode current target
 #   * ``..._wprog100_txtfrzcls_jointtgt`` — joint, JEPA/prog 1.0, GLoRIA 0.1
 #   * ``..._txtfrzcls_jointtgt_findq`` — freeze + joint + findq (archive)
-#   * ``..._findq``                   — paper + findq only (this run)
+#   * ``..._findq``                   — collapsed-pool findq (archive)
+#   * ``..._findqwmean``              — paper + weighted-mean findq (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -411,6 +416,8 @@ if JOINT_CURRENT_TARGET:
     _SETTING_TAG = f"{_SETTING_TAG}_jointtgt"
 if PROG_POOLING == "findquery":
     _SETTING_TAG = f"{_SETTING_TAG}_findq"
+elif PROG_POOLING == "findquery_wmean":
+    _SETTING_TAG = f"{_SETTING_TAG}_findqwmean"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -532,7 +539,7 @@ if local_rank == 0:
         f"joint_current_target={JOINT_CURRENT_TARGET} "
         f"(z_cur = encoder(current) single-image; "
         f"JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
-        f"prog = cos(pool_a(ẑ^c), pool_a(z_cur)) 5-way CE, "
+        f"prog = Σ_n a[n] cos(ẑ^c[n], z_cur[n]) 5-way CE, "
         f"a=softmax(z_cur·Q))"
     )
     print(
@@ -816,7 +823,7 @@ def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
     pred_f = preds.float()
     target_f = z_cur.float()
     zhat_off = five_forecast_offdiag_cos(pred_f)
-    if PROG_POOLING == "findquery":
+    if PROG_POOLING in _FINDQ_POOLINGS:
         q_key = f"__findq__:{finding.strip().lower()}"
         if q_key in text_cache:
             q = text_cache[q_key].to(DEVICE)
@@ -825,10 +832,15 @@ def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
                 [finding.strip().lower()]
             )
             text_cache[q_key] = q.detach().cpu()
-        u, v = finding_query_pool_from_actual(
-            pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN,
-        )
-        scores = (u * v).sum(dim=-1).tolist()
+        if PROG_POOLING == "findquery_wmean":
+            scores = finding_query_weighted_cos_from_actual(
+                pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN,
+            ).tolist()
+        else:
+            u, v = finding_query_pool_from_actual(
+                pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN,
+            )
+            scores = (u * v).sum(dim=-1).tolist()
     elif PROG_POOLING == "global":
         pred_g = global_pool_normalize(pred_f)
         target_g = global_pool_normalize(target_f)
@@ -985,14 +997,18 @@ def compute_jepa_losses(
         )
     else:
         finding_query = out.get("finding_query")
-        if PROG_POOLING == "findquery":
+        if PROG_POOLING in _FINDQ_POOLINGS:
             if finding_query is None:
                 raise RuntimeError(
-                    "PROG_POOLING=findquery but finding_query is missing; "
-                    "pass finding_texts into the model forward"
+                    f"PROG_POOLING={PROG_POOLING} but finding_query is "
+                    "missing; pass finding_texts into the model forward"
                 )
+            query_reduce = (
+                "wmean" if PROG_POOLING == "findquery_wmean" else "pool"
+            )
         else:
             finding_query = None
+            query_reduce = "pool"
         prog = progression_classification_loss(
             out["pred_progression_patches"].float(),
             out["current_patches_target"].float(),
@@ -1003,6 +1019,7 @@ def compute_jepa_losses(
                 finding_query.float() if finding_query is not None else None
             ),
             attn_temp=FINDING_QUERY_ATTN,
+            query_reduce=query_reduce,
         )
 
     # Anatomy dual-mask JEPA: prior anatomy → ẑ, current anatomy → z_cur.
@@ -1106,7 +1123,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 ),
                 finding_texts=(
                     batch["prog_finding"]
-                    if PROG_POOLING == "findquery" else None
+                    if PROG_POOLING in _FINDQ_POOLINGS else None
                 ),
             )
 
@@ -1203,7 +1220,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     ),
                     finding_texts=(
                         batch["prog_finding"]
-                        if PROG_POOLING == "findquery" else None
+                        if PROG_POOLING in _FINDQ_POOLINGS else None
                     ),
                 )
 

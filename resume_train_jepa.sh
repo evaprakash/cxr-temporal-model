@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_findq
+#SBATCH --job-name=jepa_wfindq
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,24 +8,24 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_findq_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_findq_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_wfindq_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_wfindq_%j.err
 
 # ============================================================
-# Paper JEPA + finding-query prog CE only.
-# Trainable text, single-image current (no prior context), no freeze,
-# local 768→128 inited from official CLS then trained.
-# Writes to checkpoints_jepa_dynamic_cbw99999_findq/
-# (does not touch paper cbw99999/ or txtfrzcls_jointtgt_findq/).
+# Paper JEPA + finding-weighted mean of tile cosines (small ablation).
+# Trainable text, single-image current, official-CLS local-proj init
+# then trained. Does NOT collapse ẑ / z_cur to one vector.
+# Writes to checkpoints_jepa_dynamic_cbw99999_findqwmean/
+# (does not touch paper cbw99999/ or collapsed-pool _findq/).
 #
 #   * W_JEPA = 1.0, W_PROG = 0.1, W_REPORT_* = 0.1
-#   * PROG_POOLING = findquery
-#     attn from z_cur only; same weights pool ẑ^c and z_cur
+#   * PROG_POOLING = findquery_wmean
+#     a = softmax(z_cur · Q); logit[c] = Σ_n a[n] cos(ẑ^c[n], z_cur[n])
 #   * FREEZE_TEXT_ENCODER = False
 #   * JOINT_CURRENT_TARGET = False
-#   * z_cur = target_image_encoder(current)  — paper, not pair-mode
-#   * Auto-resumes latest epoch_N.pt in the findq dir if preempted
-#   * Rank-0 gold set-match after each epoch (--pooling findquery)
+#   * z_cur = target_image_encoder(current)
+#   * From scratch (do not --resume paper or _findq)
+#   * Rank-0 gold after each epoch (same weighted-mean rule)
 #
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
@@ -57,7 +57,7 @@ echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || ech
 echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n/a>')"
 echo "[slurm] partition   = ${SLURM_JOB_PARTITION:-unknown}"
 
-# Abort-check: paper + findq only (no freeze, single-image current).
+# Abort-check: paper + weighted-mean findq (not collapsed pool).
 python - <<'PY'
 import pathlib
 import re
@@ -78,7 +78,7 @@ checks = {
     "W_PROG": "0.1",
     "W_REPORT_PRIOR": "0.1",
     "W_REPORT_PRED": "0.1",
-    "PROG_POOLING": '"findquery"',
+    "PROG_POOLING": '"findquery_wmean"',
     "JOINT_CURRENT_TARGET": "False",
     "FREEZE_TEXT_ENCODER": "False",
 }
@@ -87,7 +87,6 @@ for k, want in checks.items():
     got = assign(k)
     if got != want:
         bad.append(f"  {k}={got}  (want {want})")
-# Flag was previously cosmetic. Fail if current is still pair-mode.
 if re.search(
     r"target_image_encoder\(\s*current_imgs\s*,\s*prior_imgs",
     jepa,
@@ -100,7 +99,6 @@ if re.search(
     bad.append("  trainer gold still encodes current with prior")
 if "target_image_encoder(\n                current_imgs,\n            )" not in jepa:
     bad.append("  jepa.py missing single-image target_image_encoder(current_imgs)")
-# Official-CLS init of the local proj, then train (do not freeze).
 if not re.search(
     r"self\.text_projection = BertProjectionHead\([^\n]+\)\s*\n\s*self\.init_local_proj_from_official_cls",
     text,
@@ -108,14 +106,16 @@ if not re.search(
     bad.append("  text_encoder does not copy official CLS into local proj at init")
 if "assert_local_proj_matches_official_cls()" not in src:
     bad.append("  trainer does not verify official-CLS local-proj init")
+if "finding_query_weighted_cos_from_actual" not in src:
+    bad.append("  trainer gold missing weighted-mean findquery")
 if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
     sys.exit(1)
-print("[abort-check] OK  paper + findq  1/0.1/0.1/0.1")
+print("[abort-check] OK  paper + findquery_wmean  1/0.1/0.1/0.1")
 print("[abort-check] OK  text trainable, single-image current")
 print("[abort-check] OK  local text proj = official CLS init, unfrozen")
-print("[abort-check] OK  dir tag should be ..._cbw99999_findq")
+print("[abort-check] OK  dir tag should be ..._cbw99999_findqwmean")
 PY
 
 HI_ML_SRC="$PROJECT_DIR/tempcxr/modules/hi-ml/hi-ml-multimodal/src"

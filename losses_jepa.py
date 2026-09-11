@@ -171,6 +171,37 @@ def finding_query_pool_from_actual(
     return u, v
 
 
+def finding_query_weighted_cos_from_actual(
+    pred_patches: torch.Tensor,
+    actual_patches: torch.Tensor,
+    query: torch.Tensor,
+    attn_temp: float = FINDING_QUERY_ATTN_TEMP,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Paper 5-way geometry: match tiles, then finding-weighted mean.
+
+    ``a[n] = softmax(z_cur[n] · Q)`` from actual current only (stop-grad
+    sides). ``ẑ`` is never dotted with ``Q`` and is not pooled::
+
+        logit[c] = Σ_n a[n] cos(ẑ^c[n], z_cur[n])
+
+    ``pred_patches`` is ``(..., C, N, D)``; ``actual_patches`` is
+    ``(..., N, D)``. Returns ``(..., C)``.
+    """
+    weights = finding_query_attn_weights(
+        actual_patches, query, attn_temp=attn_temp, eps=eps,
+    )
+    pred = F.normalize(pred_patches, dim=-1, eps=eps)
+    actual = F.normalize(actual_patches, dim=-1, eps=eps)
+    while actual.ndim < pred.ndim:
+        actual = actual.unsqueeze(-3)
+    cos = (pred * actual).sum(dim=-1)
+    w = weights
+    while w.ndim < cos.ndim:
+        w = w.unsqueeze(-2)
+    return (cos * w).sum(dim=-1)
+
+
 # =========================================================
 # 4TH LOSS — PROGRESSION CLASSIFICATION (IMAGE–IMAGE 5-WAY CE)
 # =========================================================
@@ -183,15 +214,22 @@ def progression_classification_loss(
     class_weights: Optional[torch.Tensor] = None,
     finding_query: Optional[torch.Tensor] = None,
     attn_temp: float = FINDING_QUERY_ATTN_TEMP,
+    query_reduce: str = "pool",
 ) -> torch.Tensor:
     """5-way image-image CE on candidate latents vs single-image current.
 
     Default (no query): ``logit[b,c] = mean_p cos(ẑ^c[p], z_cur[p])``.
 
-    With ``finding_query`` ``Q`` (detached BioViL-T CLS of the finding)::
+    With ``finding_query`` ``Q`` (detached BioViL-T CLS of the finding)
+    and ``query_reduce="pool"`` (archived collapse)::
 
         a[n]     = softmax(z_cur[n] · Q)
         logit[b,c] = cos( pool_a(ẑ^c), pool_a(z_cur) )
+
+    With ``query_reduce="wmean"`` (paper geometry, finding-weighted)::
+
+        a[n]     = softmax(z_cur[n] · Q)
+        logit[b,c] = Σ_n a[n] cos(ẑ^c[n], z_cur[n])
 
     Attention from the actual current only. CE on ``logits / τ``.
 
@@ -235,10 +273,19 @@ def progression_classification_loss(
     pred = F.normalize(pred_progression_patches, dim=-1, eps=eps)
     target = F.normalize(current_patches_target, dim=-1, eps=eps)
     if finding_query is not None:
-        u, v = finding_query_pool_from_actual(
-            pred, target, finding_query, attn_temp=attn_temp, eps=eps,
-        )
-        logits = (u * v.unsqueeze(1)).sum(dim=-1)
+        if query_reduce == "wmean":
+            logits = finding_query_weighted_cos_from_actual(
+                pred, target, finding_query, attn_temp=attn_temp, eps=eps,
+            )
+        elif query_reduce == "pool":
+            u, v = finding_query_pool_from_actual(
+                pred, target, finding_query, attn_temp=attn_temp, eps=eps,
+            )
+            logits = (u * v.unsqueeze(1)).sum(dim=-1)
+        else:
+            raise ValueError(
+                f"query_reduce must be 'pool' or 'wmean', got {query_reduce!r}"
+            )
     else:
         cos_per_patch = (pred * target.unsqueeze(1)).sum(dim=-1)
         logits = cos_per_patch.mean(dim=-1)

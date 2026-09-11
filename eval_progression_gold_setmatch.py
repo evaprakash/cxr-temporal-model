@@ -73,6 +73,7 @@ from infer_jepa import IMAGE_ROOTS, load_jepa_model
 from losses_jepa import (
     FINDING_QUERY_ATTN_TEMP,
     finding_query_pool_from_actual,
+    finding_query_weighted_cos_from_actual,
     global_pool_normalize,
 )
 from progression_classify import (
@@ -150,7 +151,7 @@ def jepa_score_one_pair(
     target_f = z_cur.float()
     zhat_off = five_forecast_offdiag_cos(pred_f)
 
-    if pooling == "findquery":
+    if pooling in ("findquery", "findquery_wmean"):
         q_key = finding.strip().lower()
         if text_cache is not None and f"__findq__:{q_key}" in text_cache:
             q = text_cache[f"__findq__:{q_key}"].to(device)
@@ -158,10 +159,15 @@ def jepa_score_one_pair(
             q, _, _ = model.text_encoder.forward_contrastive([q_key])
             if text_cache is not None:
                 text_cache[f"__findq__:{q_key}"] = q.detach().cpu()
-        u, v = finding_query_pool_from_actual(
-            pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
-        )
-        cos_class_scores = (u * v).sum(dim=-1).tolist()
+        if pooling == "findquery_wmean":
+            cos_class_scores = finding_query_weighted_cos_from_actual(
+                pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
+            ).tolist()
+        else:
+            u, v = finding_query_pool_from_actual(
+                pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
+            )
+            cos_class_scores = (u * v).sum(dim=-1).tolist()
     elif pooling == "deltacos":
         cos_class_scores = deltacos_class_scores(pred_f, target_f, z_prior)
     elif pooling == "global":
@@ -277,11 +283,14 @@ def main():
     parser.add_argument(
         "--pooling",
         default="perpatch",
-        choices=["perpatch", "deltacos", "global", "head", "findquery"],
+        choices=[
+            "perpatch", "deltacos", "global", "head",
+            "findquery", "findquery_wmean",
+        ],
         help="JEPA similarity rule (ignored for biovilt). "
              "``deltacos`` = cos(ẑ^c−z_prior, z_cur−z_prior). "
-             "``findquery`` = attn from z_pair·Q, same weights pool "
-             "ẑ^c and z_pair. "
+             "``findquery`` = collapsed pool (archive). "
+             "``findquery_wmean`` = Σ_n a[n] cos(ẑ^c[n], z_cur[n]). "
              "``head`` = Linear([pool(ẑ); pool(z_cur); finding]).",
     )
     parser.add_argument(
