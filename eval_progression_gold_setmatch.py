@@ -18,8 +18,9 @@ Prints:
 Backends
 --------
 ``jepa``     — JEPA image–image cosine (default **per-patch**; use
-               ``--pooling findquery`` for frozen BioViL-T finding-query
-               attention, ``--pooling global``, or ``--pooling head``)
+               ``--pooling deltacos`` for change-vector cosine
+               ``cos(ẑ−z_prior, z_cur−z_prior)``, ``--pooling findquery``,
+               ``--pooling global``, or ``--pooling head``)
 ``biovilt``  — official BioViL-T image–text phrase-bank (max phrase
                cosine per class)
 
@@ -58,6 +59,7 @@ from eval_progression_jepa import (
     _encode_prompts,
 )
 from gold_jepa_diagnostics import (
+    deltacos_class_scores,
     five_forecast_offdiag_cos,
     print_jepa_score_diagnostics,
 )
@@ -160,6 +162,8 @@ def jepa_score_one_pair(
             pred_f, target_f, q, attn_temp=FINDING_QUERY_ATTN_TEMP,
         )
         cos_class_scores = (u * v).sum(dim=-1).tolist()
+    elif pooling == "deltacos":
+        cos_class_scores = deltacos_class_scores(pred_f, target_f, z_prior)
     elif pooling == "global":
         pred_g = global_pool_normalize(pred_f)
         target_g = global_pool_normalize(target_f)
@@ -273,8 +277,9 @@ def main():
     parser.add_argument(
         "--pooling",
         default="perpatch",
-        choices=["perpatch", "global", "head", "findquery"],
+        choices=["perpatch", "deltacos", "global", "head", "findquery"],
         help="JEPA similarity rule (ignored for biovilt). "
+             "``deltacos`` = cos(ẑ^c−z_prior, z_cur−z_prior). "
              "``findquery`` = attn from z_pair·Q, same weights pool "
              "ẑ^c and z_pair. "
              "``head`` = Linear([pool(ẑ); pool(z_cur); finding]).",

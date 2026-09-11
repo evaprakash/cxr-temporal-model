@@ -17,6 +17,37 @@ def _mean(xs: Sequence[float]) -> float:
     return sum(xs) / len(xs) if xs else float("nan")
 
 
+def deltacos_class_scores(
+    zhats: torch.Tensor,
+    z_cur: torch.Tensor,
+    z_prior: torch.Tensor,
+    eps: float = 1e-8,
+) -> List[float]:
+    """``cos(ẑ^c − z_prior, z_cur − z_prior)`` per class.
+
+    Same flatten as ``eval_jepa_only_gold._change_align``. ``zhats`` is
+    ``(C, N, D)``; ``z_cur`` / ``z_prior`` are ``(1, N, D)`` or
+    ``(N, D)``. Degenerate (near-zero) deltas score 0.
+    """
+    pred = zhats.float()
+    prior = z_prior.float()
+    if prior.dim() == 2:
+        prior = prior.unsqueeze(0)
+    cur = z_cur.float()
+    if cur.dim() == 2:
+        cur = cur.unsqueeze(0)
+    dpred = (pred - prior).flatten(1)
+    dtrue = (cur - prior).flatten()
+    if float(dtrue.norm()) < eps:
+        return [0.0] * int(pred.shape[0])
+    norms = dpred.norm(dim=1)
+    sim = F.cosine_similarity(dpred, dtrue.unsqueeze(0).expand_as(dpred), dim=1)
+    return [
+        0.0 if float(n) < eps else float(s)
+        for n, s in zip(norms, sim)
+    ]
+
+
 def five_forecast_offdiag_cos(zhats: torch.Tensor) -> float:
     """Mean off-diagonal patch-mean cosine among C forecasts.
 

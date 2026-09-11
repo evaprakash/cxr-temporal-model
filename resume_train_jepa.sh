@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_findq
+#SBATCH --job-name=jepa_paper
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,37 +8,22 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_findq_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_findq_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_paper_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_paper_%j.err
 
 # ============================================================
-# SLURM launcher: preempt queue (batch is down).
-# Marlowe: preempt uses the bare project account (no -pm06) and
-# max wall time 4h. -pm06 is a batch QOS and sbatch rejects it here.
-# GLoRIA on, full text frozen, official CLS proj, EMA 0.996 → 1.0,
-# joint current target, paper weights 1 / 0.1 / 0.1 / 0.1,
-# frozen BioViL-T finding query: attn from z_pair only, same
-# weights pool ẑ^c and z_pair.
+# Paper JEPA recipe (not findq). Writes to
+# checkpoints_jepa_dynamic_cbw99999/ — do not launch unless you
+# intend to continue that run.
 #
-#   * W_JEPA = 1.0 — mean_p (1 - cos(ẑ_dyn[p], z_pair[p]))
-#   * W_PROG = 0.1 — cos(pool_a(ẑ^c), pool_a(z_pair)), a = softmax(z_pair·Q)
-#   * Q = frozen official CLS of the finding name
-#   * z_pair = EMA encoder(current, prior); prior input stays single-image
-#   * W_REPORT_PRIOR = W_REPORT_PRED = 0.1  (GLoRIA quiet)
-#   * Text frozen in full: CXR-BERT + local 768→128
-#     (= official cls_projection_head, not a random head)
-#   * EMA 0.996 → 1.0
-#   * Writes to
-#     checkpoints_jepa_dynamic_cbw99999_txtfrzcls_jointtgt_findq/
-#     (does NOT resume _wprog100_..._jointtgt or paper _txtfrzcls)
-#   * Auto-resumes latest epoch_N.pt in that dir if preempted.
-#   * Rank-0 gold set-match after each epoch (--pooling findquery)
-#     plus pairwise-win / ẑ-film diagnostics.
+#   * W_JEPA = 1.0, W_PROG = 0.1, W_REPORT_* = 0.1
+#   * PROG_POOLING = perpatch (no finding query)
+#   * FREEZE_TEXT_ENCODER = False
+#   * JOINT_CURRENT_TARGET = False
 #
-#     mkdir -p /scratch/m000081-pm06/eprakash/logs
-#     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
-#     git pull
-#     # cancel the old W_PROG=1 job if it is still queued/running
+# For the change-vector gold eval, use eval_jepa_deltacos_gold.sh
+# instead of this trainer.
+#
 #     sbatch resume_train_jepa.sh
 # ============================================================
 
@@ -66,7 +51,7 @@ echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || ech
 echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n/a>')"
 echo "[slurm] partition   = ${SLURM_JOB_PARTITION:-unknown}"
 
-# Abort-check: refuse to launch if this checkout is not the find-query run.
+# Abort-check: paper recipe, not findq / freeze / joint.
 python - <<'PY'
 import pathlib
 import re
@@ -85,9 +70,9 @@ checks = {
     "W_PROG": "0.1",
     "W_REPORT_PRIOR": "0.1",
     "W_REPORT_PRED": "0.1",
-    "PROG_POOLING": '"findquery"',
-    "JOINT_CURRENT_TARGET": "True",
-    "FREEZE_TEXT_ENCODER": "True",
+    "PROG_POOLING": '"perpatch"',
+    "JOINT_CURRENT_TARGET": "False",
+    "FREEZE_TEXT_ENCODER": "False",
 }
 bad = []
 for k, want in checks.items():
@@ -98,12 +83,8 @@ if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
     sys.exit(1)
-if "findq" not in src or "jointtgt" not in src:
-    print("[abort-check] FAILED: expected findq + jointtgt in trainer")
-    sys.exit(1)
-print("[abort-check] OK  W_JEPA=1.0 W_PROG=0.1 W_REPORT=0.1/0.1")
-print("[abort-check] OK  PROG_POOLING=findquery JOINT_CURRENT_TARGET=True")
-print("[abort-check] OK  dir tag should be ..._txtfrzcls_jointtgt_findq")
+print("[abort-check] OK  paper recipe  1/0.1/0.1/0.1 perpatch")
+print("[abort-check] OK  text trainable, joint flag off, no findq")
 PY
 
 HI_ML_SRC="$PROJECT_DIR/tempcxr/modules/hi-ml/hi-ml-multimodal/src"

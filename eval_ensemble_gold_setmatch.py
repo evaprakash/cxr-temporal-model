@@ -311,8 +311,8 @@ def main():
     parser.add_argument(
         "--pooling",
         default="perpatch",
-        choices=["perpatch", "global", "head", "findquery"],
-        help="JEPA score rule. Use findquery for the finding-query run.",
+        choices=["perpatch", "deltacos", "global", "head", "findquery"],
+        help="JEPA score rule. ``deltacos`` = change-vector cosine.",
     )
     parser.add_argument(
         "--combine",

@@ -5,11 +5,10 @@
 #   - Dataset:  JEPACombinedDataset (silver corpus, paired only)
 #   - Model:    TempCXRJEPA (online + EMA + predictor) — unit-sphere
 #   - Losses:   JEPA per-patch cosine
-#               (1 - cos(ẑ, z_pair) mean over patches), z_pair =
-#               EMA ``encoder(current, prior)``
+#               (1 - cos(ẑ, z_cur) mean over patches)
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE vs the same z_pair,
+#               + Progression 5-way image-image CE (mean-patch cosine),
 #                 class-balanced (Cui et al. 2019, β=0.99999)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -19,23 +18,17 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: GLoRIA on, text frozen (official CLS), EMA 0.996 → 1.0,
-# joint current target, paper weights 1 / 0.1 / 0.1 / 0.1, finding-query
-# attention pool on both ẑ^c and z_pair. Anatomy off. Dir tag
-# ``_txtfrzcls_jointtgt_findq`` so this does not resume
-# ``_wprog100_txtfrzcls_jointtgt`` or paper ``_txtfrzcls``.
+# Current run: paper recipe. Trainable text, single-image current
+# target flag off, mean-patch progression CE, weights 1 / 0.1 / 0.1 / 0.1,
+# EMA 0.996 → 1.0. Writes to ``checkpoints_jepa_dynamic_cbw99999/``.
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
 #   ``(prog_finding, prog_cls_idx)`` per epoch. The model produces
 #   ``ẑ_cur^c`` for each of the 5 class prompts
-#   ``"{prog_finding} is {class}."``. Frozen BioViL-T CLS of the
-#   finding name is Q. Attention from z_pair only:
-#   a[n] = softmax(z_pair[n] · Q); same a pools ẑ^c and z_pair.
-#   ``F.cross_entropy(cos(pool_a(ẑ^c), pool_a(z_pair)) / τ, silver_label,
+#   ``"{prog_finding} is {class}."``.
+#   ``F.cross_entropy(mean_p cos(ẑ^c, z_cur) / τ, silver_label,
 #                     weight=class_weights)``.
-#   ``z_pair`` = EMA pair encoder ``(current, prior)``. Predictor input
-#   prior is still single-image.
 
 import os
 import glob
@@ -288,19 +281,18 @@ SAVE_EVERY_N_EPOCHS = 1
 W_JEPA = 1.0
 W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
-# Full text encoder (BERT + projection) is a frozen conditioner.
-FREEZE_TEXT_ENCODER = True
-# 4th loss: finding-query attention-pool cosine 5-way vs joint z_pair.
-# Paper mix: quiet CE so five ẑ^c are not all trained to copy z_pair.
+# Paper: text trains (report GLoRIA + class-sentence prompts).
+FREEZE_TEXT_ENCODER = False
+# 4th loss: mean-patch cosine 5-way vs EMA current (paper).
 W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-# Gold / in-training scores: attn from z_pair · Q, same weights on ẑ^c.
-PROG_POOLING = "findquery"
+PROG_POOLING = "perpatch"
 FINDING_QUERY_ATTN = FINDING_QUERY_ATTN_TEMP
 N_CLS = len(CLS_ORDER)
-# Both JEPA and prog CE match ẑ to pair-mode current (given prior).
-JOINT_CURRENT_TARGET = True
+# Paper train target was single-image current. Flag is dir-tag only;
+# eval of the paper ckpt still uses pair-mode z_cur (the 0.452 script).
+JOINT_CURRENT_TARGET = False
 
 # Anatomy dual-mask JEPA off for this run (per-patch full-grid only).
 W_ANAT_JEPA = 0.0
@@ -532,10 +524,8 @@ if local_rank == 0:
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
         f"joint_current_target={JOINT_CURRENT_TARGET} "
-        f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_pair[p])); "
-        f"prog = cos(pool_a(ẑ^c), pool_a(z_pair)) 5-way CE, "
-        f"a=softmax(z_pair·Q), Q=frozen BioViL-T CLS of finding; "
-        f"z_pair = EMA encoder(current, prior))"
+        f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
+        f"prog = mean_p cos(ẑ^c, z_cur) 5-way CE)"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -1097,7 +1087,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 progression_prompts_flat=build_progression_prompts(
                     batch["prog_finding"]
                 ),
-                finding_texts=batch["prog_finding"],
+                finding_texts=(
+                    batch["prog_finding"]
+                    if PROG_POOLING == "findquery" else None
+                ),
             )
 
             loss, jepa_l, prior_l, pred_l, prog_l, anat_l = (
@@ -1191,7 +1184,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     progression_prompts_flat=build_progression_prompts(
                         batch["prog_finding"]
                     ),
-                    finding_texts=batch["prog_finding"],
+                    finding_texts=(
+                        batch["prog_finding"]
+                        if PROG_POOLING == "findquery" else None
+                    ),
                 )
 
                 total, jepa_l, prior_l, pred_l, prog_l, anat_l = (
