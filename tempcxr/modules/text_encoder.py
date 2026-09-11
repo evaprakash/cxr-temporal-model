@@ -122,13 +122,13 @@ class BioViLTTextEncoder(nn.Module):
         self._pretrained_model_name = model_name
 
         # ------------------------------------------------------------
-        # Local 768→128 map (paper). Same module class as official
-        # ``cls_projection_head``, but a fresh init — trained with the
-        # rest of the text encoder. Globals / finding-query Q still use
-        # the official CLS head. Copy official weights only if the
-        # text encoder is later frozen (see ``init_local_proj_from_official_cls``).
+        # Local 768→128 map. BioViL-T only ships ``cls_projection_head``.
+        # Copy those official weights as the init, then leave the head
+        # trainable with the rest of the text encoder (paper does not
+        # freeze). Globals / finding-query Q use the official CLS head.
         # ------------------------------------------------------------
         self.text_projection = BertProjectionHead(self.model.config)
+        self.init_local_proj_from_official_cls(model_name)
 
         # ------------------------------------------------------------
         # Unprojection back to BERT hidden space (for MLM)
