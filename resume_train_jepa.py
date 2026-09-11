@@ -19,8 +19,9 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: paper recipe + finding-query prog CE only.
-# Trainable text, single-image current (no prior context), weights
-# 1 / 0.1 / 0.1 / 0.1, EMA 0.996 → 1.0. Writes to
+# Trainable text, single-image current (no prior context), paper-random
+# local 768→128 (not official-CLS copy), weights 1 / 0.1 / 0.1 / 0.1,
+# EMA 0.996 → 1.0. Writes to
 # ``checkpoints_jepa_dynamic_cbw99999_findq/`` (does not touch paper
 # ``cbw99999/`` or the old freeze+joint findq dir).
 #
@@ -590,15 +591,19 @@ val_loader = DataLoader(
 # MODEL
 # ============================================================
 model = TempCXRJEPA(freeze_text_encoder=FREEZE_TEXT_ENCODER).to(DEVICE)
-model.text_encoder.assert_local_proj_matches_official_cls()
 _w = model.text_encoder.text_projection.dense_to_hidden.weight
 _w_cls = model.text_encoder.model.cls_projection_head.dense_to_hidden.weight
 if local_rank == 0:
     print(
-        f"[train] text_projection == official cls_projection_head "
+        f"[train] local text_projection init=paper-random "
         f"(dense_to_hidden {tuple(_w.shape)} ||W||={_w.norm().item():.4f} "
-        f"match={bool(torch.equal(_w, _w_cls))})"
+        f"matches_official_cls={bool(torch.equal(_w, _w_cls))})"
     )
+    if (not FREEZE_TEXT_ENCODER) and torch.equal(_w, _w_cls):
+        raise RuntimeError(
+            "local text_projection matches official CLS but this run "
+            "should start from a fresh head (paper)"
+        )
 if FREEZE_TEXT_ENCODER:
     n_txt = sum(p.numel() for p in model.text_encoder.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)

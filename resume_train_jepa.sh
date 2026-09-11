@@ -13,7 +13,8 @@
 
 # ============================================================
 # Paper JEPA + finding-query prog CE only.
-# Trainable text, single-image current (no prior context), no freeze.
+# Trainable text, single-image current (no prior context), no freeze,
+# paper-random local 768→128 (not official-CLS copy).
 # Writes to checkpoints_jepa_dynamic_cbw99999_findq/
 # (does not touch paper cbw99999/ or txtfrzcls_jointtgt_findq/).
 #
@@ -64,6 +65,7 @@ import sys
 
 src = pathlib.Path("resume_train_jepa.py").read_text()
 jepa = pathlib.Path("tempcxr/modules/jepa.py").read_text()
+text = pathlib.Path("tempcxr/modules/text_encoder.py").read_text()
 
 def assign(name):
     m = re.search(rf"^{name} = (.+)$", src, re.M)
@@ -98,12 +100,21 @@ if re.search(
     bad.append("  trainer gold still encodes current with prior")
 if "target_image_encoder(\n                current_imgs,\n            )" not in jepa:
     bad.append("  jepa.py missing single-image target_image_encoder(current_imgs)")
+# Paper local proj is a fresh BertProjectionHead, not official-CLS copy.
+if re.search(
+    r"self\.text_projection = BertProjectionHead\([^\n]+\)\s*\n\s*self\.\w*init_local_proj_from_official_cls",
+    text,
+):
+    bad.append("  text_encoder still copies official CLS into local proj at init")
+if "assert_local_proj_matches_official_cls()" in src:
+    bad.append("  trainer still requires local proj == official CLS")
 if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
     sys.exit(1)
 print("[abort-check] OK  paper + findq  1/0.1/0.1/0.1")
 print("[abort-check] OK  text trainable, single-image current")
+print("[abort-check] OK  local text proj = paper random init")
 print("[abort-check] OK  dir tag should be ..._cbw99999_findq")
 PY
 

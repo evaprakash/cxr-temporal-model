@@ -289,7 +289,13 @@ class TempCXRJEPA(nn.Module):
             self.freeze_text_encoder()
 
     def freeze_text_encoder(self) -> None:
-        """Freeze CXR-BERT + official CLS-copied local proj; stay in eval."""
+        """Freeze CXR-BERT + official-CLS local proj; stay in eval.
+
+        Paper training does not freeze. If this path is used, copy
+        official CLS into the local head first so a random proj is
+        not locked.
+        """
+        self.text_encoder.init_local_proj_from_official_cls()
         self.text_encoder.assert_local_proj_matches_official_cls()
         for p in self.text_encoder.parameters():
             p.requires_grad_(False)

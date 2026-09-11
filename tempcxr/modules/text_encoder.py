@@ -119,16 +119,16 @@ class BioViLTTextEncoder(nn.Module):
 
         self.hidden_dim = self.model.config.hidden_size      # 768
         self.proj_dim = self.model.config.projection_size    # 128
+        self._pretrained_model_name = model_name
 
         # ------------------------------------------------------------
-        # Local 768→128 map. BioViL-T only ships ``cls_projection_head``
-        # (used for the CLS global). There is no separate local head, so
-        # we instantiate the same module class and copy those official
-        # weights. GLoRIA + the JEPA predictor consume this, not a
-        # random Linear.
+        # Local 768→128 map (paper). Same module class as official
+        # ``cls_projection_head``, but a fresh init — trained with the
+        # rest of the text encoder. Globals / finding-query Q still use
+        # the official CLS head. Copy official weights only if the
+        # text encoder is later frozen (see ``init_local_proj_from_official_cls``).
         # ------------------------------------------------------------
         self.text_projection = BertProjectionHead(self.model.config)
-        self._init_local_proj_from_official_cls(model_name)
 
         # ------------------------------------------------------------
         # Unprojection back to BERT hidden space (for MLM)
@@ -172,7 +172,7 @@ class BioViLTTextEncoder(nn.Module):
             )
         return tensors
 
-    def _init_local_proj_from_official_cls(self, model_name: str) -> None:
+    def init_local_proj_from_official_cls(self, model_name: str | None = None) -> None:
         """Copy official ``cls_projection_head`` into ``text_projection``.
 
         Verifies the live CXR-BERT head matches the file on disk, then
@@ -184,6 +184,8 @@ class BioViLTTextEncoder(nn.Module):
                 "CXRBertModel has no cls_projection_head after "
                 "from_pretrained; refusing to leave text_projection random"
             )
+        if model_name is None:
+            model_name = self._pretrained_model_name
         file_tensors = self._load_pretrained_cls_proj_tensors(model_name)
         live = {k: v.detach().cpu() for k, v in src.state_dict().items()}
         if set(live) != set(file_tensors):
