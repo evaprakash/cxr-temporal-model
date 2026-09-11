@@ -8,7 +8,7 @@
 #               (1 - cos(ẑ, z_cur) mean over patches)
 #               + GLoRIA local contrastive (z_prior)
 #               + GLoRIA local contrastive (ẑ_cur)
-#               + Progression 5-way image-image CE (mean-patch cosine),
+#               + Progression 5-way image-image CE (finding-query pool),
 #                 class-balanced (Cui et al. 2019, β=0.99999)
 #   - EMA:      momentum scheduler, target encoder updated after
 #               optimizer.step() each iteration
@@ -18,16 +18,19 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: paper recipe. Trainable text, single-image current
-# target flag off, mean-patch progression CE, weights 1 / 0.1 / 0.1 / 0.1,
-# EMA 0.996 → 1.0. Writes to ``checkpoints_jepa_dynamic_cbw99999/``.
+# Current run: paper recipe + finding-query prog CE only.
+# Trainable text, joint flag off, weights 1 / 0.1 / 0.1 / 0.1,
+# EMA 0.996 → 1.0. Writes to ``checkpoints_jepa_dynamic_cbw99999_findq/``
+# (does not touch paper ``cbw99999/`` or the old freeze+joint findq dir).
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
 #   ``(prog_finding, prog_cls_idx)`` per epoch. The model produces
 #   ``ẑ_cur^c`` for each of the 5 class prompts
-#   ``"{prog_finding} is {class}."``.
-#   ``F.cross_entropy(mean_p cos(ẑ^c, z_cur) / τ, silver_label,
+#   ``"{prog_finding} is {class}."``. Attention from actual current
+#   only: a[n] = softmax(z_cur[n] · Q); same a pools ẑ^c and z_cur.
+#   Q = detached text CLS of the finding name (text still trains).
+#   ``F.cross_entropy(cos(pool_a(ẑ^c), pool_a(z_cur)) / τ, silver_label,
 #                     weight=class_weights)``.
 
 import os
@@ -283,11 +286,11 @@ W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
 # Paper: text trains (report GLoRIA + class-sentence prompts).
 FREEZE_TEXT_ENCODER = False
-# 4th loss: mean-patch cosine 5-way vs EMA current (paper).
+# 4th loss: finding-query pool 5-way (only change vs paper).
 W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-PROG_POOLING = "perpatch"
+PROG_POOLING = "findquery"
 FINDING_QUERY_ATTN = FINDING_QUERY_ATTN_TEMP
 N_CLS = len(CLS_ORDER)
 # Paper train target was single-image current. Flag is dir-tag only;
@@ -342,7 +345,8 @@ SPLIT_SEED = 42
 #   * ``..._rp100_wprog100_txtfrzcls`` — eqw, single-image current target
 #   * ``..._rp100_wprog100_txtfrzcls_jointtgt`` — eqw, pair-mode current target
 #   * ``..._wprog100_txtfrzcls_jointtgt`` — joint, JEPA/prog 1.0, GLoRIA 0.1
-#   * ``..._txtfrzcls_jointtgt_findq`` — paper 1/0.1/0.1/0.1 + finding query
+#   * ``..._txtfrzcls_jointtgt_findq`` — freeze + joint + findq (archive)
+#   * ``..._findq``                   — paper + findq only (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -525,7 +529,8 @@ if local_rank == 0:
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
         f"joint_current_target={JOINT_CURRENT_TARGET} "
         f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
-        f"prog = mean_p cos(ẑ^c, z_cur) 5-way CE)"
+        f"prog = cos(pool_a(ẑ^c), pool_a(z_cur)) 5-way CE, "
+        f"a=softmax(z_cur·Q))"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "

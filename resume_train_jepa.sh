@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_paper
+#SBATCH --job-name=jepa_findq
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,22 +8,26 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_paper_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_paper_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_findq_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_findq_%j.err
 
 # ============================================================
-# Paper JEPA recipe (not findq). Writes to
-# checkpoints_jepa_dynamic_cbw99999/ — do not launch unless you
-# intend to continue that run.
+# Paper JEPA + finding-query prog CE only.
+# Trainable text, no joint, no freeze. Writes to
+# checkpoints_jepa_dynamic_cbw99999_findq/
+# (does not touch paper cbw99999/ or txtfrzcls_jointtgt_findq/).
 #
 #   * W_JEPA = 1.0, W_PROG = 0.1, W_REPORT_* = 0.1
-#   * PROG_POOLING = perpatch (no finding query)
+#   * PROG_POOLING = findquery
+#     attn from z_cur only; same weights pool ẑ^c and z_cur
 #   * FREEZE_TEXT_ENCODER = False
 #   * JOINT_CURRENT_TARGET = False
+#   * Auto-resumes latest epoch_N.pt in the findq dir if preempted
+#   * Rank-0 gold set-match after each epoch (--pooling findquery)
 #
-# For the change-vector gold eval, use eval_jepa_deltacos_gold.sh
-# instead of this trainer.
-#
+#     mkdir -p /scratch/m000081-pm06/eprakash/logs
+#     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
+#     git pull
 #     sbatch resume_train_jepa.sh
 # ============================================================
 
@@ -51,7 +55,7 @@ echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || ech
 echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n/a>')"
 echo "[slurm] partition   = ${SLURM_JOB_PARTITION:-unknown}"
 
-# Abort-check: paper recipe, not findq / freeze / joint.
+# Abort-check: paper + findq only (no freeze, no joint).
 python - <<'PY'
 import pathlib
 import re
@@ -70,7 +74,7 @@ checks = {
     "W_PROG": "0.1",
     "W_REPORT_PRIOR": "0.1",
     "W_REPORT_PRED": "0.1",
-    "PROG_POOLING": '"perpatch"',
+    "PROG_POOLING": '"findquery"',
     "JOINT_CURRENT_TARGET": "False",
     "FREEZE_TEXT_ENCODER": "False",
 }
@@ -83,8 +87,9 @@ if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
     sys.exit(1)
-print("[abort-check] OK  paper recipe  1/0.1/0.1/0.1 perpatch")
-print("[abort-check] OK  text trainable, joint flag off, no findq")
+print("[abort-check] OK  paper + findq  1/0.1/0.1/0.1")
+print("[abort-check] OK  text trainable, joint flag off")
+print("[abort-check] OK  dir tag should be ..._cbw99999_findq")
 PY
 
 HI_ML_SRC="$PROJECT_DIR/tempcxr/modules/hi-ml/hi-ml-multimodal/src"
