@@ -19,9 +19,10 @@
 #               ``"{Finding} is {progression}."`` template.
 #
 # Current run: paper recipe + finding-query prog CE only.
-# Trainable text, joint flag off, weights 1 / 0.1 / 0.1 / 0.1,
-# EMA 0.996 → 1.0. Writes to ``checkpoints_jepa_dynamic_cbw99999_findq/``
-# (does not touch paper ``cbw99999/`` or the old freeze+joint findq dir).
+# Trainable text, single-image current (no prior context), weights
+# 1 / 0.1 / 0.1 / 0.1, EMA 0.996 → 1.0. Writes to
+# ``checkpoints_jepa_dynamic_cbw99999_findq/`` (does not touch paper
+# ``cbw99999/`` or the old freeze+joint findq dir).
 #
 # Progression loss (the "4th loss"):
 #   For each pair the dataset surfaces one randomly-picked
@@ -293,8 +294,8 @@ PROG_TEMPLATE = "{} is {}."
 PROG_POOLING = "findquery"
 FINDING_QUERY_ATTN = FINDING_QUERY_ATTN_TEMP
 N_CLS = len(CLS_ORDER)
-# Paper train target was single-image current. Flag is dir-tag only;
-# eval of the paper ckpt still uses pair-mode z_cur (the 0.452 script).
+# Paper: single-image current. Must stay False; the encoder call in
+# ``jepa.py`` / gold below is ``target_image_encoder(current)``.
 JOINT_CURRENT_TARGET = False
 
 # Anatomy dual-mask JEPA off for this run (per-patch full-grid only).
@@ -528,7 +529,8 @@ if local_rank == 0:
         f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
         f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
         f"joint_current_target={JOINT_CURRENT_TARGET} "
-        f"(JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
+        f"(z_cur = encoder(current) single-image; "
+        f"JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
         f"prog = cos(pool_a(ẑ^c), pool_a(z_cur)) 5-way CE, "
         f"a=softmax(z_cur·Q))"
     )
@@ -768,7 +770,7 @@ def _score_gold_pair_head(raw_model, prior_img, current_img, finding, text_cache
     prior = prior_img.unsqueeze(0).to(DEVICE)
     current = current_img.unsqueeze(0).to(DEVICE)
     _, z_prior = raw_model.image_encoder(prior)
-    _, z_cur = raw_model.target_image_encoder(current, prior)
+    _, z_cur = raw_model.target_image_encoder(current)
     zhat = raw_model.predictor(z_prior, txt_local, token_mask)
     logits = raw_model.progression_logits(
         zhat, z_cur.detach(), txt_global,
@@ -797,7 +799,7 @@ def _score_gold_pair(raw_model, prior_img, current_img, finding, text_cache):
     prior = prior_img.unsqueeze(0).to(DEVICE)
     current = current_img.unsqueeze(0).to(DEVICE)
     _, z_prior = raw_model.image_encoder(prior)
-    _, z_cur = raw_model.target_image_encoder(current, prior)
+    _, z_cur = raw_model.target_image_encoder(current)
     z_cur = z_cur.detach()
     z_prior_b = z_prior.expand(n_prompts, -1, -1).contiguous()
     preds = raw_model.predictor(z_prior_b, txt_local, token_mask)

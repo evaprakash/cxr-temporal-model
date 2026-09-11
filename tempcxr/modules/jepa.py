@@ -32,8 +32,8 @@ string either way.
 The live 4th (progression) loss is 5-template cosine CE. The trainer
 passes ``finding_texts`` (length B) so the same frozen BioViL-T CLS of
 the finding name is available as ``finding_query`` ``Q``. The caller
-computes attention on ``z_pair`` with that ``Q`` and applies the
-same weights to both ``ẑ^c`` and ``z_pair``.
+computes attention on ``z_cur`` with that ``Q`` and applies the
+same weights to both ``ẑ^c`` and ``z_cur``.
 
 Optional ``use_finding_head=True`` still runs a finding-conditioned
 predictor pass and ``Linear([pool(ẑ); pool(z_cur); finding])``.
@@ -45,7 +45,7 @@ Losses (computed by the caller):
     - JEPA cosine                              : 1 − cos(ẑ_cur, z_cur) mean over patches
     - GLoRIA local contrastive                 : z_prior ↔ τ_prior
     - GLoRIA local contrastive                 : ẑ_cur ↔ τ_current
-    - Progression 5-way CE                     : attn from z_pair·Q, then cos of pooled films
+    - Progression 5-way CE                     : attn from z_cur·Q, then cos of pooled films
 """
 
 import copy
@@ -356,9 +356,10 @@ class TempCXRJEPA(nn.Module):
         Returns a dict containing:
           - prior_patches            (B, N, D)  online encoder, unit-norm,
                                                 with grad
-          - current_patches_target   (B, N, D)  EMA target encoder in
-                                                pair mode
-                                                ``encoder(current, prior)``,
+          - current_patches_target   (B, N, D)  EMA target encoder,
+                                                single-image current
+                                                ``encoder(current)``
+                                                (paper; no prior context),
                                                 unit-norm, detached
                                                 (stop-gradient)
           - pred_current_patches     (B, N, D)  predictor output ẑ_cur
@@ -438,15 +439,14 @@ class TempCXRJEPA(nn.Module):
             prog_txt_local = all_txt_local[3 * B:3 * B + n_prog]
             prog_token_mask = all_token_mask[3 * B:3 * B + n_prog]
 
-        # ---- Target encoder on current given prior: stop-gradient ----
-        # Pair mode: current patches after the temporal transformer has
-        # seen the prior (BioViL-T P_curr || P_diff → 128-d). Same
-        # target for dynamic JEPA and progression CE. Prior stays
-        # single-image on the online encoder (no current leak). Detach
-        # to harden the stop-gradient.
+        # ---- Target encoder on current alone: stop-gradient ----
+        # Paper recipe: single-image current (missing-prior token).
+        # Same target for dynamic JEPA and progression CE. Prior stays
+        # single-image on the online encoder. Detach to harden the
+        # stop-gradient.
         with torch.no_grad():
             _, current_patches_target = self.target_image_encoder(
-                current_imgs, prior_imgs,
+                current_imgs,
             )
         current_patches_target = current_patches_target.detach()
 
@@ -488,9 +488,9 @@ class TempCXRJEPA(nn.Module):
             _, N, D = pred_prog_flat.shape
             out["pred_progression_patches"] = pred_prog_flat.view(B, C, N, D)
 
-        # Frozen BioViL-T CLS of the finding name. Q scores tiles on
-        # z_pair only; those weights later pool both ẑ^c and z_pair.
-        # Detach so Q is a constant (text encoder is already frozen).
+        # BioViL-T CLS of the finding name. Q scores tiles on
+        # single-image z_cur only; those weights later pool both ẑ^c
+        # and z_cur. Detach so Q is a constant (text may still train).
         if finding_active:
             find_off = 3 * B + n_prog
             find_txt_global = all_txt_global[find_off:find_off + B]

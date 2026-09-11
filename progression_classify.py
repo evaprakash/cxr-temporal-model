@@ -490,7 +490,7 @@ def score_one_pair(
     # the feature dim, so ``z_prior`` and ``z_cur`` live on the unit
     # sphere — no further normalization needed.
     _, z_prior = model.image_encoder(prior)
-    _, z_cur = model.target_image_encoder(current, prior)
+    _, z_cur = model.target_image_encoder(current)
     z_cur = z_cur.detach()
 
     # Batch the predictor across all phrases by expanding prior to match.

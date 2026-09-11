@@ -10,8 +10,8 @@ scale-invariant — so this module exposes:
     ``1 - cos(ẑ_cur, z_cur)`` averaged over patches.
   * ``progression_classification_loss`` for the 4th loss: a 5-way CE on
     image-image cosine *logits* from N candidate ``ẑ_cur^c``. With a
-    finding query, attention is computed only on ``z_pair``, then those
-    weights pool both ``ẑ^c`` and ``z_pair``. Without, mean-over-patches
+    finding query, attention is computed only on ``z_cur``, then those
+    weights pool both ``ẑ^c`` and ``z_cur``. Without, mean-over-patches
     cosine. Supports Cui CBW.
   * ``anatomy_masked_pool_jepa_loss`` (optional / off on main): for each
     of 22 fixed CXAS anatomies, soft-pool ``ẑ`` with the prior anatomy
@@ -154,11 +154,11 @@ def finding_query_pool_from_actual(
     """Circle tiles on the real current; read the same tiles on both films.
 
     ``Q`` is the frozen BioViL-T CLS of the finding name. Attention is
-    computed only on ``actual`` (joint ``z_pair``)::
+    computed only on ``actual`` (single-image ``z_cur``)::
 
-        a[n] = softmax_n( (z_pair[n] · Q) / attn_temp )
+        a[n] = softmax_n( (z_cur[n] · Q) / attn_temp )
         u    = normalize( Σ_n a[n] ẑ[n] )
-        v    = normalize( Σ_n a[n] z_pair[n] )
+        v    = normalize( Σ_n a[n] z_cur[n] )
 
     ``ẑ`` is never dotted with ``Q``. Same index weights on both grids
     (the JEPA spatial assumption, concentrated on the finding).
@@ -184,14 +184,14 @@ def progression_classification_loss(
     finding_query: Optional[torch.Tensor] = None,
     attn_temp: float = FINDING_QUERY_ATTN_TEMP,
 ) -> torch.Tensor:
-    """5-way image-image CE on candidate latents vs pair-mode current.
+    """5-way image-image CE on candidate latents vs single-image current.
 
-    Default (no query): ``logit[b,c] = mean_p cos(ẑ^c[p], z_pair[p])``.
+    Default (no query): ``logit[b,c] = mean_p cos(ẑ^c[p], z_cur[p])``.
 
-    With ``finding_query`` ``Q`` (frozen BioViL-T CLS of the finding)::
+    With ``finding_query`` ``Q`` (detached BioViL-T CLS of the finding)::
 
-        a[n]     = softmax(z_pair[n] · Q)
-        logit[b,c] = cos( pool_a(ẑ^c), pool_a(z_pair) )
+        a[n]     = softmax(z_cur[n] · Q)
+        logit[b,c] = cos( pool_a(ẑ^c), pool_a(z_cur) )
 
     Attention from the actual current only. CE on ``logits / τ``.
 

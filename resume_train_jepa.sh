@@ -13,8 +13,8 @@
 
 # ============================================================
 # Paper JEPA + finding-query prog CE only.
-# Trainable text, no joint, no freeze. Writes to
-# checkpoints_jepa_dynamic_cbw99999_findq/
+# Trainable text, single-image current (no prior context), no freeze.
+# Writes to checkpoints_jepa_dynamic_cbw99999_findq/
 # (does not touch paper cbw99999/ or txtfrzcls_jointtgt_findq/).
 #
 #   * W_JEPA = 1.0, W_PROG = 0.1, W_REPORT_* = 0.1
@@ -22,6 +22,7 @@
 #     attn from z_cur only; same weights pool ẑ^c and z_cur
 #   * FREEZE_TEXT_ENCODER = False
 #   * JOINT_CURRENT_TARGET = False
+#   * z_cur = target_image_encoder(current)  — paper, not pair-mode
 #   * Auto-resumes latest epoch_N.pt in the findq dir if preempted
 #   * Rank-0 gold set-match after each epoch (--pooling findquery)
 #
@@ -55,13 +56,14 @@ echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || ech
 echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n/a>')"
 echo "[slurm] partition   = ${SLURM_JOB_PARTITION:-unknown}"
 
-# Abort-check: paper + findq only (no freeze, no joint).
+# Abort-check: paper + findq only (no freeze, single-image current).
 python - <<'PY'
 import pathlib
 import re
 import sys
 
 src = pathlib.Path("resume_train_jepa.py").read_text()
+jepa = pathlib.Path("tempcxr/modules/jepa.py").read_text()
 
 def assign(name):
     m = re.search(rf"^{name} = (.+)$", src, re.M)
@@ -83,12 +85,25 @@ for k, want in checks.items():
     got = assign(k)
     if got != want:
         bad.append(f"  {k}={got}  (want {want})")
+# Flag was previously cosmetic. Fail if current is still pair-mode.
+if re.search(
+    r"target_image_encoder\(\s*current_imgs\s*,\s*prior_imgs",
+    jepa,
+):
+    bad.append("  jepa.py still encodes current with prior (want single-image)")
+if re.search(
+    r"target_image_encoder\(\s*current\s*,\s*prior\s*\)",
+    src,
+):
+    bad.append("  trainer gold still encodes current with prior")
+if "target_image_encoder(\n                current_imgs,\n            )" not in jepa:
+    bad.append("  jepa.py missing single-image target_image_encoder(current_imgs)")
 if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
     sys.exit(1)
 print("[abort-check] OK  paper + findq  1/0.1/0.1/0.1")
-print("[abort-check] OK  text trainable, joint flag off")
+print("[abort-check] OK  text trainable, single-image current")
 print("[abort-check] OK  dir tag should be ..._cbw99999_findq")
 PY
 
