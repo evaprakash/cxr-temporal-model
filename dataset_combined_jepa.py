@@ -43,8 +43,11 @@ from silver_masks import (
     N_PATCHES,
     REQUIRED_CXAS_ANATOMIES,
     default_anatomy_masks_root,
+    default_masks_root,
     load_dual_anatomy_patch_weights,
+    load_prog_patch_weights,
     pair_has_full_anatomy_inventory,
+    zero_patch_weights,
 )
 
 CLS_TO_IDX = {cls: i for i, cls in enumerate(CLS_ORDER)}
@@ -294,6 +297,12 @@ class JEPACombinedDataset(Dataset):
           ``mask_pool_active`` : bool
               True iff both prior and current have the full 22-mask
               inventory — gate for ``anatomy_masked_pool_jepa_loss``.
+          ``finding_patch_weights_prior`` : Tensor ``(N,)``
+              Soft 14×14 coverage of the sampled ``prog_finding`` on the
+              **prior** image (zeros if missing). Used by
+              ``change_localization_loss``.
+          ``finding_mask_active`` : bool
+              True iff that prior finding mask has non-trivial mass.
 
         Training time uses these fields to build a per-pair 5-prompt
         bank (one ``"{prog_finding} is {class}."`` per class) and runs
@@ -316,6 +325,8 @@ class JEPACombinedDataset(Dataset):
         masks_root: Optional[str] = None,
         require_full_anatomy_masks: bool = False,
         load_anatomy_masks: Optional[bool] = None,
+        finding_masks_root: Optional[str] = None,
+        load_finding_masks: bool = False,
     ):
         if condition_mode not in CONDITION_MODES:
             raise ValueError(
@@ -337,6 +348,8 @@ class JEPACombinedDataset(Dataset):
             else bool(load_anatomy_masks)
         )
         self.masks_root = masks_root or default_anatomy_masks_root()
+        self.load_finding_masks = bool(load_finding_masks)
+        self.finding_masks_root = finding_masks_root or default_masks_root()
         if self.load_anatomy_masks:
             if not os.path.isdir(self.masks_root):
                 print(
@@ -350,6 +363,19 @@ class JEPACombinedDataset(Dataset):
                 "[JEPA dataset] anatomy masks disabled "
                 "(load_anatomy_masks=False)"
             )
+        if self.load_finding_masks:
+            if not os.path.isdir(self.finding_masks_root):
+                print(
+                    f"[JEPA dataset] WARNING: finding masks_root not found "
+                    f"({self.finding_masks_root}); change-loc will never fire."
+                )
+            else:
+                print(
+                    f"[JEPA dataset] finding masks_root="
+                    f"{self.finding_masks_root}"
+                )
+        else:
+            print("[JEPA dataset] finding masks disabled")
 
         # ------------------------------------------------------------
         # Load + filter
@@ -654,6 +680,20 @@ class JEPACombinedDataset(Dataset):
             )
             mask_pool_active = False
 
+        if self.load_finding_masks and prog_finding:
+            finding_patch_weights_prior, finding_mask_active = (
+                load_prog_patch_weights(
+                    self.finding_masks_root,
+                    dataset,
+                    str(row["parent_image_prev"]),
+                    prog_finding,
+                    aug_params=params,
+                )
+            )
+        else:
+            finding_patch_weights_prior = zero_patch_weights()
+            finding_mask_active = False
+
         return {
             "prior_image": prior_img,
             "current_image": curr_img,
@@ -668,6 +708,8 @@ class JEPACombinedDataset(Dataset):
             "mask_patch_weights_prior": mask_patch_weights_prior,
             "mask_patch_weights_curr": mask_patch_weights_curr,
             "mask_pool_active": bool(mask_pool_active),
+            "finding_patch_weights_prior": finding_patch_weights_prior,
+            "finding_mask_active": bool(finding_mask_active),
         }
 
 
@@ -692,7 +734,8 @@ def jepa_collate_fn(batch):
 
     ``mask_patch_weights_prior`` / ``mask_patch_weights_curr`` are
     ``(B, A, N)``; ``mask_pool_active`` is ``(B,)`` bool gating the
-    anatomy dual-mask JEPA add-on.
+    anatomy dual-mask JEPA add-on. ``finding_patch_weights_prior`` is
+    ``(B, N)`` for ``change_localization_loss``.
     """
     return {
         "prior_image": torch.stack([b["prior_image"] for b in batch]),
@@ -715,6 +758,12 @@ def jepa_collate_fn(batch):
         ),
         "mask_pool_active": torch.tensor(
             [b["mask_pool_active"] for b in batch], dtype=torch.bool
+        ),
+        "finding_patch_weights_prior": torch.stack(
+            [b["finding_patch_weights_prior"] for b in batch]
+        ),
+        "finding_mask_active": torch.tensor(
+            [b["finding_mask_active"] for b in batch], dtype=torch.bool
         ),
     }
 

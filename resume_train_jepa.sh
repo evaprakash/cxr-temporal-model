@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_wfindq
+#SBATCH --job-name=jepa_loc
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,26 +8,25 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_wfindq_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_wfindq_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_loc_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_loc_%j.err
 
 # ============================================================
-# Paper JEPA + finding-weighted mean of tile cosines (small ablation).
-# Trainable text, single-image current, official-CLS local-proj init
-# then trained. Does NOT collapse ẑ / z_cur to one vector.
-# Writes to checkpoints_jepa_dynamic_cbw99999_findqwmean/
-# (does not touch paper cbw99999/ or collapsed-pool _findq/).
+# Paper JEPA + change-localization add-on (from scratch).
+# 5-way stays per-patch mean cosine. Does NOT use finding-query.
+# Writes to checkpoints_jepa_dynamic_cbw99999_loc10/
+# (does not touch paper cbw99999/, _findq/, or _findqwmean/).
 #
-#   * W_JEPA = 1.0, W_PROG = 0.1, W_REPORT_* = 0.1
-#   * PROG_POOLING = findquery_wmean
-#     a = softmax(z_cur · Q); logit[c] = Σ_n a[n] cos(ẑ^c[n], z_cur[n])
+#   * W_JEPA = 1.0, W_PROG = 0.1, W_REPORT_* = 0.1, W_LOC = 0.1
+#   * PROG_POOLING = perpatch
+#   * s = 1-cos(ẑ_dynamic, z_prior); raise s in prior finding mask
+#   * Skip silver-stable and rows with no prior finding mask
 #   * FREEZE_TEXT_ENCODER = False
 #   * JOINT_CURRENT_TARGET = False
-#   * z_cur = target_image_encoder(current)
-#   * From scratch (do not --resume paper or _findq)
-#   * Rank-0 gold after each epoch (same weighted-mean rule)
+#   * From scratch (do not --resume paper or findq)
+#   * Rank-0 gold after each epoch (paper perpatch)
 #
-# Frozen paper epoch_5 readout (no train): sbatch eval_jepa_wfindq_paper.sh
+# Decision-tile eval (frozen paper, 1 hr): sbatch eval_jepa_decision_tiles.sh
 #
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
@@ -59,7 +58,7 @@ echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || ech
 echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n/a>')"
 echo "[slurm] partition   = ${SLURM_JOB_PARTITION:-unknown}"
 
-# Abort-check: paper + weighted-mean findq (not collapsed pool).
+# Abort-check: paper perpatch + change-loc (not findq).
 python - <<'PY'
 import pathlib
 import re
@@ -80,9 +79,11 @@ checks = {
     "W_PROG": "0.1",
     "W_REPORT_PRIOR": "0.1",
     "W_REPORT_PRED": "0.1",
-    "PROG_POOLING": '"findquery_wmean"',
+    "W_LOC": "0.1",
+    "PROG_POOLING": '"perpatch"',
     "JOINT_CURRENT_TARGET": "False",
     "FREEZE_TEXT_ENCODER": "False",
+    "USE_CHANGE_LOC": "True",
 }
 bad = []
 for k, want in checks.items():
@@ -108,16 +109,18 @@ if not re.search(
     bad.append("  text_encoder does not copy official CLS into local proj at init")
 if "assert_local_proj_matches_official_cls()" not in src:
     bad.append("  trainer does not verify official-CLS local-proj init")
-if "finding_query_weighted_cos_from_actual" not in src:
-    bad.append("  trainer gold missing weighted-mean findquery")
+if "change_localization_loss" not in src:
+    bad.append("  trainer missing change_localization_loss")
+if 'PROG_POOLING = "findquery_wmean"' in src or 'PROG_POOLING = "findquery"' in src:
+    bad.append("  trainer still on finding-query pooling")
 if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
     sys.exit(1)
-print("[abort-check] OK  paper + findquery_wmean  1/0.1/0.1/0.1")
+print("[abort-check] OK  paper perpatch + loc  1/0.1/0.1/0.1 + W_LOC=0.1")
 print("[abort-check] OK  text trainable, single-image current")
 print("[abort-check] OK  local text proj = official CLS init, unfrozen")
-print("[abort-check] OK  dir tag should be ..._cbw99999_findqwmean")
+print("[abort-check] OK  dir tag should be ..._cbw99999_loc10")
 PY
 
 HI_ML_SRC="$PROJECT_DIR/tempcxr/modules/hi-ml/hi-ml-multimodal/src"

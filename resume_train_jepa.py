@@ -19,23 +19,23 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: paper recipe + finding-weighted mean of tile cosines.
-# Trainable text, single-image current (no prior context), local
-# 768→128 inited from official CLS then trained, weights
-# 1 / 0.1 / 0.1 / 0.1, EMA 0.996 → 1.0. Writes to
-# ``checkpoints_jepa_dynamic_cbw99999_findqwmean/`` (does not touch
-# paper ``cbw99999/`` or the collapsed-pool ``_findq`` dir).
+# Current run: paper recipe + change-localization add-on.
+# Trainable text, single-image current, local 768→128 inited from
+# official CLS then trained, weights 1 / 0.1 / 0.1 / 0.1, plus
+# W_LOC = 0.1 on predictor-delta inside the prior finding mask.
+# 5-way stays paper per-patch mean cosine (no finding-query).
+# Writes to ``checkpoints_jepa_dynamic_cbw99999_loc10/`` (does not
+# touch paper ``cbw99999/``, ``_findq/``, or ``_findqwmean/``).
 #
 # Progression loss (the "4th loss"):
-#   For each pair the dataset surfaces one randomly-picked
-#   ``(prog_finding, prog_cls_idx)`` per epoch. The model produces
-#   ``ẑ_cur^c`` for each of the 5 class prompts
-#   ``"{prog_finding} is {class}."``. Attention from actual current
-#   only: a[n] = softmax(z_cur[n] · Q). Paper geometry: match then
-#   average, with a weighting the mean. Q = detached text CLS of the
-#   finding name (text still trains).
-#   ``F.cross_entropy(Σ_n a[n] cos(ẑ^c[n], z_cur[n]) / τ, silver_label,
-#                     weight=class_weights)``.
+#   Per pair, one sampled ``(prog_finding, prog_cls_idx)``. Five
+#   ``ẑ_cur^c`` from ``"{prog_finding} is {class}."``. Paper rule:
+#   ``CE(mean_n cos(ẑ^c[n], z_cur[n]) / τ, silver, CBW)``.
+#
+# Localization add-on (not anatomy JEPA):
+#   On the *dynamic* ẑ (report-conditioned next-film forecast):
+#   ``s = 1 - cos(ẑ, z_prior)``; raise s inside the prior finding
+#   mask, lower it outside. Skips ``stable`` and rows with no mask.
 
 import os
 import glob
@@ -88,6 +88,7 @@ from losses import local_contrastive_loss
 from losses_jepa import (
     FINDING_QUERY_ATTN_TEMP,
     anatomy_masked_pool_jepa_loss,
+    change_localization_loss,
     finding_query_pool_from_actual,
     finding_query_weighted_cos_from_actual,
     global_pool_normalize,
@@ -95,7 +96,11 @@ from losses_jepa import (
     patch_token_feature_stats,
     progression_classification_loss,
 )
-from silver_masks import N_ANATOMY_MASKS, default_anatomy_masks_root
+from silver_masks import (
+    N_ANATOMY_MASKS,
+    default_anatomy_masks_root,
+    default_masks_root,
+)
 
 
 # ============================================================
@@ -291,17 +296,24 @@ W_REPORT_PRIOR = 0.1
 W_REPORT_PRED = 0.1
 # Paper: text trains (report GLoRIA + class-sentence prompts).
 FREEZE_TEXT_ENCODER = False
-# 4th loss: paper mean-of-tile-cosines, finding-weighted (not pooled).
+# 4th loss: paper mean-of-tile-cosines (no finding-query).
 W_PROG = 0.1
 PROG_TEMP = 0.1
 PROG_TEMPLATE = "{} is {}."
-PROG_POOLING = "findquery_wmean"
+PROG_POOLING = "perpatch"
 _FINDQ_POOLINGS = ("findquery", "findquery_wmean")
 FINDING_QUERY_ATTN = FINDING_QUERY_ATTN_TEMP
 N_CLS = len(CLS_ORDER)
 # Paper: single-image current. Must stay False; the encoder call in
 # ``jepa.py`` / gold below is ``target_image_encoder(current)``.
 JOINT_CURRENT_TARGET = False
+
+# Predictor-delta localization on the prior finding mask (dynamic ẑ).
+# Skip stable: there is no change to concentrate. New/resolved fire
+# only when a prior finding mask exists.
+W_LOC = 0.1
+USE_CHANGE_LOC = True
+LOC_SKIP_CLASSES = ("stable",)
 
 # Anatomy dual-mask JEPA off for this run (per-patch full-grid only).
 W_ANAT_JEPA = 0.0
@@ -353,7 +365,8 @@ SPLIT_SEED = 42
 #   * ``..._wprog100_txtfrzcls_jointtgt`` — joint, JEPA/prog 1.0, GLoRIA 0.1
 #   * ``..._txtfrzcls_jointtgt_findq`` — freeze + joint + findq (archive)
 #   * ``..._findq``                   — collapsed-pool findq (archive)
-#   * ``..._findqwmean``              — paper + weighted-mean findq (this run)
+#   * ``..._findqwmean``              — paper + weighted-mean findq (archive)
+#   * ``..._loc{ww}``                 — paper + change-loc add-on (this run)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -418,6 +431,8 @@ if PROG_POOLING == "findquery":
     _SETTING_TAG = f"{_SETTING_TAG}_findq"
 elif PROG_POOLING == "findquery_wmean":
     _SETTING_TAG = f"{_SETTING_TAG}_findqwmean"
+if USE_CHANGE_LOC and W_LOC > 0:
+    _SETTING_TAG = f"{_SETTING_TAG}_loc{_report_weight_tag(W_LOC)}"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -491,6 +506,18 @@ if USE_ANATOMY_JEPA and W_ANAT_JEPA > 0:
         )
 
 _LOAD_ANATOMY_MASKS = bool(USE_ANATOMY_JEPA and W_ANAT_JEPA > 0)
+_LOAD_FINDING_MASKS = bool(USE_CHANGE_LOC and W_LOC > 0)
+
+if _LOAD_FINDING_MASKS:
+    try:
+        import pycocotools.mask  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "Change-loc requires pycocotools (pip install pycocotools)."
+        ) from exc
+    _find_root = default_masks_root()
+    if not os.path.isdir(_find_root):
+        raise RuntimeError(f"filtered_masks not found at {_find_root}")
 
 train_dataset = JEPACombinedDataset(
     image_roots=IMAGE_ROOTS,
@@ -501,6 +528,7 @@ train_dataset = JEPACombinedDataset(
     condition_mode=CONDITION_MODE,
     require_full_anatomy_masks=REQUIRE_FULL_ANATOMY_MASKS,
     load_anatomy_masks=_LOAD_ANATOMY_MASKS,
+    load_finding_masks=_LOAD_FINDING_MASKS,
 )
 
 val_dataset = JEPACombinedDataset(
@@ -512,6 +540,7 @@ val_dataset = JEPACombinedDataset(
     condition_mode=CONDITION_MODE,
     require_full_anatomy_masks=REQUIRE_FULL_ANATOMY_MASKS,
     load_anatomy_masks=_LOAD_ANATOMY_MASKS,
+    load_finding_masks=_LOAD_FINDING_MASKS,
 )
 
 # Compute Cui et al. class-balanced weights from the ACTUAL training
@@ -529,18 +558,18 @@ if local_rank == 0:
     print(f"[train] log dir:        {LOG_DIR}")
     print(
         f"[train] per-patch JEPA + {PROG_POOLING} prog CE: "
-        f"W_JEPA={W_JEPA} W_PROG={W_PROG} "
+        f"W_JEPA={W_JEPA} W_PROG={W_PROG} W_LOC={W_LOC} "
         f"W_REPORT_PRIOR={W_REPORT_PRIOR} W_REPORT_PRED={W_REPORT_PRED} "
         f"freeze_text_encoder={FREEZE_TEXT_ENCODER} "
         f"ema={EMA_START}→{EMA_END} "
         f"anatomy_jepa={USE_ANATOMY_JEPA} W_ANAT_JEPA={W_ANAT_JEPA} "
-        f"require_full_anatomy_masks={REQUIRE_FULL_ANATOMY_MASKS} "
-        f"load_anatomy_masks={_LOAD_ANATOMY_MASKS} "
+        f"change_loc={USE_CHANGE_LOC} "
+        f"load_finding_masks={_LOAD_FINDING_MASKS} "
         f"joint_current_target={JOINT_CURRENT_TARGET} "
         f"(z_cur = encoder(current) single-image; "
         f"JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
-        f"prog = Σ_n a[n] cos(ẑ^c[n], z_cur[n]) 5-way CE, "
-        f"a=softmax(z_cur·Q))"
+        f"prog = mean_n cos(ẑ^c[n], z_cur[n]) 5-way CE; "
+        f"loc = -(s_in-s_out) on 1-cos(ẑ_dyn, z_prior), skip stable)"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -703,7 +732,7 @@ if local_rank == 0 and not os.path.exists(CSV_LOG):
     with open(CSV_LOG, "w") as f:
         f.write(
             "epoch,val_total,val_jepa,val_report_prior,val_report_pred,"
-            "val_prog,val_anatjepa,"
+            "val_prog,val_anatjepa,val_loc,"
             "val_zhat_std,val_zcur_std,val_zprior_std,"
             "val_zhat_offdiag_cos,"
             "gold_combined,gold_single,gold_multi\n"
@@ -926,6 +955,11 @@ def eval_gold_setmatch(raw_model, groups, image_roots, epoch):
 # ============================================================
 # LOSS COMPUTATION (shared by train + val)
 # ============================================================
+_LOC_SKIP_IDX = torch.tensor(
+    [CLS_ORDER.index(c) for c in LOC_SKIP_CLASSES], dtype=torch.long
+)
+
+
 def compute_jepa_losses(
     out,
     prog_cls_idx,
@@ -933,6 +967,8 @@ def compute_jepa_losses(
     mask_patch_weights_prior=None,
     mask_patch_weights_curr=None,
     mask_pool_active=None,
+    finding_patch_weights_prior=None,
+    finding_mask_active=None,
 ):
     """
     out                      : dict returned by TempCXRJEPA.forward
@@ -943,8 +979,10 @@ def compute_jepa_losses(
     mask_patch_weights_prior : optional (B, A, N) prior anatomy soft weights
     mask_patch_weights_curr  : optional (B, A, N) current anatomy soft weights
     mask_pool_active         : optional (B,) bool — full 22-mask inventory
+    finding_patch_weights_prior : optional (B, N) prior finding soft weights
+    finding_mask_active      : optional (B,) bool — finding mask has mass
 
-    Returns: (total, jepa, prior, pred, prog, anatjepa) as scalar tensors.
+    Returns: (total, jepa, prior, pred, prog, anatjepa, loc) scalars.
     """
 
     # JEPA loss is per-patch cosine; cross-rank gathering doesn't add
@@ -987,8 +1025,8 @@ def compute_jepa_losses(
         current_token_mask,
     )
 
-    # 5-way CE on find-query cosine (or archived head / mean-patch).
-    # ``weight=`` uses Cui CBW. JEPA stays per-patch (not query-pooled).
+    # 5-way CE on paper mean-of-tile cosine (or archived findq / head).
+    # ``weight=`` uses Cui CBW. JEPA stays per-patch.
     if "prog_logits" in out:
         prog = F.cross_entropy(
             out["prog_logits"].float(),
@@ -1050,14 +1088,35 @@ def compute_jepa_losses(
     else:
         anatjepa = out["pred_current_patches"].new_zeros(())
 
+    if (
+        USE_CHANGE_LOC
+        and W_LOC > 0
+        and finding_patch_weights_prior is not None
+        and finding_mask_active is not None
+    ):
+        loc_active = finding_mask_active.bool()
+        skip = torch.isin(
+            prog_cls_idx, _LOC_SKIP_IDX.to(device=prog_cls_idx.device),
+        )
+        loc_active = loc_active & ~skip
+        loc = change_localization_loss(
+            out["pred_current_patches"].float(),
+            out["prior_patches"].float(),
+            finding_patch_weights_prior.float(),
+            loc_active,
+        )
+    else:
+        loc = out["pred_current_patches"].new_zeros(())
+
     total = (
         W_JEPA * jepa
         + W_REPORT_PRIOR * prior
         + W_REPORT_PRED * pred
         + W_PROG * prog
         + W_ANAT_JEPA * anatjepa
+        + W_LOC * loc
     )
-    return total, jepa, prior, pred, prog, anatjepa
+    return total, jepa, prior, pred, prog, anatjepa, loc
 
 
 # ============================================================
@@ -1090,6 +1149,24 @@ for epoch in range(start_epoch, EPOCHS + 1):
         mask_w_prior = batch["mask_patch_weights_prior"].to(DEVICE)
         mask_w_curr = batch["mask_patch_weights_curr"].to(DEVICE)
         mask_active = batch["mask_pool_active"].to(DEVICE)
+        find_w_prior = batch["finding_patch_weights_prior"].to(DEVICE)
+        find_active = batch["finding_mask_active"].to(DEVICE)
+
+        if (
+            epoch == start_epoch
+            and batch_idx == 0
+            and local_rank == 0
+            and USE_CHANGE_LOC
+        ):
+            skip = torch.isin(prog_cls_idx, _LOC_SKIP_IDX.to(DEVICE))
+            loc_on = find_active.bool() & ~skip
+            print(
+                f"[train] first-batch loc_active_frac="
+                f"{loc_on.float().mean().item():.3f} "
+                f"(mask={int(find_active.sum().item())}/"
+                f"{find_active.numel()} skip_stable="
+                f"{int(skip.sum().item())})"
+            )
 
         if (
             epoch == start_epoch
@@ -1127,7 +1204,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 ),
             )
 
-            loss, jepa_l, prior_l, pred_l, prog_l, anat_l = (
+            loss, jepa_l, prior_l, pred_l, prog_l, anat_l, loc_l = (
                 compute_jepa_losses(
                     out,
                     prog_cls_idx,
@@ -1135,6 +1212,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     mask_patch_weights_prior=mask_w_prior,
                     mask_patch_weights_curr=mask_w_curr,
                     mask_pool_active=mask_active,
+                    finding_patch_weights_prior=find_w_prior,
+                    finding_mask_active=find_active,
                 )
             )
 
@@ -1167,6 +1246,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "loss": f"{loss.item():.4f}",
                 "jepa": f"{jepa_l.item():.4f}",
                 "prog": f"{prog_l.item():.4f}",
+                "loc": f"{loc_l.item():.4f}",
                 "zhat_std": f"{zhat_std:.3f}",
                 "ema_m": f"{m:.4f}",
                 "avg": f"{running_total / running_batches:.4f}",
@@ -1190,6 +1270,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # ============================================================
     model.eval()
     val_total = val_jepa = val_prior = val_pred = val_prog = val_anatjepa = 0.0
+    val_loc = 0.0
     val_zhat_std = val_zcur_std = val_zprior_std = val_zhat_cos = 0.0
     val_batches = 0
 
@@ -1207,6 +1288,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
             mask_w_prior = batch["mask_patch_weights_prior"].to(DEVICE)
             mask_w_curr = batch["mask_patch_weights_curr"].to(DEVICE)
             mask_active = batch["mask_pool_active"].to(DEVICE)
+            find_w_prior = batch["finding_patch_weights_prior"].to(DEVICE)
+            find_active = batch["finding_mask_active"].to(DEVICE)
 
             with torch.amp.autocast("cuda"):
                 out = model(
@@ -1224,7 +1307,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     ),
                 )
 
-                total, jepa_l, prior_l, pred_l, prog_l, anat_l = (
+                total, jepa_l, prior_l, pred_l, prog_l, anat_l, loc_l = (
                     compute_jepa_losses(
                         out,
                         prog_cls_idx,
@@ -1232,6 +1315,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
                         mask_patch_weights_prior=mask_w_prior,
                         mask_patch_weights_curr=mask_w_curr,
                         mask_pool_active=mask_active,
+                        finding_patch_weights_prior=find_w_prior,
+                        finding_mask_active=find_active,
                     )
                 )
 
@@ -1241,6 +1326,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             val_pred += pred_l.item()
             val_prog += prog_l.item()
             val_anatjepa += anat_l.item()
+            val_loc += loc_l.item()
             zs = patch_token_feature_stats(out["pred_current_patches"])
             zc = patch_token_feature_stats(out["current_patches_target"])
             zp = patch_token_feature_stats(out["prior_patches"])
@@ -1256,6 +1342,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     val_pred /= max(val_batches, 1)
     val_prog /= max(val_batches, 1)
     val_anatjepa /= max(val_batches, 1)
+    val_loc /= max(val_batches, 1)
     val_zhat_std /= max(val_batches, 1)
     val_zcur_std /= max(val_batches, 1)
     val_zprior_std /= max(val_batches, 1)
@@ -1267,6 +1354,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     val_pred = ddp_reduce(val_pred)
     val_prog = ddp_reduce(val_prog)
     val_anatjepa = ddp_reduce(val_anatjepa)
+    val_loc = ddp_reduce(val_loc)
     val_zhat_std = ddp_reduce(val_zhat_std)
     val_zcur_std = ddp_reduce(val_zcur_std)
     val_zprior_std = ddp_reduce(val_zprior_std)
@@ -1282,6 +1370,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             f"PredReport={val_pred:.4f} | "
             f"Prog={val_prog:.4f} | "
             f"AnatJEPA={val_anatjepa:.4f} | "
+            f"Loc={val_loc:.4f} | "
             f"zhat_std={val_zhat_std:.4f} | "
             f"zhat_offdiag_cos={val_zhat_cos:.4f}"
         )
@@ -1321,7 +1410,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         with open(CSV_LOG, "a") as f:
             f.write(
                 f"{epoch},{val_total},{val_jepa},{val_prior},{val_pred},"
-                f"{val_prog},{val_anatjepa},"
+                f"{val_prog},{val_anatjepa},{val_loc},"
                 f"{val_zhat_std},{val_zcur_std},{val_zprior_std},"
                 f"{val_zhat_cos},"
                 f"{gold_combined},{gold_single},{gold_multi}\n"
