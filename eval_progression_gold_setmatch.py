@@ -19,13 +19,17 @@ Backends
 --------
 ``jepa``     — JEPA image–image cosine (default **per-patch**; use
                ``--pooling deltacos`` for change-vector cosine
-               ``cos(ẑ−z_prior, z_cur−z_prior)``, ``--pooling findquery``,
+               ``cos(ẑ−z_prior, z_cur−z_prior)``,                ``--pooling findquery``, ``--pooling findquery_wmean``,
                ``--pooling global``, or ``--pooling head``)
 ``biovilt``  — official BioViL-T image–text phrase-bank (max phrase
                cosine per class)
 
 Usage
 -----
+    python eval_progression_gold_setmatch.py --backend jepa --eval \\
+        --ckpt checkpoints_jepa_dynamic_cbw99999/epoch_5.pt \\
+        --pooling findquery_wmean
+
     python eval_progression_gold_setmatch.py --backend jepa --eval \\
         --ckpt checkpoints_jepa_dynamic_cbw99999/best.pt
 

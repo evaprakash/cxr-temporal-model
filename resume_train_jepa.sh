@@ -27,6 +27,8 @@
 #   * From scratch (do not --resume paper or _findq)
 #   * Rank-0 gold after each epoch (same weighted-mean rule)
 #
+# Frozen paper epoch_5 readout (no train): sbatch eval_jepa_wfindq_paper.sh
+#
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
 #     git pull
