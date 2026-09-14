@@ -536,6 +536,7 @@ def _report(records: list[dict], *, out_dir: Path,
         c for c in (
             "energy_in_box", "box_area", "mean_diff", "max_diff",
             "top5_pg", "top1pct_pg",
+            "iou_eqarea", "iou_top10", "pixel_auroc",
         ) if c in df.columns
     ]
     if extra_cols:
@@ -546,18 +547,27 @@ def _report(records: list[dict], *, out_dir: Path,
         print("  energy_in_box ~ box_area → uniform; >> area → mass on finding")
         print("  max_diff > 0 → peak inside (same event as PG hit)")
         print("  top5 / top1pct = softer pointing")
+        print("  iou_eqarea = mIoU, pred = hottest |box| pixels (TempA-style)")
+        print("  iou_top10  = mIoU, pred = hottest 10% of map")
+        print("  pixel_auroc = rank in-box vs out (0.5 = chance)")
         if len(extra):
             def _m(col):
                 s = extra[col].dropna()
                 return float(s.mean()) if len(s) else float("nan")
 
+            box_a = _m("box_area")
+            iou_chance = box_a / (2.0 - box_a) if 0.0 < box_a < 2.0 else float("nan")
             print(f"  n_sides              {len(extra)}")
-            print(f"  box_area (chance)    {_m('box_area'):.4f}")
+            print(f"  box_area (chance)    {box_a:.4f}")
             print(f"  energy_in_box        {_m('energy_in_box'):.4f}")
             print(f"  mean_diff (in-out)   {_m('mean_diff'):.4f}")
             print(f"  max_diff  (in-out)   {_m('max_diff'):.4f}")
             print(f"  top5_pg              {_m('top5_pg'):.4f}")
             print(f"  top1pct_pg           {_m('top1pct_pg'):.4f}")
+            print(f"  iou_eqarea (mIoU)    {_m('iou_eqarea'):.4f}   "
+                  f"(random ~ {iou_chance:.4f})")
+            print(f"  iou_top10            {_m('iou_top10'):.4f}")
+            print(f"  pixel_auroc          {_m('pixel_auroc'):.4f}")
 
     if rendered:
         print(f"\n✅ DONE — PNGs written to {out_dir.resolve()}")

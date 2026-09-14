@@ -38,8 +38,8 @@ Recipe
 7. Ground-truth mask: union of *all* the pair's finding bboxes
    (``prior_bboxes`` on the prev side, ``current_bboxes`` on the
    curr side). One mask per side, same change map for both sides.
-8. Score per side with BioViL CNR + Pointing Game on the model 448x448
-   grid.
+8. Score per side with BioViL CNR, Pointing Game, mIoU, and pixel
+   AUROC on the model 448x448 grid.
 
 Note on asymmetry with BioViL-T
 --------------------------------

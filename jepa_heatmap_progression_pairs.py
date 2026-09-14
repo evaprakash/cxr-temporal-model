@@ -356,6 +356,39 @@ def compute_cnr(heatmap: np.ndarray, mask: np.ndarray) -> float | None:
     return abs(mu_a - mu_b) / denom
 
 
+def _iou_hottest_k(heatmap: np.ndarray, mask: np.ndarray, k: int) -> float | None:
+    """IoU of the ``k`` hottest pixels vs the union box. Rank-based (scale-free)."""
+    k = int(k)
+    n = int(heatmap.size)
+    if k <= 0 or n == 0:
+        return None
+    k = min(k, n)
+    flat = heatmap.reshape(-1)
+    pred = np.zeros(n, dtype=bool)
+    pred[np.argpartition(flat, -k)[-k:]] = True
+    pred = pred.reshape(mask.shape)
+    inter = int(np.logical_and(pred, mask).sum())
+    union = int(np.logical_or(pred, mask).sum())
+    if union <= 0:
+        return None
+    return float(inter / union)
+
+
+def _pixel_auroc(heatmap: np.ndarray, mask: np.ndarray) -> float | None:
+    """Mann–Whitney AUROC: P(score_in > score_out) + 0.5 P(tie). Chance = 0.5."""
+    pos = heatmap[mask].reshape(-1)
+    neg = heatmap[~mask].reshape(-1)
+    n_pos = int(pos.size)
+    n_neg = int(neg.size)
+    if n_pos == 0 or n_neg == 0:
+        return None
+    neg_sorted = np.sort(neg)
+    less = np.searchsorted(neg_sorted, pos, side="left")
+    greater = np.searchsorted(neg_sorted, pos, side="right")
+    u = float(less.sum()) + 0.5 * float((greater - less).sum())
+    return float(u / (n_pos * n_neg))
+
+
 def compute_change_map_side_metrics(
     heatmap: np.ndarray,
     mask: np.ndarray,
@@ -376,6 +409,11 @@ def compute_change_map_side_metrics(
       (PG is ``max_diff > 0`` when there are no ties).
     * ``top5_pg`` — any of the 5 hottest pixels in the box.
     * ``top1pct_pg`` — any of the hottest 1% of pixels in the box.
+    * ``iou_eqarea`` — TempA-style mIoU: predicted mask = hottest
+      ``|box|`` pixels (no threshold; comparable across map scales).
+    * ``iou_top10`` — same, but hottest 10% of the map.
+    * ``pixel_auroc`` — threshold-free ranking of in-box vs out-of-box
+      pixels (0.5 = chance).
     """
     empty = {
         "cnr": None,
@@ -390,6 +428,9 @@ def compute_change_map_side_metrics(
         "max_diff": None,
         "top5_pg": None,
         "top1pct_pg": None,
+        "iou_eqarea": None,
+        "iou_top10": None,
+        "pixel_auroc": None,
     }
     if mask is None or not mask.any() or mask.size != heatmap.size:
         return empty
@@ -419,6 +460,8 @@ def compute_change_map_side_metrics(
     top1pct_pg = int(bool(mask_flat[order[:k1]].any()))
     mx_in = float(interior.max())
     mx_out = float(exterior.max())
+    n_box = int(mask_flat.sum())
+    k10 = max(1, int(round(0.10 * flat.size)))
 
     return {
         "cnr": cnr,
@@ -433,6 +476,9 @@ def compute_change_map_side_metrics(
         "max_diff": mx_in - mx_out,
         "top5_pg": top5_pg,
         "top1pct_pg": top1pct_pg,
+        "iou_eqarea": _iou_hottest_k(hm, mask, n_box),
+        "iou_top10": _iou_hottest_k(hm, mask, k10),
+        "pixel_auroc": _pixel_auroc(hm, mask),
     }
 
 

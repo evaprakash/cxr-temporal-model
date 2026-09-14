@@ -12,7 +12,7 @@
 #SBATCH --error=/scratch/m000081-pm06/eprakash/logs/change_maps_%j.err
 
 # ============================================================
-# Rerun change-map CNR / PG (plus same-map extras) on gold_bboxes.
+# Rerun change-map CNR / PG / mIoU / pixel-AUROC on gold_bboxes.
 # Metrics only (--no-render). Three models, same pairs:
 #   1. official BioViL-T   role-swap 1-cos          (no ckpt)
 #   2. supervised unfrozen role-swap 1-cos          (head unused)
@@ -57,7 +57,7 @@ export JEPA_IMAGE_ROOTS_DIR="${JEPA_IMAGE_ROOTS_DIR:-$SCRATCH_BASE/all_data}"
 BBOX_PARQUET="${BBOX_PARQUET:-$CHEXTEMPORAL_DIR/gold_bboxes.parquet}"
 JEPA_CKPT="${JEPA_CKPT:-$PROJECT_DIR/checkpoints_jepa_dynamic_cbw99999/epoch_5.pt}"
 SUP_CKPT="${SUP_CKPT:-$PROJECT_DIR/checkpoints_supervised_progression_unfrozen/epoch_5.pt}"
-OUT_DIR="${OUT_DIR:-$PROJECT_DIR/change_maps_rerun}"
+OUT_DIR="${OUT_DIR:-$PROJECT_DIR/change_maps_region}"
 
 echo "[slurm] CHEXTEMPORAL_DIR     = $CHEXTEMPORAL_DIR"
 echo "[slurm] JEPA_IMAGE_ROOTS_DIR = $JEPA_IMAGE_ROOTS_DIR"
