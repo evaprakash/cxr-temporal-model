@@ -57,6 +57,11 @@ Usage
     # Pick N pairs (one per progression class when possible) for a demo
     python biovilt_change_map_pairs.py --num-examples 10
 
+    # Unfrozen supervised (same patch change map; head is unused):
+    python biovilt_change_map_pairs.py --no-render \\
+      --ckpt checkpoints_supervised_progression_unfrozen/epoch_5.pt \\
+      --out-dir change_maps_supervised_unfrozen
+
 The stdout summary and per-pair CSV are drop-in comparable with
 ``jepa_change_map_pairs.py``.
 """
@@ -103,6 +108,7 @@ from infer_jepa import IMAGE_ROOTS  # noqa: E402
 from jepa_heatmap_progression_pairs import (  # noqa: E402
     _parse_bboxes,
     boxes_mask_in_model_space,
+    compute_change_map_side_metrics,
     compute_cnr,
     compute_pointing_game,
     load_image,
@@ -131,7 +137,20 @@ CLS_ORDER = ["improving", "stable", "worsening", "new", "resolved"]
 # ============================================================
 # MODEL
 # ============================================================
-def load_model() -> TempCXR:
+def load_model(ckpt_path: str | None = None):
+    """Official BioViL-T, or unfrozen supervised image-encoder weights.
+
+    ``--ckpt`` loads ``image_encoder`` from
+    ``train_supervised_progression.py`` (BioViLTImageEncoderJEPA).
+    The 5-way head is not used; change maps are still the patch
+    role-swap recipe.
+    """
+    if ckpt_path:
+        from eval_progression_biovilt import load_supervised_encoders
+        print(f"🔧 Loading supervised image encoder from {ckpt_path}")
+        model = load_supervised_encoders(ckpt_path, torch.device(DEVICE))
+        print("✅ Supervised encoders loaded (change maps use patches only).")
+        return model
     print("🔧 Initializing TempCXR with mode='biovilt' (no checkpoint).")
     model = TempCXR(mode="biovilt").to(DEVICE)
     model.eval()
@@ -249,6 +268,12 @@ def pick_pair_examples(records: list[dict], n: int, seed: int) -> list[dict]:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--ckpt",
+        default=None,
+        help="Optional unfrozen supervised checkpoint "
+             "(loads image_encoder). Default: official BioViL-T.",
+    )
+    parser.add_argument(
         "--gold-parquet", default=DEFAULT_GOLD_PARQUET,
         help=f"Path to gold_bboxes.parquet (default: {DEFAULT_GOLD_PARQUET}).",
     )
@@ -344,7 +369,7 @@ def main():
         pairs = pick_pair_examples(pairs, n=args.num_examples, seed=args.seed)
         print(f"🎯 Down-sampled to {len(pairs)} pairs (--num-examples)")
 
-    model = load_model()
+    model = load_model(args.ckpt)
 
     records: list[dict] = []
     for i, rec in enumerate(pairs):
@@ -365,10 +390,18 @@ def main():
             prev_boxes, prev_orig, prev_disp.size)
         curr_mask = boxes_mask_in_model_space(
             curr_boxes, curr_orig, curr_disp.size)
-        prev_cnr = compute_cnr(change_map, prev_mask) if prev_boxes else None
-        curr_cnr = compute_cnr(change_map, curr_mask) if curr_boxes else None
-        prev_pg = compute_pointing_game(change_map, prev_mask) if prev_boxes else None
-        curr_pg = compute_pointing_game(change_map, curr_mask) if curr_boxes else None
+        prev_m = (
+            compute_change_map_side_metrics(change_map, prev_mask)
+            if prev_boxes else compute_change_map_side_metrics(
+                change_map, np.zeros_like(change_map, dtype=bool))
+        )
+        curr_m = (
+            compute_change_map_side_metrics(change_map, curr_mask)
+            if curr_boxes else compute_change_map_side_metrics(
+                change_map, np.zeros_like(change_map, dtype=bool))
+        )
+        prev_cnr, prev_pg = prev_m["cnr"], prev_m["pointing_game"]
+        curr_cnr, curr_pg = curr_m["cnr"], curr_m["pointing_game"]
 
         # Represent each side as one row (mirrors the JEPA heatmap
         # script's CSV layout), but note ``disease_name`` and
@@ -386,13 +419,9 @@ def main():
             "n_rows_in_pair": rec["n_rows"],
         }
         records.append({**meta_common, "side": "prev",
-                        "n_boxes": len(prev_boxes),
-                        "cnr": prev_cnr,
-                        "pointing_game": prev_pg})
+                        "n_boxes": len(prev_boxes), **prev_m})
         records.append({**meta_common, "side": "curr",
-                        "n_boxes": len(curr_boxes),
-                        "cnr": curr_cnr,
-                        "pointing_game": curr_pg})
+                        "n_boxes": len(curr_boxes), **curr_m})
 
         p_drawn = c_drawn = 0
         if not args.no_render:
@@ -502,6 +531,33 @@ def _report(records: list[dict], *, out_dir: Path,
             print(f"    {lbl:10s}  n={len(sub):4d}  "
                   f"acc={sub['pointing_game'].mean():.4f}  "
                   f"hits={int(sub['pointing_game'].sum())}/{len(sub)}")
+
+    extra_cols = [
+        c for c in (
+            "energy_in_box", "box_area", "mean_diff", "max_diff",
+            "top5_pg", "top1pct_pg",
+        ) if c in df.columns
+    ]
+    if extra_cols:
+        extra = df.dropna(subset=["cnr"])
+        print("\n" + "=" * 70)
+        print(f"{tag} CHANGE-MAP EXTRA GROUNDING (same map + union box)")
+        print("=" * 70)
+        print("  energy_in_box ~ box_area → uniform; >> area → mass on finding")
+        print("  max_diff > 0 → peak inside (same event as PG hit)")
+        print("  top5 / top1pct = softer pointing")
+        if len(extra):
+            def _m(col):
+                s = extra[col].dropna()
+                return float(s.mean()) if len(s) else float("nan")
+
+            print(f"  n_sides              {len(extra)}")
+            print(f"  box_area (chance)    {_m('box_area'):.4f}")
+            print(f"  energy_in_box        {_m('energy_in_box'):.4f}")
+            print(f"  mean_diff (in-out)   {_m('mean_diff'):.4f}")
+            print(f"  max_diff  (in-out)   {_m('max_diff'):.4f}")
+            print(f"  top5_pg              {_m('top5_pg'):.4f}")
+            print(f"  top1pct_pg           {_m('top1pct_pg'):.4f}")
 
     if rendered:
         print(f"\n✅ DONE — PNGs written to {out_dir.resolve()}")

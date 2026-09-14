@@ -70,6 +70,37 @@ class BioViLTPairModel:
         self.device = device
 
 
+def load_supervised_encoders(ckpt_path: str, device: torch.device) -> BioViLTPairModel:
+    """Official BioViL-T encoders overwritten with a supervised checkpoint.
+
+    Expects ``train_supervised_progression.py`` format: ``image_encoder``
+    and ``text_encoder`` state dicts. The 5-way head is ignored.
+    """
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"supervised checkpoint not found: {ckpt_path}")
+    model = BioViLTPairModel(device)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "image_encoder" not in ckpt:
+        raise ValueError(
+            f"{ckpt_path} has no image_encoder weights. "
+            "Need an unfrozen supervised checkpoint "
+            "(checkpoints_supervised_progression_unfrozen/epoch_*.pt), "
+            "not a frozen-probe head-only file."
+        )
+    model.image_encoder.load_state_dict(ckpt["image_encoder"])
+    print(f"[supervised] loaded image encoder from {ckpt_path}")
+    if "text_encoder" in ckpt:
+        model.text_encoder.load_state_dict(ckpt["text_encoder"])
+        print(f"[supervised] loaded text encoder from {ckpt_path}")
+    model.image_encoder.eval()
+    model.text_encoder.eval()
+    for p in model.image_encoder.parameters():
+        p.requires_grad = False
+    for p in model.text_encoder.parameters():
+        p.requires_grad = False
+    return model
+
+
 def build_phrase_bank(
     finding: str,
     template: str = PROMPT_TEMPLATE,

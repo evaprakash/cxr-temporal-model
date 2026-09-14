@@ -90,6 +90,7 @@ from dataset_combined_jepa import DEFAULT_DATASET_DIR
 from infer_jepa import IMAGE_ROOTS, load_jepa_model
 from jepa_heatmap_progression_pairs import (
     boxes_mask_in_model_space,
+    compute_change_map_side_metrics,
     compute_cnr,
     compute_pointing_game,
     load_image,
@@ -328,10 +329,18 @@ def main():
             prev_boxes, prev_orig, prev_disp.size)
         curr_mask = boxes_mask_in_model_space(
             curr_boxes, curr_orig, curr_disp.size)
-        prev_cnr = compute_cnr(change_map, prev_mask) if prev_boxes else None
-        curr_cnr = compute_cnr(change_map, curr_mask) if curr_boxes else None
-        prev_pg = compute_pointing_game(change_map, prev_mask) if prev_boxes else None
-        curr_pg = compute_pointing_game(change_map, curr_mask) if curr_boxes else None
+        prev_m = (
+            compute_change_map_side_metrics(change_map, prev_mask)
+            if prev_boxes else compute_change_map_side_metrics(
+                change_map, np.zeros_like(change_map, dtype=bool))
+        )
+        curr_m = (
+            compute_change_map_side_metrics(change_map, curr_mask)
+            if curr_boxes else compute_change_map_side_metrics(
+                change_map, np.zeros_like(change_map, dtype=bool))
+        )
+        prev_cnr, prev_pg = prev_m["cnr"], prev_m["pointing_game"]
+        curr_cnr, curr_pg = curr_m["cnr"], curr_m["pointing_game"]
 
         prog_str = "|".join(rec["progressions"])
         find_str = "|".join(rec["findings"])
@@ -346,13 +355,9 @@ def main():
             "n_predictor_tuples": len(rec["_fp_tuples"]),
         }
         records.append({**meta_common, "side": "prev",
-                        "n_boxes": len(prev_boxes),
-                        "cnr": prev_cnr,
-                        "pointing_game": prev_pg})
+                        "n_boxes": len(prev_boxes), **prev_m})
         records.append({**meta_common, "side": "curr",
-                        "n_boxes": len(curr_boxes),
-                        "cnr": curr_cnr,
-                        "pointing_game": curr_pg})
+                        "n_boxes": len(curr_boxes), **curr_m})
 
         p_drawn = c_drawn = 0
         if not args.no_render:

@@ -356,6 +356,86 @@ def compute_cnr(heatmap: np.ndarray, mask: np.ndarray) -> float | None:
     return abs(mu_a - mu_b) / denom
 
 
+def compute_change_map_side_metrics(
+    heatmap: np.ndarray,
+    mask: np.ndarray,
+    topk: int = 5,
+) -> dict:
+    """CNR, pointing game, plus same-map extras (no extra model pass).
+
+    All scores use the upsampled 448×448 change map and the union box
+    mask. Empty mask → every value is ``None`` (same skip rule as CNR).
+
+    Extra keys (beyond ``cnr`` / ``pointing_game``):
+
+    * ``energy_in_box`` — fraction of non-negative map mass inside the
+      box (``~box_area`` = uniform; ``1`` = all change on the finding).
+    * ``box_area`` — fraction of pixels in the box.
+    * ``mean_in`` / ``mean_out`` / ``mean_diff`` — signed CNR numerator.
+    * ``max_in`` / ``max_out`` / ``max_diff`` — peak-in vs peak-out
+      (PG is ``max_diff > 0`` when there are no ties).
+    * ``top5_pg`` — any of the 5 hottest pixels in the box.
+    * ``top1pct_pg`` — any of the hottest 1% of pixels in the box.
+    """
+    empty = {
+        "cnr": None,
+        "pointing_game": None,
+        "energy_in_box": None,
+        "box_area": None,
+        "mean_in": None,
+        "mean_out": None,
+        "mean_diff": None,
+        "max_in": None,
+        "max_out": None,
+        "max_diff": None,
+        "top5_pg": None,
+        "top1pct_pg": None,
+    }
+    if mask is None or not mask.any() or mask.size != heatmap.size:
+        return empty
+
+    hm = heatmap.astype(np.float64, copy=False)
+    interior = hm[mask]
+    exterior = hm[~mask]
+    if interior.size == 0 or exterior.size == 0:
+        return empty
+
+    mu_a = float(interior.mean())
+    mu_b = float(exterior.mean())
+    var_a = float(interior.var())
+    var_b = float(exterior.var())
+    denom = (var_a + var_b) ** 0.5
+    cnr = abs(mu_a - mu_b) / denom if denom >= 1e-12 else None
+
+    pos = np.clip(hm, 0.0, None)
+    pos_sum = float(pos.sum())
+    energy = float(pos[mask].sum() / pos_sum) if pos_sum > 1e-12 else None
+
+    flat = hm.reshape(-1)
+    mask_flat = mask.reshape(-1)
+    order = np.argsort(flat)[::-1]
+    top5_pg = int(bool(mask_flat[order[: min(topk, order.size)]].any()))
+    k1 = max(1, int(round(0.01 * order.size)))
+    top1pct_pg = int(bool(mask_flat[order[:k1]].any()))
+    mx_in = float(interior.max())
+    mx_out = float(exterior.max())
+
+    return {
+        "cnr": cnr,
+        "pointing_game": int(bool(mask.flat[int(np.argmax(hm))])),
+        "energy_in_box": energy,
+        "box_area": float(mask.mean()),
+        "mean_in": mu_a,
+        "mean_out": mu_b,
+        "mean_diff": mu_a - mu_b,
+        "max_in": mx_in,
+        "max_out": mx_out,
+        "max_diff": mx_in - mx_out,
+        "top5_pg": top5_pg,
+        "top1pct_pg": top1pct_pg,
+    }
+
+
 def compute_pointing_game(heatmap: np.ndarray,
                           mask: np.ndarray) -> int | None:
     """Pointing Game: 1 if the heatmap's argmax pixel lies inside the union
