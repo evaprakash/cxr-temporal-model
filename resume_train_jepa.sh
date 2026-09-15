@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=jepa_loc
+#SBATCH --job-name=jepa_loc_ft
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,25 +8,21 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_loc_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_loc_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/jepa_loc_ft_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/jepa_loc_ft_%j.err
 
 # ============================================================
-# Paper JEPA + change-localization add-on (from scratch).
-# 5-way stays per-patch mean cosine. Does NOT use finding-query.
-# Writes to checkpoints_jepa_dynamic_cbw99999_loc10/
-# (does not touch paper cbw99999/, _findq/, or _findqwmean/).
+# Slow-LR loc-loss add-on on paper JEPA epoch_5.
+# Fresh AdamW at LR=2e-6 (10× below paper). 5-way stays per-patch.
+# Writes to checkpoints_jepa_dynamic_cbw99999_loc10_lr2e6/
+# (does not touch paper cbw99999/).
 #
 #   * W_JEPA = 1.0, W_PROG = 0.1, W_REPORT_* = 0.1, W_LOC = 0.1
 #   * PROG_POOLING = perpatch
 #   * s = 1-cos(ẑ_dynamic, z_prior); raise s in prior finding mask
 #   * Skip silver-stable and rows with no prior finding mask
-#   * FREEZE_TEXT_ENCODER = False
-#   * JOINT_CURRENT_TARGET = False
-#   * From scratch (do not --resume paper or findq)
-#   * Rank-0 gold after each epoch (paper perpatch)
-#
-# Decision-tile eval (frozen paper, 1 hr): sbatch eval_jepa_decision_tiles.sh
+#   * --finetune-from paper epoch_5 (model only)
+#   * Rank-0 gold 5-way + predictor-delta maps after each epoch
 #
 #     mkdir -p /scratch/m000081-pm06/eprakash/logs
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
@@ -58,7 +54,7 @@ echo "[slurm] branch      = $(git rev-parse --abbrev-ref HEAD 2>/dev/null || ech
 echo "[slurm] HEAD        = $(git rev-parse --short HEAD 2>/dev/null || echo '<n/a>')"
 echo "[slurm] partition   = ${SLURM_JOB_PARTITION:-unknown}"
 
-# Abort-check: paper perpatch + change-loc (not findq).
+# Abort-check: paper perpatch + loc, slow LR, finetune-from paper.
 python - <<'PY'
 import pathlib
 import re
@@ -75,6 +71,7 @@ def assign(name):
     return m.group(1).strip()
 
 checks = {
+    "LR": "2e-6",
     "W_JEPA": "1.0",
     "W_PROG": "0.1",
     "W_REPORT_PRIOR": "0.1",
@@ -111,16 +108,20 @@ if "assert_local_proj_matches_official_cls()" not in src:
     bad.append("  trainer does not verify official-CLS local-proj init")
 if "change_localization_loss" not in src:
     bad.append("  trainer missing change_localization_loss")
+if "eval_gold_change_maps" not in src:
+    bad.append("  trainer missing in-epoch gold change-map eval")
+if "--finetune-from" not in src:
+    bad.append("  trainer missing --finetune-from")
 if 'PROG_POOLING = "findquery_wmean"' in src or 'PROG_POOLING = "findquery"' in src:
     bad.append("  trainer still on finding-query pooling")
 if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
     sys.exit(1)
-print("[abort-check] OK  paper perpatch + loc  1/0.1/0.1/0.1 + W_LOC=0.1")
-print("[abort-check] OK  text trainable, single-image current")
-print("[abort-check] OK  local text proj = official CLS init, unfrozen")
-print("[abort-check] OK  dir tag should be ..._cbw99999_loc10")
+print("[abort-check] OK  paper perpatch + loc add-on  1/0.1/0.1/0.1 + W_LOC=0.1")
+print("[abort-check] OK  LR=2e-6  --finetune-from paper weights (no optimizer)")
+print("[abort-check] OK  gold 5-way + predictor-delta maps each epoch")
+print("[abort-check] OK  dir tag should be ..._cbw99999_loc10_lr2e6")
 PY
 
 HI_ML_SRC="$PROJECT_DIR/tempcxr/modules/hi-ml/hi-ml-multimodal/src"
@@ -133,8 +134,10 @@ export PYTHONPATH="${HI_ML_SRC}${PYTHONPATH:+:$PYTHONPATH}"
 
 export CHEXTEMPORAL_DIR="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
 export JEPA_IMAGE_ROOTS_DIR="${JEPA_IMAGE_ROOTS_DIR:-$SCRATCH_BASE/all_data}"
+PAPER_CKPT="${PAPER_CKPT:-$PROJECT_DIR/checkpoints_jepa_dynamic_cbw99999/epoch_5.pt}"
 echo "[slurm] CHEXTEMPORAL_DIR     = $CHEXTEMPORAL_DIR"
 echo "[slurm] JEPA_IMAGE_ROOTS_DIR = $JEPA_IMAGE_ROOTS_DIR"
+echo "[slurm] PAPER_CKPT           = $PAPER_CKPT"
 for d in \
     "$JEPA_IMAGE_ROOTS_DIR/mimic" \
     "$JEPA_IMAGE_ROOTS_DIR/chexpert/train" \
@@ -144,7 +147,13 @@ do
         echo "[slurm] WARNING: missing image root: $d" >&2
     fi
 done
+if [ ! -f "$PAPER_CKPT" ]; then
+    echo "[slurm] ERROR: missing paper ckpt: $PAPER_CKPT" >&2
+    exit 1
+fi
 
 mkdir -p "$SCRATCH_BASE/logs"
 
-torchrun --nproc_per_node=4 resume_train_jepa.py "$@"
+torchrun --nproc_per_node=4 resume_train_jepa.py \
+    --finetune-from "$PAPER_CKPT" \
+    "$@"

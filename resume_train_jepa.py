@@ -19,13 +19,13 @@
 #               ``CONDITION_MODE=templated`` for the per-finding
 #               ``"{Finding} is {progression}."`` template.
 #
-# Current run: paper recipe + change-localization add-on.
-# Trainable text, single-image current, local 768→128 inited from
-# official CLS then trained, weights 1 / 0.1 / 0.1 / 0.1, plus
-# W_LOC = 0.1 on predictor-delta inside the prior finding mask.
-# 5-way stays paper per-patch mean cosine (no finding-query).
-# Writes to ``checkpoints_jepa_dynamic_cbw99999_loc10/`` (does not
-# touch paper ``cbw99999/``, ``_findq/``, or ``_findqwmean/``).
+# Current run: slow-LR loc-loss add-on on paper JEPA epoch_5.
+# Same recipe (trainable text, single-image current, official-CLS
+# local proj, weights 1 / 0.1 / 0.1 / 0.1, per-patch 5-way) plus
+# W_LOC = 0.1. ``--finetune-from`` loads paper weights only (fresh
+# AdamW at LR=2e-6, 10× below paper). Writes to
+# ``checkpoints_jepa_dynamic_cbw99999_loc10_lr2e6/`` — does not
+# touch paper ``cbw99999/``.
 #
 # Progression loss (the "4th loss"):
 #   Per pair, one sampled ``(prog_finding, prog_cls_idx)``. Five
@@ -35,7 +35,10 @@
 # Localization add-on (not anatomy JEPA):
 #   On the *dynamic* ẑ (report-conditioned next-film forecast):
 #   ``s = 1 - cos(ẑ, z_prior)``; raise s inside the prior finding
-#   mask, lower it outside. Skips ``stable`` and rows with no mask.
+#   mask, lower it outside. Skips ``stable`` (no change to put in
+#   the box) and rows with no prior finding mask (typical for
+#   ``new``). Rank-0 gold after each epoch: 5-way set-match plus
+#   predictor-delta energy / mIoU / pixel AUROC / CNR / PG.
 
 import os
 import glob
@@ -70,6 +73,11 @@ from gold_progression_setmatch import (
     print_setmatch_report,
     summarize_setmatch,
     topk_set_match,
+)
+from jepa_change_map_pairs import (
+    DEFAULT_GOLD_PARQUET as DEFAULT_GOLD_BBOX_PARQUET,
+    eval_gold_change_maps,
+    prepare_gold_change_map_pairs,
 )
 from progression_classify import (
     DEFAULT_GOLD_PARQUET,
@@ -218,9 +226,23 @@ IMAGE_ROOTS = {
 parser = argparse.ArgumentParser()
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument(
+    "--finetune-from",
+    type=str,
+    default=None,
+    help="Load model weights only (no optimizer / scheduler). "
+         "Used to continue paper JEPA at a new LR. Ignored if "
+         "this run's checkpoint dir already has epoch_*.pt "
+         "(preempt restart uses --resume / auto-resume).",
+)
+parser.add_argument(
     "--skip-gold",
     action="store_true",
     help="Skip CheXTemporal gold set-match after each epoch.",
+)
+parser.add_argument(
+    "--skip-gold-maps",
+    action="store_true",
+    help="Skip predictor-delta grounding after each gold set-match.",
 )
 args = parser.parse_args()
 
@@ -275,7 +297,9 @@ def gather_with_grad(tensor):
 # ============================================================
 # HYPERPARAMETERS
 # ============================================================
-LR = 2e-5
+# Paper from-scratch is 2e-5. This run is a loc-loss add-on on
+# frozen-recipe paper weights, so 10× lower.
+LR = 2e-6
 WEIGHT_DECAY = 0.01
 # Batch size was 32 before; dropped to 24 to fit under the A100-40GB
 # memory ceiling with ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``.
@@ -309,8 +333,11 @@ N_CLS = len(CLS_ORDER)
 JOINT_CURRENT_TARGET = False
 
 # Predictor-delta localization on the prior finding mask (dynamic ẑ).
-# Skip stable: there is no change to concentrate. New/resolved fire
-# only when a prior finding mask exists.
+# Skip stable: loc is -(s_in - s_out), i.e. "put more change in the
+# box than outside." Stable has no change to place; training it
+# invents a hotspot. ``new`` usually has no prior mask so
+# finding_mask_active is already False. ``resolved`` / improving /
+# worsening fire when the silver prior mask has mass.
 W_LOC = 0.1
 USE_CHANGE_LOC = True
 LOC_SKIP_CLASSES = ("stable",)
@@ -366,7 +393,8 @@ SPLIT_SEED = 42
 #   * ``..._txtfrzcls_jointtgt_findq`` — freeze + joint + findq (archive)
 #   * ``..._findq``                   — collapsed-pool findq (archive)
 #   * ``..._findqwmean``              — paper + weighted-mean findq (archive)
-#   * ``..._loc{ww}``                 — paper + change-loc add-on (this run)
+#   * ``..._loc{ww}``                 — paper + change-loc add-on
+#   * ``..._lr{lr}``                  — LR != 2e-5 (this run: loc + 2e-6)
 #   * ``..._anatjepa{ww}``            — anatomy JEPA add-on (full-grid on)
 #   * ``..._anatjepaonly{ww}``        — anatomy JEPA only (W_JEPA=0)
 # Legacy ``checkpoints_jepa/`` and ``logs/`` dirs from older
@@ -433,6 +461,9 @@ elif PROG_POOLING == "findquery_wmean":
     _SETTING_TAG = f"{_SETTING_TAG}_findqwmean"
 if USE_CHANGE_LOC and W_LOC > 0:
     _SETTING_TAG = f"{_SETTING_TAG}_loc{_report_weight_tag(W_LOC)}"
+if abs(LR - 2e-5) > 1e-15:
+    _lr_tag = f"{LR:.0e}".replace("e-0", "e").replace("e+", "e").replace("-", "")
+    _SETTING_TAG = f"{_SETTING_TAG}_lr{_lr_tag}"
 
 _DEFAULT_CKPT_DIR = os.path.join(
     _HERE, f"checkpoints_jepa_{CONDITION_MODE}_{_SETTING_TAG}"
@@ -569,7 +600,8 @@ if local_rank == 0:
         f"(z_cur = encoder(current) single-image; "
         f"JEPA = mean_p (1-cos(ẑ_dyn[p], z_cur[p])); "
         f"prog = mean_n cos(ẑ^c[n], z_cur[n]) 5-way CE; "
-        f"loc = -(s_in-s_out) on 1-cos(ẑ_dyn, z_prior), skip stable)"
+        f"loc = -(s_in-s_out) on 1-cos(ẑ_dyn, z_prior), "
+        f"skip {LOC_SKIP_CLASSES}, LR={LR})"
     )
     print(
         f"[train] progression-class CBW: β={CBW_BETA} "
@@ -721,6 +753,28 @@ if args.resume is not None:
 
     if local_rank == 0:
         print(f"Resumed from {args.resume}")
+elif args.finetune_from is not None:
+    checkpoint = torch.load(args.finetune_from, map_location=DEVICE)
+    missing, unexpected = model.module.load_state_dict(
+        checkpoint["model"], strict=False,
+    )
+    start_epoch = int(checkpoint.get("epoch", 0)) + 1
+    best_val_loss = float("inf")
+    steps_so_far = (start_epoch - 1) * len(train_loader)
+    for _ in range(steps_so_far):
+        try:
+            next(momentum_scheduler)
+        except StopIteration:
+            break
+    if local_rank == 0:
+        print(
+            f"Finetune-from {args.finetune_from} "
+            f"(model only, fresh AdamW LR={LR}, start_epoch={start_epoch})"
+        )
+        if missing:
+            print(f"  missing keys ({len(missing)}): {missing[:8]}")
+        if unexpected:
+            print(f"  unexpected keys ({len(unexpected)}): {unexpected[:8]}")
 
 
 # ============================================================
@@ -735,7 +789,9 @@ if local_rank == 0 and not os.path.exists(CSV_LOG):
             "val_prog,val_anatjepa,val_loc,"
             "val_zhat_std,val_zcur_std,val_zprior_std,"
             "val_zhat_offdiag_cos,"
-            "gold_combined,gold_single,gold_multi\n"
+            "gold_combined,gold_single,gold_multi,"
+            "gold_cnr,gold_energy,gold_iou_eqarea,"
+            "gold_pixel_auroc,gold_pg\n"
         )
 if local_rank == 0 and not os.path.exists(FEAT_CSV_LOG):
     with open(FEAT_CSV_LOG, "w") as f:
@@ -751,6 +807,7 @@ if local_rank == 0 and not os.path.exists(FEAT_CSV_LOG):
 # ============================================================
 gold_groups = None
 gold_roots = None
+gold_map_pairs = None
 if not args.skip_gold:
     if local_rank == 0:
         gold_df = load_gold_pairs(DEFAULT_GOLD_PARQUET, DEFAULT_FINDINGS)
@@ -767,6 +824,13 @@ if not args.skip_gold:
         print("[gold] image roots:")
         for d in ("mimic", "chexpert", "rexgradient"):
             print(f"  {d}: {gold_roots.get(d, '<missing>')}")
+        if not args.skip_gold_maps:
+            bbox_parquet = os.environ.get(
+                "GOLD_BBOX_PARQUET", DEFAULT_GOLD_BBOX_PARQUET,
+            )
+            gold_map_pairs = prepare_gold_change_map_pairs(
+                bbox_parquet, gold_roots,
+            )
 
 
 # ============================================================
@@ -1398,6 +1462,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             print("Saved new BEST checkpoint")
 
         gold_combined = gold_single = gold_multi = ""
+        gold_cnr = gold_energy = gold_iou = gold_auroc = gold_pg = ""
         if gold_groups is not None:
             gold_sum = eval_gold_setmatch(
                 model.module, gold_groups, gold_roots, epoch,
@@ -1406,6 +1471,19 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 gold_combined = f"{gold_sum['combined_score']:.6f}"
                 gold_single = f"{gold_sum['single_acc']:.6f}"
                 gold_multi = f"{gold_sum['multi_jaccard']:.6f}"
+        if gold_map_pairs is not None:
+            maps_sum = eval_gold_change_maps(
+                model.module, gold_map_pairs, epoch, device=DEVICE,
+            )
+            if maps_sum is not None:
+                def _csv(v):
+                    return f"{v:.6f}" if v is not None else ""
+
+                gold_cnr = _csv(maps_sum["cnr"])
+                gold_energy = _csv(maps_sum["energy_in_box"])
+                gold_iou = _csv(maps_sum["iou_eqarea"])
+                gold_auroc = _csv(maps_sum["pixel_auroc"])
+                gold_pg = _csv(maps_sum["pointing_game"])
 
         with open(CSV_LOG, "a") as f:
             f.write(
@@ -1413,7 +1491,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 f"{val_prog},{val_anatjepa},{val_loc},"
                 f"{val_zhat_std},{val_zcur_std},{val_zprior_std},"
                 f"{val_zhat_cos},"
-                f"{gold_combined},{gold_single},{gold_multi}\n"
+                f"{gold_combined},{gold_single},{gold_multi},"
+                f"{gold_cnr},{gold_energy},{gold_iou},"
+                f"{gold_auroc},{gold_pg}\n"
             )
 
     if WORLD_SIZE > 1:

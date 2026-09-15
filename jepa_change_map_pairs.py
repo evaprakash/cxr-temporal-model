@@ -164,7 +164,8 @@ def compute_change_map(model: TempCXRJEPA,
     _, txt_local, token_mask = model.text_encoder.forward_contrastive(prompts)
     k = len(prompts)
 
-    prior_b = prior_img.unsqueeze(0).to(DEVICE)
+    device = prior_img.device
+    prior_b = prior_img.unsqueeze(0).to(device)
     _, z_prior = model.image_encoder(prior_b)  # (1, N, D)
 
     z_prior_b = z_prior.expand(k, -1, -1).contiguous()
@@ -185,6 +186,208 @@ def compute_change_map(model: TempCXRJEPA,
     up = F.interpolate(grid, size=(out_size, out_size),
                        mode="bilinear", align_corners=False)
     return up.squeeze().cpu().float().numpy()
+
+
+# Paper JEPA vs unfrozen supervised on the same 1,333 gold sides
+# (change_maps_region / job 486113). Loc-loss watch targets are
+# energy + mIoU; pixel AUROC is already tied; CNR already leads.
+SUPERVISED_GOLD_MAPS = {
+    "cnr": 0.5176,
+    "energy_in_box": 0.2133,
+    "iou_eqarea": 0.1628,
+    "pixel_auroc": 0.6778,
+    "pointing_game": 0.3121,
+}
+PAPER_JEPA_GOLD_MAPS = {
+    "cnr": 0.5564,
+    "energy_in_box": 0.1729,
+    "iou_eqarea": 0.1348,
+    "pixel_auroc": 0.6730,
+    "pointing_game": 0.1725,
+}
+
+
+def summarize_change_map_records(records: list[dict]) -> dict | None:
+    """Mean grounding scores over sides that have a valid CNR."""
+    if not records:
+        return None
+    df = pd.DataFrame(records)
+    valid = df.dropna(subset=["cnr"])
+    if len(valid) == 0:
+        return None
+
+    def _mean(col: str):
+        if col not in valid.columns:
+            return None
+        s = valid[col].dropna()
+        return float(s.mean()) if len(s) else None
+
+    return {
+        "n_sides": int(len(valid)),
+        "n_total": int(len(df)),
+        "cnr": _mean("cnr"),
+        "energy_in_box": _mean("energy_in_box"),
+        "iou_eqarea": _mean("iou_eqarea"),
+        "pixel_auroc": _mean("pixel_auroc"),
+        "pointing_game": _mean("pointing_game"),
+        "box_area": _mean("box_area"),
+    }
+
+
+def prepare_gold_change_map_pairs(
+    gold_parquet: str,
+    image_roots: dict[str, str],
+) -> list[dict]:
+    """Load ``gold_bboxes.parquet`` once and collapse to scored pairs."""
+    df = pd.read_parquet(gold_parquet)
+    print(f"[gold-maps] loaded {len(df)} rows from {gold_parquet}")
+    df = normalize_gold_bboxes_schema(df)
+    print(f"[gold-maps] {len(df)} rows after schema + label filter")
+
+    def _resolve(dataset, rel):
+        try:
+            return _resolve_with_fallbacks(dataset, rel, image_roots)
+        except FileNotFoundError:
+            return None
+
+    df["_prev_resolved"] = df.apply(
+        lambda r: _resolve(r["dataset"], r["parent_image_prev"]), axis=1)
+    df["_curr_resolved"] = df.apply(
+        lambda r: _resolve(r["dataset"], r["parent_image_curr"]), axis=1)
+    df = df[df["_prev_resolved"].notna() & df["_curr_resolved"].notna()]
+    df = df.reset_index(drop=True)
+    print(f"[gold-maps] {len(df)} rows have both images present")
+
+    pairs = group_by_pair(df)
+    path_by_pair: dict[tuple, tuple] = {}
+    fp_by_pair: dict[tuple, list[tuple[str, str]]] = {}
+    for _, row in df.iterrows():
+        k = (row["dataset"], row["patient_id"],
+             row["study_id_prev"], row["study_id_curr"])
+        if k not in path_by_pair:
+            path_by_pair[k] = (row["_prev_resolved"], row["_curr_resolved"])
+        fp_by_pair.setdefault(k, []).append(
+            (str(row["finding"]), str(row["progression"]).lower()))
+
+    for rec in pairs:
+        k = (rec["dataset"], rec["patient_id"],
+             rec["study_id_prev"], rec["study_id_curr"])
+        rec["_prev_path"], rec["_curr_path"] = path_by_pair[k]
+        seen: set[tuple[str, str]] = set()
+        rec["_fp_tuples"] = []
+        for tup in fp_by_pair[k]:
+            if tup in seen:
+                continue
+            seen.add(tup)
+            rec["_fp_tuples"].append(tup)
+
+    print(f"[gold-maps] {len(pairs)} unique pairs (predictor-delta + union box)")
+    print(
+        "[gold-maps] watch vs supervised: "
+        f"energy {PAPER_JEPA_GOLD_MAPS['energy_in_box']:.3f}→"
+        f"{SUPERVISED_GOLD_MAPS['energy_in_box']:.3f}  "
+        f"mIoU {PAPER_JEPA_GOLD_MAPS['iou_eqarea']:.3f}→"
+        f"{SUPERVISED_GOLD_MAPS['iou_eqarea']:.3f}  "
+        f"(pixel AUROC already {PAPER_JEPA_GOLD_MAPS['pixel_auroc']:.3f} "
+        f"vs {SUPERVISED_GOLD_MAPS['pixel_auroc']:.3f}; "
+        f"CNR already leads {PAPER_JEPA_GOLD_MAPS['cnr']:.3f} "
+        f"vs {SUPERVISED_GOLD_MAPS['cnr']:.3f})"
+    )
+    return pairs
+
+
+@torch.no_grad()
+def eval_gold_change_maps(model, pairs, epoch, device=None) -> dict | None:
+    """In-training predictor-delta grounding (same recipe as this script)."""
+    import sys
+    from tqdm import tqdm
+
+    model.eval()
+    records: list[dict] = []
+    skipped = 0
+    pbar = tqdm(
+        range(len(pairs)),
+        desc=f"gold change-maps ep{epoch}",
+        dynamic_ncols=True,
+        file=sys.stdout,
+    )
+    for i in pbar:
+        rec = pairs[i]
+        try:
+            prev_t, prev_disp, prev_orig = load_image(rec["_prev_path"])
+            curr_t, curr_disp, curr_orig = load_image(rec["_curr_path"])
+        except (FileNotFoundError, OSError):
+            skipped += 1
+            continue
+        if device is not None:
+            prev_t = prev_t.to(device)
+
+        change_map = compute_change_map(
+            model, prev_t, rec["_fp_tuples"], out_size=INPUT_SIZE)
+        if change_map is None:
+            skipped += 1
+            continue
+
+        prev_boxes = rec["prev_boxes"]
+        curr_boxes = rec["curr_boxes"]
+        prev_mask = boxes_mask_in_model_space(
+            prev_boxes, prev_orig, prev_disp.size)
+        curr_mask = boxes_mask_in_model_space(
+            curr_boxes, curr_orig, curr_disp.size)
+        empty = np.zeros_like(change_map, dtype=bool)
+        prev_m = compute_change_map_side_metrics(
+            change_map, prev_mask if prev_boxes else empty)
+        curr_m = compute_change_map_side_metrics(
+            change_map, curr_mask if curr_boxes else empty)
+
+        prog_str = "|".join(rec["progressions"])
+        find_str = "|".join(rec["findings"])
+        meta = {
+            "dataset": rec["dataset"],
+            "comparison": prog_str,
+            "disease_name": find_str,
+        }
+        records.append({**meta, "side": "prev", **prev_m})
+        records.append({**meta, "side": "curr", **curr_m})
+
+        summary = summarize_change_map_records(records)
+        if summary is not None:
+            pbar.set_postfix(
+                skipped=skipped,
+                energy=(
+                    f"{summary['energy_in_box']:.3f}"
+                    if summary["energy_in_box"] is not None else "-"
+                ),
+                mIoU=(
+                    f"{summary['iou_eqarea']:.3f}"
+                    if summary["iou_eqarea"] is not None else "-"
+                ),
+            )
+    pbar.close()
+    if skipped:
+        print(f"[gold-maps] skipped pairs: {skipped}")
+    summary = summarize_change_map_records(records)
+    if summary is None:
+        print("[gold-maps] no scored sides")
+        return None
+
+    def _fmt(v):
+        return f"{v:.4f}" if v is not None else "-"
+
+    print(
+        f"[gold-maps] ep{epoch}  sides={summary['n_sides']}/{summary['n_total']}  "
+        f"energy={_fmt(summary['energy_in_box'])} "
+        f"(paper {_fmt(PAPER_JEPA_GOLD_MAPS['energy_in_box'])} / "
+        f"sup {_fmt(SUPERVISED_GOLD_MAPS['energy_in_box'])})  "
+        f"mIoU={_fmt(summary['iou_eqarea'])} "
+        f"(paper {_fmt(PAPER_JEPA_GOLD_MAPS['iou_eqarea'])} / "
+        f"sup {_fmt(SUPERVISED_GOLD_MAPS['iou_eqarea'])})  "
+        f"pixAUROC={_fmt(summary['pixel_auroc'])} "
+        f"(sup {_fmt(SUPERVISED_GOLD_MAPS['pixel_auroc'])})  "
+        f"CNR={_fmt(summary['cnr'])}  "
+        f"PG={_fmt(summary['pointing_game'])}"
+    )
+    return summary
 
 
 # ============================================================
