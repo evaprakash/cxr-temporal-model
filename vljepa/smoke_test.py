@@ -150,7 +150,7 @@ def _build_stub_model():
             self.image_encoder = _StubImage()
             self.text_encoder = _StubText()
             self.predictor = LlamaPredictor(
-                vis_dim=128, txt_dim=128, out_dim=128,
+                vis_dim=128, out_dim=128,
                 n_layers=2, smoke=True, gradient_checkpointing=False,
             )
             self.freeze_image_encoder = True
@@ -159,19 +159,14 @@ def _build_stub_model():
         def encode_images(self, prior, current):
             return self.image_encoder(current, prior)
 
-        def encode_text(self, texts):
+        def encode_targets(self, texts):
             return self.text_encoder.forward_contrastive(texts)
-
-        def predict_from_tokens(self, img_g, img_p, q_loc, q_mask, return_aux=False):
-            vis = torch.cat([img_g.unsqueeze(1), img_p], dim=1)
-            return self.predictor(vis, q_loc, q_mask, return_aux=return_aux)
 
         def forward(self, prior, current, query_texts, target_texts=None, return_aux=False):
             img_g, img_p = self.encode_images(prior, current)
-            q_g, q_loc, q_mask = self.encode_text(query_texts)
-            pred = self.predict_from_tokens(
-                img_g, img_p, q_loc, q_mask, return_aux=return_aux,
-            )
+            q_h, q_mask, q_ids = self.predictor.embed_query(query_texts, prior.device)
+            vis = torch.cat([img_g.unsqueeze(1), img_p], dim=1)
+            pred = self.predictor(vis, query_texts, return_aux=return_aux)
             aux = None
             if return_aux:
                 pred, aux = pred
@@ -179,12 +174,12 @@ def _build_stub_model():
                 "pred": pred,
                 "img_global": img_g,
                 "img_patches": img_p,
-                "query_global": q_g,
-                "query_local": q_loc,
+                "query_llama": q_h,
                 "query_mask": q_mask,
+                "query_ids": q_ids,
             }
             if target_texts is not None:
-                t_g, t_loc, t_mask = self.encode_text(target_texts)
+                t_g, t_loc, t_mask = self.encode_targets(target_texts)
                 out["target_global"] = t_g
                 out["target_local"] = t_loc
                 out["target_mask"] = t_mask
@@ -241,7 +236,8 @@ def main() -> int:
         _print(
             f"[smoke] predictor init={model.predictor.init_source} "
             f"hidden={model.predictor.hidden_size} "
-            f"layers={model.predictor.n_layers}"
+            f"layers={model.predictor.n_layers} "
+            f"tok={model.predictor.tokenizer_source}"
         )
 
     # ---- per-example forward (batch size 1) so shapes are readable ----
@@ -280,8 +276,8 @@ def main() -> int:
         for key in (
             "img_global",
             "img_patches",
-            "query_global",
-            "query_local",
+            "query_ids",
+            "query_llama",
             "query_mask",
             "pred",
             "target_global",

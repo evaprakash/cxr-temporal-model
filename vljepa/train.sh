@@ -15,8 +15,8 @@
 # Option-2 VL-JEPA (Chen et al. arXiv:2512.10942 predictor).
 #
 #   image  : BioViL-T pair encoder (prior + current)
-#   query  : "What is the progression of {finding}?"  (BioViL-T text; lowercase)
-#   target : "{Finding} is {class}."  pos=gold, neg=other 4
+#   query  : "What is the progression of {finding}?"  (Llama tok+embed)
+#   target : "{Finding} is {class}."  BioViL-T Y-encoder; pos=gold, neg=other 4
 #   pred   : last 8 Llama-3.2-1B layers, bidirectional
 #   loss   : 5-way InfoNCE
 #   grain  : one silver (pair, finding) per example
@@ -84,6 +84,8 @@ checks = [
     ('TARGET_TEMPLATE = "{finding} is {cls}."', prompts),
     ("class_infonce_loss", model),
     ("LlamaPredictor", model),
+    ("embed_query", model),
+    ("embed_tokens", model),
     ("eval_gold_setmatch", train),
     ("FREEZE_IMAGE_ENCODER = True", train),
     ("TEMPERATURE = 0.07", train),
@@ -102,7 +104,7 @@ if bad:
 print("[abort-check] OK  option-2 VL-JEPA")
 print("[abort-check] OK  query=What is the progression of {finding}?")
 print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
-print("[abort-check] OK  BioViL-T pair image + BioViL-T text + Llama predictor")
+print("[abort-check] OK  BioViL-T pair image + Llama query + BioViL-T Y-encoder")
 print("[abort-check] OK  gold set-match after every epoch")
 PY
 

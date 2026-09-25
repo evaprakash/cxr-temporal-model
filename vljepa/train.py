@@ -247,10 +247,9 @@ def main():
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(LOG_DIR, exist_ok=True)
         print("[vljepa] option 2")
-        print(f"[vljepa]   query  = {QUERY_TEMPLATE}")
-        print(f"[vljepa]   target = {TARGET_TEMPLATE}")
+        print(f"[vljepa]   query  = {QUERY_TEMPLATE}  (Llama tok+embed)")
+        print(f"[vljepa]   target = {TARGET_TEMPLATE}  (BioViL-T Y-encoder)")
         print(f"[vljepa]   image  = BioViL-T pair (prior+current)")
-        print(f"[vljepa]   text   = BioViL-T")
         print(f"[vljepa]   pred   = Llama last {N_LLAMA_LAYERS} layers")
         print(f"[vljepa]   loss   = 5-way InfoNCE τ={TEMPERATURE}")
         print(f"[vljepa]   freeze image={FREEZE_IMAGE_ENCODER} "
@@ -315,7 +314,8 @@ def main():
         n_all = sum(p.numel() for p in model.parameters())
         print(
             f"[vljepa] predictor init={model.predictor.init_source} "
-            f"hidden={model.predictor.hidden_size} layers={model.predictor.n_layers}"
+            f"hidden={model.predictor.hidden_size} layers={model.predictor.n_layers} "
+            f"tok={model.predictor.tokenizer_source}"
         )
         print(f"[vljepa] params trainable={n_train:,} / total={n_all:,}")
 

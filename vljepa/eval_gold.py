@@ -3,9 +3,9 @@
 For each gold ``(pair, finding)``:
 
   1. Encode prior+current with BioViL-T (pair).
-  2. Query = ``What is the progression of {finding}?`` (lowercase finding)
+  2. Query = ``What is the progression of {finding}?`` (Llama tok+embed)
   3. Predict Ŝ.
-  4. Score cosine(Ŝ, BioViL-T(``{Finding} is {class}.``)) for all 5 classes.
+  4. Score cosine(Ŝ, BioViL-T Y-encoder(``{Finding} is {class}.``)) for all 5 classes.
   5. Argmax / top-|GT| set-match (same tables as the JEPA trainer).
 """
 
