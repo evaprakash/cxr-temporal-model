@@ -15,7 +15,7 @@
 # Option-2 VL-JEPA (Chen et al. arXiv:2512.10942 predictor).
 #
 #   image  : BioViL-T pair encoder (prior + current)
-#   query  : "What is the progression of {Finding}?"  (BioViL-T text)
+#   query  : "What is the progression of {finding}?"  (BioViL-T text; lowercase)
 #   target : "{Finding} is {class}."  pos=gold, neg=other 4
 #   pred   : last 8 Llama-3.2-1B layers, bidirectional
 #   loss   : 5-way InfoNCE
@@ -100,7 +100,7 @@ if bad:
     print("\n".join(bad))
     sys.exit(1)
 print("[abort-check] OK  option-2 VL-JEPA")
-print("[abort-check] OK  query=What is the progression of {Finding}?")
+print("[abort-check] OK  query=What is the progression of {finding}?")
 print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
 print("[abort-check] OK  BioViL-T pair image + BioViL-T text + Llama predictor")
 print("[abort-check] OK  gold set-match after every epoch")

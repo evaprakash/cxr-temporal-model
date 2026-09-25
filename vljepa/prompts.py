@@ -1,14 +1,13 @@
 """Option-2 VL-JEPA text templates.
 
 Query (predictor condition)
-    ``What is the progression of {Finding}?``
+    ``What is the progression of {finding}?``
+    Finding stays lowercase (``pleural effusion``).
 
 Target / negatives (Y-encoder / InfoNCE)
     ``{Finding} is {class}.``
+    Finding is sentence-cased (``Pleural effusion is stable.``).
     Positive = gold class; negatives = the other four ``CLS_ORDER`` classes.
-
-Finding capitalization matches the existing JEPA templated condition
-(``Edema is worsening.``).
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ def cap_finding(finding: str) -> str:
 
 
 def query_text(finding: str) -> str:
-    return QUERY_TEMPLATE.format(finding=cap_finding(finding))
+    return QUERY_TEMPLATE.format(finding=str(finding).strip().lower())
 
 
 def target_text(finding: str, cls: str) -> str:
