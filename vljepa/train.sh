@@ -26,11 +26,13 @@
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
 #     git pull
 #     python -m vljepa.smoke_test          # CPU shape check
+#     python -m vljepa.download_llama      # Llama-3.2-1B → $SCRATCH_BASE/hf
 #     python -m vljepa.check_llama         # tok / weight fallback preview
 #     sbatch vljepa/train.sh
 #
 # Optional:
-#     export VLJEPA_LLAMA_LOCAL=/path/to/Llama-3.2-1B
+#     export VLJEPA_HF_HOME=$SCRATCH_BASE/hf
+#     export VLJEPA_LLAMA_LOCAL=$SCRATCH_BASE/hf/Llama-3.2-1B
 #     export HF_TOKEN=...                 # if loading from the hub
 #     export VLJEPA_CHECKPOINT_DIR=...
 # ============================================================
@@ -121,8 +123,19 @@ export CHEXTEMPORAL_DIR="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
 export JEPA_IMAGE_ROOTS_DIR="${JEPA_IMAGE_ROOTS_DIR:-$SCRATCH_BASE/all_data}"
 echo "[slurm] CHEXTEMPORAL_DIR     = $CHEXTEMPORAL_DIR"
 echo "[slurm] JEPA_IMAGE_ROOTS_DIR = $JEPA_IMAGE_ROOTS_DIR"
+export VLJEPA_HF_HOME="${VLJEPA_HF_HOME:-$SCRATCH_BASE/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$VLJEPA_HF_HOME/hub}"
+LLAMA_DEST="${VLJEPA_LLAMA_LOCAL:-$VLJEPA_HF_HOME/Llama-3.2-1B}"
+mkdir -p "$VLJEPA_HF_HOME/hub"
+if [ -f "$LLAMA_DEST/config.json" ]; then
+    export VLJEPA_LLAMA_LOCAL="$LLAMA_DEST"
+else
+    unset VLJEPA_LLAMA_LOCAL
+fi
+echo "[slurm] VLJEPA_HF_HOME       = $VLJEPA_HF_HOME"
 echo "[slurm] VLJEPA_LLAMA_NAME    = ${VLJEPA_LLAMA_NAME:-meta-llama/Llama-3.2-1B}"
-echo "[slurm] VLJEPA_LLAMA_LOCAL   = ${VLJEPA_LLAMA_LOCAL:-<hub>}"
+echo "[slurm] VLJEPA_LLAMA_LOCAL   = ${VLJEPA_LLAMA_LOCAL:-<hub cache under VLJEPA_HF_HOME>}"
+echo "[slurm] Llama dest           = $LLAMA_DEST"
 for d in \
     "$JEPA_IMAGE_ROOTS_DIR/mimic" \
     "$JEPA_IMAGE_ROOTS_DIR/chexpert/train" \

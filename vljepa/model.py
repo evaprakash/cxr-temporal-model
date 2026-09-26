@@ -37,6 +37,9 @@ N_LLAMA_LAYERS_DEFAULT = 8
 MAX_QUERY_LEN = 64
 MAX_QUERY_LEN_SMOKE = 32
 N_CLS = len(CLS_ORDER)
+# Login HF cache lives on the quota-full /scratch/m000081 volume.
+# Llama weights go on pm06 instead (override with VLJEPA_HF_HOME).
+_DEFAULT_SCRATCH = "/scratch/m000081-pm06/eprakash"
 
 # Llama-3.2-1B config (used when hub weights are unavailable).
 _LLAMA32_1B = dict(
@@ -58,6 +61,39 @@ _LLAMA32_1B = dict(
 )
 
 
+def llama_hf_home() -> str:
+    return os.environ.get("VLJEPA_HF_HOME") or os.path.join(
+        os.environ.get("SCRATCH_BASE", _DEFAULT_SCRATCH), "hf"
+    )
+
+
+def llama_hub_cache() -> str:
+    path = os.path.join(llama_hf_home(), "hub")
+    os.makedirs(path, exist_ok=True)
+    # huggingface_hub otherwise follows HF_HOME on the quota-full volume.
+    os.environ["HF_HUB_CACHE"] = path
+    return path
+
+
+def default_llama_dir() -> str:
+    return os.path.join(llama_hf_home(), "Llama-3.2-1B")
+
+
+def is_llama_dir(path: Optional[str]) -> bool:
+    return bool(path) and os.path.isfile(os.path.join(path, "config.json"))
+
+
+def resolve_llama_local() -> Optional[str]:
+    """Use an on-disk snapshot if present; never point at the full /scratch/m000081 cache."""
+    explicit = os.environ.get("VLJEPA_LLAMA_LOCAL") or None
+    if is_llama_dir(explicit):
+        return explicit
+    fallback = default_llama_dir()
+    if is_llama_dir(fallback):
+        return fallback
+    return None
+
+
 def _raw_llama_config_json(src: str, local_files_only: bool) -> dict:
     """Load config.json without Transformers validating ``rope_scaling``."""
     import json
@@ -70,7 +106,10 @@ def _raw_llama_config_json(src: str, local_files_only: bool) -> dict:
     from huggingface_hub import hf_hub_download
 
     path = hf_hub_download(
-        src, "config.json", local_files_only=local_files_only
+        src,
+        "config.json",
+        local_files_only=local_files_only,
+        cache_dir=llama_hub_cache(),
     )
     with open(path) as f:
         return json.load(f)
@@ -116,6 +155,7 @@ def _llama_weight_dir(src: str, local_files_only: bool) -> str:
     return snapshot_download(
         src,
         local_files_only=local_files_only,
+        cache_dir=llama_hub_cache(),
         allow_patterns=["*.safetensors", "*.bin", "config.json", "*.index.json"],
     )
 
@@ -159,7 +199,10 @@ def load_llama_model(
 
     if torch_dtype is None:
         torch_dtype = torch.float32
-    kwargs: Dict[str, Any] = {"torch_dtype": torch_dtype}
+    kwargs: Dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "cache_dir": llama_hub_cache(),
+    }
     if local_files_only:
         kwargs["local_files_only"] = True
 
@@ -340,7 +383,10 @@ class LlamaPredictor(nn.Module):
             if not src:
                 continue
             try:
-                tok = AutoTokenizer.from_pretrained(src, use_fast=True)
+                tok_kw: Dict[str, Any] = {"use_fast": True}
+                if not os.path.isdir(src):
+                    tok_kw["cache_dir"] = llama_hub_cache()
+                tok = AutoTokenizer.from_pretrained(src, **tok_kw)
                 if tok.pad_token is None:
                     tok.pad_token = tok.eos_token
                 self.tokenizer = tok

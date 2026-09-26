@@ -44,7 +44,7 @@ from losses_jepa import patch_token_feature_stats
 
 from .dataset import VLJEPAFindingDataset, flatten_target_texts, vljepa_collate_fn
 from .eval_gold import eval_gold_setmatch
-from .model import VLJEPA, class_infonce_loss
+from .model import VLJEPA, class_infonce_loss, llama_hub_cache, resolve_llama_local
 from .prompts import QUERY_TEMPLATE, TARGET_TEMPLATE
 
 N_CLS = len(CLS_ORDER)
@@ -69,7 +69,8 @@ FREEZE_IMAGE_ENCODER = True
 FREEZE_TEXT_ENCODER = False
 N_LLAMA_LAYERS = 8
 LLAMA_NAME = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
-LLAMA_LOCAL = os.environ.get("VLJEPA_LLAMA_LOCAL") or None
+llama_hub_cache()
+LLAMA_LOCAL = resolve_llama_local()
 IMAGE_MODE = "biovilt"
 
 # ============================================================
