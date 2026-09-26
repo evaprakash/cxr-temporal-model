@@ -40,6 +40,7 @@ from progression_classify import (
 )
 from progression_phrases import CLS_ORDER
 from dataset_combined_jepa import DEFAULT_FINDINGS
+from losses_jepa import patch_token_feature_stats
 
 from .dataset import VLJEPAFindingDataset, flatten_target_texts, vljepa_collate_fn
 from .eval_gold import eval_gold_setmatch
@@ -96,6 +97,8 @@ LOG_DIR = os.environ.get(
     os.path.join(_ROOT, "logs_vljepa"),
 )
 CSV_LOG = os.path.join(LOG_DIR, "val_metrics_vljepa.csv")
+FEAT_CSV_LOG = os.path.join(LOG_DIR, "feat_std_vljepa.csv")
+FEAT_LOG_EVERY = int(os.environ.get("FEAT_LOG_EVERY", "20"))
 
 
 def seed_dataloader_worker(worker_id):
@@ -121,6 +124,37 @@ def ddp_reduce(value, device, world_size):
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     tensor /= world_size
     return float(tensor.item())
+
+
+def target_class_offdiag(target_global: torch.Tensor, bsz: int, n_cls: int = N_CLS) -> float:
+    """Mean off-diagonal cosine among the 5 class-phrase embeds (template collapse)."""
+    import torch.nn.functional as F
+
+    t = target_global.detach().float()
+    if t.dim() == 2:
+        t = t.view(bsz, n_cls, -1)
+    t = F.normalize(t, dim=-1)
+    sim = torch.bmm(t, t.transpose(1, 2))
+    off = sim.sum(dim=(1, 2)) - sim.diagonal(dim1=-2, dim2=-1).sum(-1)
+    return float((off / float(n_cls * (n_cls - 1))).mean().item())
+
+
+def feat_stats_from_out(out: dict, bsz: int) -> dict:
+    img = patch_token_feature_stats(out["img_patches"])
+    q = out.get("query_llama")
+    q_stats = (
+        patch_token_feature_stats(q)
+        if q is not None and q.dim() == 3
+        else {"std_over_patches": out["pred"].new_zeros(()),
+              "mean_offdiag_cos": out["pred"].new_zeros(())}
+    )
+    return {
+        "img_patch_std": float(img["std_over_patches"]),
+        "img_patch_offdiag": float(img["mean_offdiag_cos"]),
+        "query_tok_std": float(q_stats["std_over_patches"]),
+        "target_offdiag": target_class_offdiag(out["target_global"], bsz),
+        "pred_batch_std": float(out["pred"].detach().float().std(unbiased=False).item()),
+    }
 
 
 def cui_class_weights(counts: torch.Tensor, beta: float) -> torch.Tensor:
@@ -168,6 +202,8 @@ def run_val(raw_model, loader, device, class_weights, desc):
     total = 0.0
     correct = 0
     n = 0
+    feat_sum = None
+    n_feat = 0
     for batch in tqdm(loader, desc=desc, disable=device.type == "cpu" and False):
         prior = batch["prior_image"].to(device, non_blocking=True)
         current = batch["current_image"].to(device, non_blocking=True)
@@ -184,18 +220,26 @@ def run_val(raw_model, loader, device, class_weights, desc):
         total += float(loss.item()) * labels.shape[0]
         correct += int((pred_cls == labels).sum().item())
         n += int(labels.shape[0])
-    return total / max(n, 1), correct / max(n, 1), n
+        stats = feat_stats_from_out(out, labels.shape[0])
+        if feat_sum is None:
+            feat_sum = {k: 0.0 for k in stats}
+        for k, v in stats.items():
+            feat_sum[k] += v
+        n_feat += 1
+    feat_avg = {k: v / max(n_feat, 1) for k, v in (feat_sum or {}).items()}
+    return total / max(n, 1), correct / max(n, 1), n, feat_avg
 
 
 def train_one_epoch(
     model, raw_model, loader, optimizer, scheduler, device, class_weights, epoch,
-    rank,
+    rank, global_step=0, feat_csv=None,
 ):
     model.train()
     running = 0.0
     correct = 0
     n = 0
     pbar = tqdm(loader, desc=f"vljepa train ep{epoch}", disable=rank != 0)
+    last_stats = {}
     for batch in pbar:
         prior = batch["prior_image"].to(device, non_blocking=True)
         current = batch["current_image"].to(device, non_blocking=True)
@@ -218,12 +262,25 @@ def train_one_epoch(
         running += float(loss.item()) * labels.shape[0]
         correct += int((pred_cls == labels).sum().item())
         n += int(labels.shape[0])
+        global_step += 1
         if rank == 0:
+            last_stats = feat_stats_from_out(out, labels.shape[0])
+            if feat_csv is not None and global_step % FEAT_LOG_EVERY == 0:
+                feat_csv.write(
+                    f"{global_step},{epoch},"
+                    f"{last_stats['img_patch_std']:.6f},"
+                    f"{last_stats['img_patch_offdiag']:.6f},"
+                    f"{last_stats['query_tok_std']:.6f},"
+                    f"{last_stats['target_offdiag']:.6f},"
+                    f"{last_stats['pred_batch_std']:.6f}\n"
+                )
+                feat_csv.flush()
             pbar.set_postfix(
                 loss=f"{running / max(n, 1):.4f}",
                 acc=f"{correct / max(n, 1):.3f}",
+                tgt_off=f"{last_stats.get('target_offdiag', 0):.3f}",
             )
-    return running / max(n, 1), correct / max(n, 1)
+    return running / max(n, 1), correct / max(n, 1), global_step
 
 
 def parse_args():
@@ -375,17 +432,31 @@ def main():
         with open(CSV_LOG, "w") as f:
             f.write(
                 "epoch,train_loss,train_acc,val_loss,val_acc,"
+                "val_img_patch_std,val_target_offdiag,val_pred_batch_std,"
                 "gold_combined,gold_single,gold_multi\n"
             )
+    feat_f = None
+    if rank == 0:
+        new_feat = not os.path.isfile(FEAT_CSV_LOG)
+        feat_f = open(FEAT_CSV_LOG, "a")
+        if new_feat:
+            feat_f.write(
+                "step,epoch,img_patch_std,img_patch_offdiag,"
+                "query_tok_std,target_offdiag,pred_batch_std\n"
+            )
+        print(f"[vljepa] feat-std CSV: {FEAT_CSV_LOG} (every {FEAT_LOG_EVERY} steps)")
+        print("[vljepa] gold set-match after every epoch (rank 0)")
 
+    global_step = 0
     for epoch in range(start_epoch, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc, global_step = train_one_epoch(
             model, raw_model, train_loader, optimizer, scheduler,
             device, class_weights, epoch, rank,
+            global_step=global_step, feat_csv=feat_f,
         )
-        val_loss, val_acc, val_n = run_val(
+        val_loss, val_acc, val_n, val_feat = run_val(
             raw_model, val_loader, device, class_weights, f"vljepa val ep{epoch}",
         )
         train_loss = ddp_reduce(train_loss, device, world_size)
@@ -397,7 +468,9 @@ def main():
             print(
                 f"[vljepa] epoch {epoch}: "
                 f"train loss={train_loss:.4f} acc={train_acc:.3f} | "
-                f"val loss={val_loss:.4f} acc={val_acc:.3f} (n={val_n})"
+                f"val loss={val_loss:.4f} acc={val_acc:.3f} (n={val_n}) | "
+                f"img_std={val_feat.get('img_patch_std', 0):.4f} "
+                f"tgt_offdiag={val_feat.get('target_offdiag', 0):.4f}"
             )
             ckpt = {
                 "epoch": epoch,
@@ -440,12 +513,17 @@ def main():
                 f.write(
                     f"{epoch},{train_loss:.6f},{train_acc:.6f},"
                     f"{val_loss:.6f},{val_acc:.6f},"
+                    f"{val_feat.get('img_patch_std', float('nan')):.6f},"
+                    f"{val_feat.get('target_offdiag', float('nan')):.6f},"
+                    f"{val_feat.get('pred_batch_std', float('nan')):.6f},"
                     f"{gold_combined},{gold_single},{gold_multi}\n"
                 )
 
         if world_size > 1:
             dist.barrier()
 
+    if feat_f is not None:
+        feat_f.close()
     if world_size > 1:
         dist.destroy_process_group()
 

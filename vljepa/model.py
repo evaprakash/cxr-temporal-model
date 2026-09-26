@@ -184,7 +184,8 @@ class LlamaPredictor(nn.Module):
         from transformers import AutoTokenizer
 
         tried = []
-        for src in (llama_local, llama_name):
+        extra = os.environ.get("VLJEPA_TOKENIZER") or None
+        for src in (llama_local, extra, llama_name):
             if not src:
                 continue
             try:

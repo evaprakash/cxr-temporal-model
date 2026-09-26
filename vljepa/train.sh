@@ -26,6 +26,7 @@
 #     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
 #     git pull
 #     python -m vljepa.smoke_test          # CPU shape check
+#     python -m vljepa.check_llama         # tok / weight fallback preview
 #     sbatch vljepa/train.sh
 #
 # Optional:
