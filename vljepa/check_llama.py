@@ -52,16 +52,13 @@ def main() -> int:
     print()
     wsrc = local or name
     try:
-        from transformers import LlamaModel
+        from .model import load_llama_model
 
-        kwargs = {
-            "attn_implementation": "eager",
-            "torch_dtype": __import__("torch").float32,
-        }
-        if local:
-            kwargs["local_files_only"] = True
-        LlamaModel.from_pretrained(wsrc, **kwargs)
-        print(f"WEIGHTS OK     {wsrc}")
+        llama = load_llama_model(wsrc, local_files_only=bool(local))
+        print(
+            f"WEIGHTS OK     {wsrc}  "
+            f"hidden={llama.config.hidden_size} layers={llama.config.num_hidden_layers}"
+        )
         print("TRAIN WOULD LOG  predictor init=pretrained:...:last8")
     except Exception as exc:
         print(f"WEIGHTS FAIL    {wsrc}: {type(exc).__name__}: {exc}")

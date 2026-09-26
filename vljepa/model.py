@@ -58,6 +58,152 @@ _LLAMA32_1B = dict(
 )
 
 
+def _raw_llama_config_json(src: str, local_files_only: bool) -> dict:
+    """Load config.json without Transformers validating ``rope_scaling``."""
+    import json
+
+    if os.path.isdir(src):
+        path = os.path.join(src, "config.json")
+        if os.path.isfile(path):
+            with open(path) as f:
+                return json.load(f)
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(
+        src, "config.json", local_files_only=local_files_only
+    )
+    with open(path) as f:
+        return json.load(f)
+
+
+def _relax_llama_rope_scaling(raw: dict) -> dict:
+    """Old Transformers only accept ``{type, factor}``. Llama 3.2 uses ``rope_type``.
+
+    We are well under 8k tokens (197 patches + short query), so swapping
+    llama3 RoPE scaling for linear/none does not change this model.
+    """
+    raw = dict(raw)
+    rs = raw.get("rope_scaling")
+    if isinstance(rs, dict) and "type" not in rs:
+        factor = float(rs.get("factor", 1.0))
+        raw["rope_scaling"] = {"type": "linear", "factor": factor}
+    return raw
+
+
+def _llama_config_from_raw(raw: dict):
+    from transformers import LlamaConfig
+
+    raw = _relax_llama_rope_scaling(raw)
+    try:
+        return LlamaConfig.from_dict(raw)
+    except (TypeError, ValueError):
+        pass
+    allowed = set(inspect.signature(LlamaConfig.__init__).parameters) - {"self"}
+    slim = {k: v for k, v in raw.items() if k in allowed}
+    slim = _relax_llama_rope_scaling(slim)
+    try:
+        return LlamaConfig(**slim)
+    except ValueError:
+        slim["rope_scaling"] = None
+        return LlamaConfig(**slim)
+
+
+def _llama_weight_dir(src: str, local_files_only: bool) -> str:
+    if os.path.isdir(src):
+        return src
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(
+        src,
+        local_files_only=local_files_only,
+        allow_patterns=["*.safetensors", "*.bin", "config.json", "*.index.json"],
+    )
+
+
+def _state_dict_from_dir(root: str) -> dict:
+    import glob
+
+    tensors = [
+        p
+        for p in glob.glob(os.path.join(root, "*.safetensors"))
+        if "index" not in os.path.basename(p)
+    ]
+    if tensors:
+        from safetensors.torch import load_file
+
+        sd: dict = {}
+        for path in tensors:
+            sd.update(load_file(path))
+    else:
+        sd = {}
+        for path in glob.glob(os.path.join(root, "pytorch_model*.bin")):
+            sd.update(torch.load(path, map_location="cpu"))
+    if not sd:
+        raise FileNotFoundError(f"no Llama weights under {root}")
+    if any(k.startswith("model.") for k in sd):
+        sd = {
+            (k[6:] if k.startswith("model.") else k): v
+            for k, v in sd.items()
+            if not k.startswith("lm_head")
+        }
+    return sd
+
+
+def load_llama_model(
+    src: str,
+    local_files_only: bool = False,
+    torch_dtype=None,
+):
+    """Load Llama-3.2 weights on older Transformers (RoPE-config mismatch)."""
+    from transformers import LlamaModel
+
+    if torch_dtype is None:
+        torch_dtype = torch.float32
+    kwargs: Dict[str, Any] = {"torch_dtype": torch_dtype}
+    if local_files_only:
+        kwargs["local_files_only"] = True
+
+    attempts = (
+        {**kwargs, "attn_implementation": "eager"},
+        dict(kwargs),
+    )
+    last_err: Optional[Exception] = None
+    for kw in attempts:
+        try:
+            return LlamaModel.from_pretrained(src, **kw)
+        except TypeError:
+            continue
+        except ValueError as exc:
+            last_err = exc
+            if "rope_scaling" not in str(exc):
+                raise
+            break
+        except Exception as exc:
+            last_err = exc
+            break
+
+    cfg = _llama_config_from_raw(_raw_llama_config_json(src, local_files_only))
+    cfg._attn_implementation = "eager"
+    try:
+        llama = LlamaModel.from_pretrained(src, config=cfg, **kwargs)
+    except Exception as exc:
+        last_err = exc
+        root = _llama_weight_dir(src, local_files_only)
+        llama = LlamaModel(cfg)
+        missing, unexpected = llama.load_state_dict(
+            _state_dict_from_dir(root), strict=False
+        )
+        print(
+            f"[vljepa] Llama state_dict fallback from {root!r} "
+            f"(missing={len(missing)} unexpected={len(unexpected)})"
+        )
+    print(
+        f"[vljepa] loaded Llama weights from {src!r} with relaxed rope_scaling "
+        f"(old Transformers). Last error was: {last_err}"
+    )
+    return llama
+
+
 def _llama_config(smoke: bool):
     from transformers import LlamaConfig
 
@@ -237,14 +383,11 @@ class LlamaPredictor(nn.Module):
         if not smoke:
             load_src = llama_local or llama_name
             try:
-                kwargs: Dict[str, Any] = {
-                    "attn_implementation": "eager",
-                    "torch_dtype": torch.float32,
-                    "use_safetensors": True,
-                }
-                if llama_local:
-                    kwargs["local_files_only"] = True
-                llama = LlamaModel.from_pretrained(load_src, **kwargs)
+                llama = load_llama_model(
+                    load_src,
+                    local_files_only=bool(llama_local),
+                    torch_dtype=torch.float32,
+                )
                 all_layers = list(llama.layers)
                 take = min(n_layers, len(all_layers))
                 layers = nn.ModuleList(all_layers[-take:])
