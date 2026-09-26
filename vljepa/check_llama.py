@@ -18,15 +18,18 @@ def main() -> int:
     local = os.environ.get("VLJEPA_LLAMA_LOCAL") or None
     extra = os.environ.get("VLJEPA_TOKENIZER") or None
     name = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
-    print("VLJEPA_LLAMA_LOCAL =", local)
-    print("VLJEPA_TOKENIZER   =", extra)
-    print("VLJEPA_LLAMA_NAME  =", name)
+    bert = os.environ.get("VLJEPA_TOKENIZER_FALLBACK", "bert-base-uncased")
+    print("VLJEPA_LLAMA_LOCAL         =", local)
+    print("VLJEPA_TOKENIZER           =", extra)
+    print("VLJEPA_LLAMA_NAME          =", name)
+    print("VLJEPA_TOKENIZER_FALLBACK  =", bert)
     print()
 
     tok_ok = False
+    tok_src = None
     from transformers import AutoTokenizer
 
-    for src in (local, extra, name):
+    for src in (local, extra, name, bert):
         if not src:
             continue
         try:
@@ -34,12 +37,15 @@ def main() -> int:
             print(f"TOKENIZER OK  {src}  vocab={tok.vocab_size}")
             print("  sample:", tok("What is the progression of pleural effusion?"))
             tok_ok = True
+            tok_src = src
             break
         except Exception as exc:
             print(f"TOKENIZER FAIL {src}: {type(exc).__name__}: {exc}")
 
     if not tok_ok:
         print("TRAIN WOULD LOG  tok=smoke-charhash-fallback")
+    elif tok_src == bert and tok_src not in (local, extra, name):
+        print(f"TRAIN WOULD LOG  tok=pretrained:{bert}  (BERT word pieces, not a QA encoder)")
     else:
         print("TRAIN WOULD LOG  tok=pretrained:...")
 

@@ -185,7 +185,12 @@ class LlamaPredictor(nn.Module):
 
         tried = []
         extra = os.environ.get("VLJEPA_TOKENIZER") or None
-        for src in (llama_local, extra, llama_name):
+        # Open tokenizer if Llama is gated. Word-piece ids only — query
+        # still goes through random Llama embed_tokens, not BERT.
+        bert_fallback = os.environ.get(
+            "VLJEPA_TOKENIZER_FALLBACK", "bert-base-uncased"
+        )
+        for src in (llama_local, extra, llama_name, bert_fallback):
             if not src:
                 continue
             try:
@@ -194,13 +199,19 @@ class LlamaPredictor(nn.Module):
                     tok.pad_token = tok.eos_token
                 self.tokenizer = tok
                 self.tokenizer_source = f"pretrained:{src}"
+                if src == bert_fallback and src not in (llama_local, extra, llama_name):
+                    print(
+                        f"[vljepa] Llama tokenizer unavailable; "
+                        f"using open tokenizer {src!r} (ids → random Llama embeds). "
+                        f"Not a BERT query encoder."
+                    )
                 return
             except Exception as exc:
                 tried.append(f"{src}: {type(exc).__name__}: {exc}")
         print(
-            "[vljepa] Llama tokenizer not loaded "
+            "[vljepa] no tokenizer loaded "
             f"({'; '.join(tried)}). Using smoke char-hash tokenizer. "
-            "Set HF_TOKEN / VLJEPA_LLAMA_LOCAL for the paper query path."
+            "Set HF_TOKEN / VLJEPA_LLAMA_LOCAL / VLJEPA_TOKENIZER."
         )
         self.tokenizer = _SmokeTokenizer(vocab_size=32, max_length=self.max_query_len)
         self.tokenizer_source = "smoke-charhash-fallback"
