@@ -32,6 +32,8 @@ from progression_phrases import CLS_ORDER
 
 N_SMOKE = 5
 IMAGE_HW = 448
+# Scan this many silver rows to find N_SMOKE pairs whose CXRs exist on disk.
+_SILVER_SCAN_CAP = 4000
 
 _FALLBACK_SILVER = [
     ("edema", "worsening"),
@@ -52,11 +54,54 @@ def _shape(x) -> str:
     return repr(type(x))
 
 
+def _image_roots():
+    """Same silver image roots as ``vljepa.train``."""
+    here = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    base = os.environ.get("JEPA_IMAGE_ROOTS_DIR", os.path.join(here, "all_data"))
+    return {
+        "mimic": os.path.join(base, "mimic"),
+        "chexpert": os.path.join(base, "chexpert", "train"),
+        "rexgradient": os.path.join(base, "rexgradient", "deid_png"),
+    }
+
+
+def _try_load_cxr_pair(dataset, prev_rel, curr_rel, roots):
+    """Return (prior_t, current_t, prev_path, curr_path) or None."""
+    from PIL import Image
+
+    from dataset_combined import BASE_TRANSFORM, apply_augmentation
+    from dataset_combined_jepa import _resolve_image_path
+
+    if not dataset or dataset not in roots:
+        return None
+    if prev_rel is None or curr_rel is None:
+        return None
+    try:
+        prev_p = _resolve_image_path(str(dataset), str(prev_rel), roots)
+        curr_p = _resolve_image_path(str(dataset), str(curr_rel), roots)
+    except Exception:
+        return None
+    if not prev_p.is_file() or not curr_p.is_file():
+        return None
+    try:
+        prior = apply_augmentation(
+            BASE_TRANSFORM(Image.open(prev_p).convert("RGB")), None,
+        )
+        current = apply_augmentation(
+            BASE_TRANSFORM(Image.open(curr_p).convert("RGB")), None,
+        )
+    except Exception:
+        return None
+    return prior, current, str(prev_p), str(curr_p)
+
+
 def _load_silver_rows(n: int):
     from dataset_combined_jepa import DEFAULT_FINDINGS
     from progression_phrases import SILVER_TO_CLS
 
     path = os.environ.get("VLJEPA_SMOKE_FINDINGS", DEFAULT_FINDINGS)
+    roots = _image_roots()
+    _print(f"[smoke] image roots: {roots}")
     if not os.path.isfile(path):
         _print(f"[smoke] silver parquet not found ({path}); using fallback labels")
         return [
@@ -68,33 +113,57 @@ def _load_silver_rows(n: int):
 
         df = pd.read_parquet(path)
         rows = []
+        n_tried = 0
+        n_missing_img = 0
         for _, r in df.iterrows():
+            if n_tried >= _SILVER_SCAN_CAP:
+                break
             finding = str(r.get("finding", "")).strip().lower()
             raw = str(r.get("progression", "")).strip()
             cls = SILVER_TO_CLS.get(raw, SILVER_TO_CLS.get(raw.title(), None))
             if not finding or cls not in CLS_ORDER:
                 continue
-            rows.append(
-                {
-                    "finding": finding,
-                    "cls": cls,
-                    "source": "silver",
-                    "dataset": str(r.get("dataset", "")),
-                    "parent_image_prev": r.get("parent_image_prev"),
-                    "parent_image_curr": r.get("parent_image_curr"),
-                }
+            n_tried += 1
+            loaded = _try_load_cxr_pair(
+                r.get("dataset"),
+                r.get("parent_image_prev"),
+                r.get("parent_image_curr"),
+                roots,
             )
+            row = {
+                "finding": finding,
+                "cls": cls,
+                "source": "silver",
+                "dataset": str(r.get("dataset", "")),
+                "parent_image_prev": r.get("parent_image_prev"),
+                "parent_image_curr": r.get("parent_image_curr"),
+            }
+            if loaded is None:
+                n_missing_img += 1
+                continue
+            prior, current, prev_p, curr_p = loaded
+            row["prior_image"] = prior
+            row["current_image"] = current
+            row["prior_path"] = prev_p
+            row["current_path"] = curr_p
+            row["image_source"] = "silver-cxr"
+            rows.append(row)
             if len(rows) >= n:
                 break
+        _print(
+            f"[smoke] silver parquet={path}  scanned={n_tried}  "
+            f"missing/unreadable images={n_missing_img}  "
+            f"loaded CXRs={len(rows)}"
+        )
         if len(rows) < n:
             _print(
-                f"[smoke] only {len(rows)} usable silver rows; padding fallback"
+                f"[smoke] only {len(rows)} pairs with real CXRs; "
+                f"padding {n - len(rows)} with random tensors"
             )
             for f, c in _FALLBACK_SILVER:
                 if len(rows) >= n:
                     break
                 rows.append({"finding": f, "cls": c, "source": "fallback"})
-        _print(f"[smoke] loaded {len(rows)} examples from {path}")
         return rows[:n]
     except Exception as exc:
         _print(f"[smoke] failed to read silver ({exc}); using fallback")
@@ -207,6 +276,14 @@ def main() -> int:
         finding = row["finding"]
         cls = row["cls"]
         cls_idx = CLS_ORDER.index(cls)
+        prior = row.get("prior_image")
+        current = row.get("current_image")
+        if prior is None or current is None:
+            prior = torch.randn(3, IMAGE_HW, IMAGE_HW)
+            current = torch.randn(3, IMAGE_HW, IMAGE_HW)
+            image_source = "randn"
+        else:
+            image_source = row.get("image_source", "silver-cxr")
         examples.append(
             {
                 "idx": i,
@@ -214,10 +291,13 @@ def main() -> int:
                 "cls": cls,
                 "cls_idx": cls_idx,
                 "source": row.get("source", "?"),
+                "image_source": image_source,
+                "prior_path": row.get("prior_path", ""),
+                "current_path": row.get("current_path", ""),
                 "query_text": query_text(finding),
                 "target_texts": class_target_texts(finding),
-                "prior_image": torch.randn(3, IMAGE_HW, IMAGE_HW),
-                "current_image": torch.randn(3, IMAGE_HW, IMAGE_HW),
+                "prior_image": prior,
+                "current_image": current,
             }
         )
 
@@ -249,6 +329,10 @@ def main() -> int:
         _print(f"  finding     : {ex['finding']}")
         _print(f"  gold class  : {ex['cls']}  (idx={ex['cls_idx']})")
         _print(f"  query       : {ex['query_text']}")
+        _print(f"  image_source: {ex['image_source']}")
+        if ex.get("prior_path"):
+            _print(f"  prior_path  : {ex['prior_path']}")
+            _print(f"  current_path: {ex['current_path']}")
         _print("  targets     :")
         for c_i, t in enumerate(ex["target_texts"]):
             mark = "  <-- POS" if c_i == ex["cls_idx"] else "  (neg)"
