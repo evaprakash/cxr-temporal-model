@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --time=4:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=/scratch/m000081-pm06/eprakash/logs/vljepa_opt2_%j.out
 #SBATCH --error=/scratch/m000081-pm06/eprakash/logs/vljepa_opt2_%j.err
 
@@ -42,6 +42,16 @@ module load nvhpc
 
 source /users/eprakash/miniconda3/etc/profile.d/conda.sh
 conda activate roentgen
+
+# nvhpc puts nvc on PATH. Llama RoPE hits a Triton compile that passes
+# gcc-only -Wno-psabi; nvc then aborts the first train step.
+if [ -x /usr/bin/gcc ]; then
+    export CC=/usr/bin/gcc
+    export CXX=/usr/bin/g++
+    export TRITON_CC=/usr/bin/gcc
+fi
+export CFLAGS="${CFLAGS:-}"
+export CXXFLAGS="${CXXFLAGS:-}"
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export NCCL_DEBUG=WARN
