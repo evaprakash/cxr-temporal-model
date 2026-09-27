@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --time=2:00:00
+#SBATCH --time=4:00:00
 #SBATCH --output=/scratch/m000081-pm06/eprakash/logs/vljepa_opt2_%j.out
 #SBATCH --error=/scratch/m000081-pm06/eprakash/logs/vljepa_opt2_%j.err
 
