@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=vljepa_opt2
+#SBATCH --job-name=vljepa_sgneg
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/vljepa_opt2_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/vljepa_opt2_%j.err
+#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/vljepa_sgneg_%j.out
+#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/vljepa_sgneg_%j.err
 
 # ============================================================
 # Option-2 VL-JEPA (Chen et al. arXiv:2512.10942 predictor).
@@ -18,7 +18,8 @@
 #   query  : "What is the progression of {finding}?"  (Llama tok+embed)
 #   target : "{Finding} is {class}."  BioViL-T Y-encoder; pos=gold, neg=other 4
 #   pred   : last 8 Llama-3.2-1B layers, bidirectional
-#   loss   : 5-way InfoNCE
+#   loss   : 5-way InfoNCE; stop-grad on the four wrong phrases
+#   ckpt   : checkpoints_vljepa_sgneg/  (fresh; does not resume ep5)
 #   grain  : one silver (pair, finding) per example
 #   eval   : CheXTemporal gold set-match after every epoch
 #
@@ -96,6 +97,9 @@ checks = [
     ('QUERY_TEMPLATE = "What is the progression of {finding}?"', prompts),
     ('TARGET_TEMPLATE = "{finding} is {cls}."', prompts),
     ("class_infonce_loss", model),
+    ("stopgrad_negatives", model),
+    ("STOPGRAD_NEG_PHRASES = True", train),
+    ("checkpoints_vljepa_sgneg", train),
     ("LlamaPredictor", model),
     ("embed_query", model),
     ("embed_tokens", model),
@@ -117,6 +121,7 @@ if bad:
 print("[abort-check] OK  option-2 VL-JEPA")
 print("[abort-check] OK  query=What is the progression of {finding}?")
 print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
+print("[abort-check] OK  stop-grad wrong phrases; fresh ckpt dir sgneg")
 print("[abort-check] OK  BioViL-T pair image + Llama query + BioViL-T Y-encoder")
 print("[abort-check] OK  gold set-match after every epoch")
 PY

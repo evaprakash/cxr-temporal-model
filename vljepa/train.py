@@ -2,6 +2,7 @@
 
 Loss is 5-way InfoNCE: predicted Ŝ vs BioViL-T embeddings of
 ``{Finding} is {class}.`` (gold = positive, other four = negatives).
+Wrong-phrase Y embeddings are stop-grad. Fresh run (not resume ep5).
 Rank-0 runs CheXTemporal gold set-match after every epoch.
 
     torchrun --nproc_per_node=4 -m vljepa.train
@@ -67,6 +68,7 @@ SAVE_EVERY_N_EPOCHS = 1
 
 FREEZE_IMAGE_ENCODER = True
 FREEZE_TEXT_ENCODER = False
+STOPGRAD_NEG_PHRASES = True
 N_LLAMA_LAYERS = 8
 LLAMA_NAME = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
 llama_hub_cache()
@@ -91,11 +93,11 @@ IMAGE_ROOTS = {
 
 CHECKPOINT_DIR = os.environ.get(
     "VLJEPA_CHECKPOINT_DIR",
-    os.path.join(_ROOT, "checkpoints_vljepa"),
+    os.path.join(_ROOT, "checkpoints_vljepa_sgneg"),
 )
 LOG_DIR = os.environ.get(
     "VLJEPA_LOG_DIR",
-    os.path.join(_ROOT, "logs_vljepa"),
+    os.path.join(_ROOT, "logs_vljepa_sgneg"),
 )
 CSV_LOG = os.path.join(LOG_DIR, "val_metrics_vljepa.csv")
 FEAT_CSV_LOG = os.path.join(LOG_DIR, "feat_std_vljepa.csv")
@@ -216,6 +218,7 @@ def run_val(raw_model, loader, device, class_weights, desc):
         loss, logits = class_infonce_loss(
             out["pred"], out["target_global"], labels,
             temperature=TEMPERATURE, class_weights=class_weights,
+            stopgrad_negatives=STOPGRAD_NEG_PHRASES,
         )
         pred_cls = logits.argmax(dim=-1)
         total += float(loss.item()) * labels.shape[0]
@@ -252,6 +255,7 @@ def train_one_epoch(
         loss, logits = class_infonce_loss(
             out["pred"], out["target_global"], labels,
             temperature=TEMPERATURE, class_weights=class_weights,
+            stopgrad_negatives=STOPGRAD_NEG_PHRASES,
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -309,7 +313,10 @@ def main():
         print(f"[vljepa]   target = {TARGET_TEMPLATE}  (BioViL-T Y-encoder)")
         print(f"[vljepa]   image  = BioViL-T pair (prior+current)")
         print(f"[vljepa]   pred   = Llama last {N_LLAMA_LAYERS} layers")
-        print(f"[vljepa]   loss   = 5-way InfoNCE τ={TEMPERATURE}")
+        print(
+            f"[vljepa]   loss   = 5-way InfoNCE τ={TEMPERATURE} "
+            f"stopgrad_neg={STOPGRAD_NEG_PHRASES}"
+        )
         print(f"[vljepa]   freeze image={FREEZE_IMAGE_ENCODER} "
               f"text={FREEZE_TEXT_ENCODER}")
         print(f"[vljepa]   ckpt   = {CHECKPOINT_DIR}")

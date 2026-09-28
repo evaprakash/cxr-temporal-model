@@ -7,7 +7,8 @@
     class phrases    ─►  BioViL-T text encoder (Y-encoder) ─►  S_Y^{1..5}
                          InfoNCE(Ŝ, S_Y) with the gold class as the positive
                          and the other four ``{Finding} is {class}.`` phrases
-                         as in-example negatives.
+                         as in-example negatives. Wrong-phrase Y embeddings
+                         are stop-grad so Y only moves through the gold sentence.
 
 Matches VL-JEPA (Chen et al., arXiv:2512.10942): query is Llama-side,
 target lives in a separate Y-encoder. Here the Y-encoder is BioViL-T.
@@ -746,12 +747,18 @@ def class_infonce_loss(
     labels: torch.Tensor,
     temperature: float = 0.07,
     class_weights: Optional[torch.Tensor] = None,
+    stopgrad_negatives: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """In-example 5-way InfoNCE.
 
     ``pred``           (B, D) unit-norm predicted Ŝ
     ``target_global``  (B*C, D) or (B, C, D) class phrase embeddings
     ``labels``         (B,) gold class index
+
+    When ``stopgrad_negatives`` is True (default), Y-encoder gradients
+    flow only through the gold phrase. Softmax still sees all five
+    cosines, so Ŝ is trained 5-way; the four wrong sentences cannot
+    walk away from Ŝ on other rows.
     """
     bsz = pred.shape[0]
     if target_global.dim() == 2:
@@ -762,6 +769,13 @@ def class_infonce_loss(
         n_cls = targets.shape[1]
     pred_n = F.normalize(pred.float(), dim=-1)
     tgt_n = F.normalize(targets.float(), dim=-1)
-    logits = torch.einsum("bd,bcd->bc", pred_n, tgt_n) / float(temperature)
+    if stopgrad_negatives:
+        labels = labels.to(device=tgt_n.device)
+        idx = torch.arange(bsz, device=tgt_n.device)
+        tgt_used = tgt_n.detach().clone()
+        tgt_used[idx, labels] = tgt_n[idx, labels]
+    else:
+        tgt_used = tgt_n
+    logits = torch.einsum("bd,bcd->bc", pred_n, tgt_used) / float(temperature)
     loss = F.cross_entropy(logits, labels, weight=class_weights)
     return loss, logits
