@@ -42,6 +42,7 @@ from progression_classify import (
 from progression_phrases import CLS_ORDER
 from dataset_combined_jepa import DEFAULT_FINDINGS
 
+from .cluster_paths import gold_image_dirs, image_roots as cluster_image_roots
 from .model import VLJEPA
 from .prompts import QUERY_TEMPLATE, TARGET_TEMPLATE
 
@@ -153,15 +154,10 @@ def main():
     if args.limit:
         groups = groups.iloc[: args.limit].reset_index(drop=True)
     gold_parquet_dir = os.path.dirname(os.path.abspath(DEFAULT_GOLD_PARQUET))
-    _image_roots_dir = os.environ.get(
-        "JEPA_IMAGE_ROOTS_DIR",
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "all_data"),
-    )
     roots = {
-        "mimic": os.path.join(_image_roots_dir, "mimic"),
-        "chexpert": os.path.join(_image_roots_dir, "chexpert", "train"),
-        "rexgradient": os.path.join(_image_roots_dir, "rexgradient", "deid_png"),
+        **cluster_image_roots(),
         **discover_gold_image_roots(gold_parquet_dir),
+        **gold_image_dirs(),
     }
     eval_gold_setmatch(model, groups, roots, epoch=-1, device=device)
 

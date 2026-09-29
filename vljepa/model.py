@@ -31,6 +31,7 @@ from progression_phrases import CLS_ORDER
 from tempcxr.modules.image_encoder_jepa import BioViLTImageEncoderJEPA
 from tempcxr.modules.text_encoder import BioViLTTextEncoder
 
+from .cluster_paths import hf_home as llama_hf_home
 from .prompts import class_target_texts, query_text
 
 LLAMA_NAME_DEFAULT = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
@@ -38,9 +39,6 @@ N_LLAMA_LAYERS_DEFAULT = 8
 MAX_QUERY_LEN = 64
 MAX_QUERY_LEN_SMOKE = 32
 N_CLS = len(CLS_ORDER)
-# Login HF cache lives on the quota-full /scratch/m000081 volume.
-# Llama weights go on pm06 instead (override with VLJEPA_HF_HOME).
-_DEFAULT_SCRATCH = "/scratch/m000081-pm06/eprakash"
 
 # Llama-3.2-1B config (used when hub weights are unavailable).
 _LLAMA32_1B = dict(
@@ -62,12 +60,6 @@ _LLAMA32_1B = dict(
 )
 
 
-def llama_hf_home() -> str:
-    return os.environ.get("VLJEPA_HF_HOME") or os.path.join(
-        os.environ.get("SCRATCH_BASE", _DEFAULT_SCRATCH), "hf"
-    )
-
-
 def llama_hub_cache() -> str:
     path = os.path.join(llama_hf_home(), "hub")
     os.makedirs(path, exist_ok=True)
@@ -85,7 +77,7 @@ def is_llama_dir(path: Optional[str]) -> bool:
 
 
 def resolve_llama_local() -> Optional[str]:
-    """Use an on-disk snapshot if present; never point at the full /scratch/m000081 cache."""
+    """Use an on-disk snapshot if present (default: $SCRATCH_BASE/hf/Llama-3.2-1B)."""
     explicit = os.environ.get("VLJEPA_LLAMA_LOCAL") or None
     if is_llama_dir(explicit):
         return explicit

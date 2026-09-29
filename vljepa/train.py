@@ -43,6 +43,7 @@ from progression_phrases import CLS_ORDER
 from dataset_combined_jepa import DEFAULT_FINDINGS
 from losses_jepa import patch_token_feature_stats
 
+from .cluster_paths import gold_image_dirs, image_roots as cluster_image_roots
 from .dataset import VLJEPAFindingDataset, flatten_target_texts, vljepa_collate_fn
 from .eval_gold import eval_gold_setmatch
 from .model import VLJEPA, class_infonce_loss, llama_hub_cache, resolve_llama_local
@@ -81,15 +82,7 @@ IMAGE_MODE = "biovilt"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 
-_IMAGE_ROOTS_DIR = os.environ.get(
-    "JEPA_IMAGE_ROOTS_DIR",
-    os.path.join(_ROOT, "all_data"),
-)
-IMAGE_ROOTS = {
-    "mimic": os.path.join(_IMAGE_ROOTS_DIR, "mimic"),
-    "chexpert": os.path.join(_IMAGE_ROOTS_DIR, "chexpert", "train"),
-    "rexgradient": os.path.join(_IMAGE_ROOTS_DIR, "rexgradient", "deid_png"),
-}
+IMAGE_ROOTS = cluster_image_roots()
 
 CHECKPOINT_DIR = os.environ.get(
     "VLJEPA_CHECKPOINT_DIR",
@@ -321,6 +314,7 @@ def main():
               f"text={FREEZE_TEXT_ENCODER}")
         print(f"[vljepa]   ckpt   = {CHECKPOINT_DIR}")
         print(f"[vljepa]   logs   = {LOG_DIR}")
+        print(f"[vljepa]   images = {IMAGE_ROOTS}")
 
     train_ds = VLJEPAFindingDataset(
         IMAGE_ROOTS, split="train", train=True,
@@ -428,6 +422,7 @@ def main():
             gold_roots = {
                 **IMAGE_ROOTS,
                 **discover_gold_image_roots(gold_parquet_dir),
+                **gold_image_dirs(),
             }
             print(f"[vljepa] gold groups: {len(gold_groups)}")
             print("[vljepa] gold image roots:")

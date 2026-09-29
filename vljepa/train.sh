@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081-pm06/eprakash/logs/vljepa_sgneg_%j.out
-#SBATCH --error=/scratch/m000081-pm06/eprakash/logs/vljepa_sgneg_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_sgneg_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_sgneg_%j.err
 
 # ============================================================
 # Option-2 VL-JEPA (Chen et al. arXiv:2512.10942 predictor).
@@ -23,12 +23,11 @@
 #   grain  : one silver (pair, finding) per example
 #   eval   : CheXTemporal gold set-match after every epoch
 #
-#     mkdir -p /scratch/m000081-pm06/eprakash/logs
-#     cd /scratch/m000081-pm06/eprakash/cxr-temporal-model
+#     mkdir -p /scratch/m000081/eprakash/logs
+#     cd /scratch/m000081/eprakash/temporal/final/cxr-temporal-model
 #     git pull
-#     python -m vljepa.smoke_test          # CPU shape check
-#     python -m vljepa.download_llama      # Llama-3.2-1B → $SCRATCH_BASE/hf
-#     python -m vljepa.check_llama         # tok / weight fallback preview
+#     python -m vljepa.smoke_cluster       # paths + real Llama load/run
+#     python -m vljepa.smoke_test          # CPU shape check (tiny Llama)
 #     sbatch vljepa/train.sh
 #
 # Optional:
@@ -61,8 +60,8 @@ export NCCL_P2P_DISABLE=1
 export PYTHONFAULTHANDLER=1
 export PYTHONUNBUFFERED=1
 
-SCRATCH_BASE="${SCRATCH_BASE:-/scratch/m000081-pm06/eprakash}"
-PROJECT_DIR="${PROJECT_DIR:-$SCRATCH_BASE/cxr-temporal-model}"
+SCRATCH_BASE="${SCRATCH_BASE:-/scratch/m000081/eprakash}"
+PROJECT_DIR="${PROJECT_DIR:-$SCRATCH_BASE/temporal/final/cxr-temporal-model}"
 cd "$PROJECT_DIR" || {
     echo "[slurm] ERROR: PROJECT_DIR not found: $PROJECT_DIR" >&2
     exit 1
@@ -84,6 +83,8 @@ need = [
     "eval_gold.py",
     "prompts.py",
     "smoke_test.py",
+    "smoke_cluster.py",
+    "cluster_paths.py",
 ]
 bad = [f for f in need if not (root / f).is_file()]
 if bad:
@@ -100,6 +101,7 @@ checks = [
     ("stopgrad_negatives", model),
     ("STOPGRAD_NEG_PHRASES = True", train),
     ("checkpoints_vljepa_sgneg", train),
+    ("SCRATCH_BASE_DEFAULT = \"/scratch/m000081/eprakash\"", (root / "cluster_paths.py").read_text()),
     ("LlamaPredictor", model),
     ("embed_query", model),
     ("embed_tokens", model),
@@ -122,6 +124,7 @@ print("[abort-check] OK  option-2 VL-JEPA")
 print("[abort-check] OK  query=What is the progression of {finding}?")
 print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
 print("[abort-check] OK  stop-grad wrong phrases; fresh ckpt dir sgneg")
+print("[abort-check] OK  cycle-6 paths /scratch/m000081/eprakash")
 print("[abort-check] OK  BioViL-T pair image + Llama query + BioViL-T Y-encoder")
 print("[abort-check] OK  gold set-match after every epoch")
 PY
@@ -135,6 +138,9 @@ echo "[slurm] hi-ml OK: $HI_ML_SRC"
 export PYTHONPATH="${PROJECT_DIR}:${HI_ML_SRC}${PYTHONPATH:+:$PYTHONPATH}"
 
 export CHEXTEMPORAL_DIR="${CHEXTEMPORAL_DIR:-$PROJECT_DIR/CheXTemporal}"
+if [ ! -d "$CHEXTEMPORAL_DIR" ] && [ -d "$SCRATCH_BASE/temporal/final/CheXTemporal" ]; then
+    export CHEXTEMPORAL_DIR="$SCRATCH_BASE/temporal/final/CheXTemporal"
+fi
 export JEPA_IMAGE_ROOTS_DIR="${JEPA_IMAGE_ROOTS_DIR:-$SCRATCH_BASE/all_data}"
 echo "[slurm] CHEXTEMPORAL_DIR     = $CHEXTEMPORAL_DIR"
 echo "[slurm] JEPA_IMAGE_ROOTS_DIR = $JEPA_IMAGE_ROOTS_DIR"
@@ -145,21 +151,29 @@ mkdir -p "$VLJEPA_HF_HOME/hub"
 if [ -f "$LLAMA_DEST/config.json" ]; then
     export VLJEPA_LLAMA_LOCAL="$LLAMA_DEST"
 else
-    unset VLJEPA_LLAMA_LOCAL
+    echo "[slurm] ERROR: Llama snapshot missing at $LLAMA_DEST" >&2
+    echo "[slurm]        mv it from pm06 or run: python -m vljepa.download_llama" >&2
+    exit 1
 fi
 echo "[slurm] VLJEPA_HF_HOME       = $VLJEPA_HF_HOME"
 echo "[slurm] VLJEPA_LLAMA_NAME    = ${VLJEPA_LLAMA_NAME:-meta-llama/Llama-3.2-1B}"
-echo "[slurm] VLJEPA_LLAMA_LOCAL   = ${VLJEPA_LLAMA_LOCAL:-<hub cache under VLJEPA_HF_HOME>}"
+echo "[slurm] VLJEPA_LLAMA_LOCAL   = $VLJEPA_LLAMA_LOCAL"
 echo "[slurm] Llama dest           = $LLAMA_DEST"
-for d in \
-    "$JEPA_IMAGE_ROOTS_DIR/mimic" \
-    "$JEPA_IMAGE_ROOTS_DIR/chexpert/train" \
-    "$JEPA_IMAGE_ROOTS_DIR/rexgradient/deid_png"
-do
-    if [ ! -d "$d" ]; then
-        echo "[slurm] WARNING: missing image root: $d" >&2
-    fi
-done
+
+python - <<'PY'
+from vljepa.cluster_paths import inventory
+bad = []
+for name, path, ok, detail in inventory(require_sample=False):
+    mark = "OK  " if ok else "FAIL"
+    extra = f"  ({detail})" if detail else ""
+    print(f"[slurm] [{mark}] {name:32s} {path}{extra}")
+    if not ok:
+        bad.append(name)
+if bad:
+    print("[slurm] ERROR: missing cluster paths:", ", ".join(bad), flush=True)
+    raise SystemExit(1)
+print("[slurm] cluster paths OK")
+PY
 
 mkdir -p "$SCRATCH_BASE/logs"
 

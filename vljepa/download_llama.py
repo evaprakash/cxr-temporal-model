@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Snapshot Llama-3.2-1B onto pm06 scratch (not the quota-full /scratch/m000081 cache).
+"""Snapshot Llama-3.2-1B onto $SCRATCH_BASE/hf (cycle-6: /scratch/m000081/eprakash/hf).
 
     python -m vljepa.download_llama
 """

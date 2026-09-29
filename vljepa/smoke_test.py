@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import _root  # noqa: F401
+from .cluster_paths import image_roots as cluster_image_roots
 from .dataset import flatten_target_texts
 from .model import VLJEPA, class_infonce_loss
 from .prompts import QUERY_TEMPLATE, TARGET_TEMPLATE, class_target_texts, query_text
@@ -56,13 +57,7 @@ def _shape(x) -> str:
 
 def _image_roots():
     """Same silver image roots as ``vljepa.train``."""
-    here = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    base = os.environ.get("JEPA_IMAGE_ROOTS_DIR", os.path.join(here, "all_data"))
-    return {
-        "mimic": os.path.join(base, "mimic"),
-        "chexpert": os.path.join(base, "chexpert", "train"),
-        "rexgradient": os.path.join(base, "rexgradient", "deid_png"),
-    }
+    return cluster_image_roots()
 
 
 def _try_load_cxr_pair(dataset, prev_rel, curr_rel, roots):
