@@ -1,8 +1,8 @@
 """DDP trainer for option-2 VL-JEPA.
 
-Loss is 5-way InfoNCE: predicted Ŝ vs BioViL-T embeddings of
+Loss is 5-way InfoNCE: predicted Ŝ vs frozen BioViL-T embeddings of
 ``{Finding} is {class}.`` (gold = positive, other four = negatives).
-Wrong-phrase Y embeddings are stop-grad. Fresh run (not resume ep5).
+Text encoder is frozen so the five sentences cannot drift. Fresh run.
 Rank-0 runs CheXTemporal gold set-match after every epoch.
 
     torchrun --nproc_per_node=4 -m vljepa.train
@@ -68,8 +68,8 @@ SPLIT_SEED = 42
 SAVE_EVERY_N_EPOCHS = 1
 
 FREEZE_IMAGE_ENCODER = True
-FREEZE_TEXT_ENCODER = False
-STOPGRAD_NEG_PHRASES = True
+FREEZE_TEXT_ENCODER = True
+STOPGRAD_NEG_PHRASES = False
 N_LLAMA_LAYERS = 8
 LLAMA_NAME = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
 llama_hub_cache()
@@ -86,11 +86,11 @@ IMAGE_ROOTS = cluster_image_roots()
 
 CHECKPOINT_DIR = os.environ.get(
     "VLJEPA_CHECKPOINT_DIR",
-    os.path.join(_ROOT, "checkpoints_vljepa_sgneg"),
+    os.path.join(_ROOT, "checkpoints_vljepa_frzy"),
 )
 LOG_DIR = os.environ.get(
     "VLJEPA_LOG_DIR",
-    os.path.join(_ROOT, "logs_vljepa_sgneg"),
+    os.path.join(_ROOT, "logs_vljepa_frzy"),
 )
 CSV_LOG = os.path.join(LOG_DIR, "val_metrics_vljepa.csv")
 FEAT_CSV_LOG = os.path.join(LOG_DIR, "feat_std_vljepa.csv")

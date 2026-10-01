@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """Did gold recall move because the answer sentences moved, or because Ŝ did?
 
-CPU-only. Uses the first VL-JEPA run (Y unfrozen, no stop-grad).
+Uses the first VL-JEPA run (Y unfrozen, no stop-grad).
 
 Part A — answer drift, no images, no Llama
     Encode ``{Finding} is {class}.`` with pretrained BioViL-T and with the
     text encoder inside each checkpoint. Cosine near 1 means that sentence
-    did not move. This is the ground-truth side.
+    did not move. Also prints the pretrained 5×5, including resolved–stable.
 
-Part B — predictor vs fixed answers (optional, slower)
-    Run epoch-1 and epoch-5 Ŝ on a stratified gold sample. Score the same
+Part B — predictor vs fixed answers
+    Run epoch-1 and epoch-5 Ŝ on stratified single-label gold. Score the same
     Ŝ against that epoch's sentences and against the pretrained sentences.
-    If resolved recall appears only against the epoch sentences, the answers
-    moved to meet Ŝ. If it appears against the pretrained sentences too, Ŝ
-    learned the original answers.
 
-    cd /scratch/m000081/eprakash/temporal/final/cxr-temporal-model
-    python -m vljepa.probe_answer_drift
-    python -m vljepa.probe_answer_drift --skip-pred
-    python -m vljepa.probe_answer_drift --pred-epochs 5 --pred-limit 250
+Part C — zero-shot, no predictor
+    Frozen BioViL-T image encoder vs the five original sentences. If resolved
+    films already lose this argmax, the pretrained sentence is a weak target.
+
+    sbatch vljepa/probe_answer_drift.sh
 """
 
 from __future__ import annotations
@@ -149,9 +147,33 @@ def part_a(ckpt_dir: str) -> None:
         _print(row)
         del enc, bank
     _print("")
+    _print_pair_matrix(init_bank)
+    _print("")
     _print("Read part A: a class column falling well below 1 means that")
     _print("sentence's embedding moved. offdiag is how similar the five")
     _print("sentences are to each other (the first run stayed near 0.5).")
+    _print("The 5×5 is the pretrained geometry. resolved–stable near 0.9")
+    _print("means argmax cannot separate those two sentences.")
+    del init
+
+
+def _print_pair_matrix(bank: Dict[str, torch.Tensor]) -> None:
+    acc = None
+    for vecs in bank.values():
+        sim = vecs @ vecs.T
+        acc = sim if acc is None else acc + sim
+    acc = acc / max(len(bank), 1)
+    _print("PART A2  pretrained 5×5 cosine, mean over findings")
+    header = f"{'':12}" + "".join(f"{c[:10]:>12}" for c in CLS_ORDER)
+    _print(header)
+    for i, cls in enumerate(CLS_ORDER):
+        _print(f"{cls[:12]:12}" + "".join(f"{float(acc[i, j]):12.4f}" for j in range(len(CLS_ORDER))))
+    i_res = CLS_ORDER.index("resolved")
+    i_sta = CLS_ORDER.index("stable")
+    _print(
+        f"resolved–stable cosine = {float(acc[i_res, i_sta]):.4f}  "
+        f"(1 = same sentence)"
+    )
 
 
 def _gold_roots() -> dict:
@@ -198,7 +220,7 @@ def _llama_local(cfg: dict) -> Optional[str]:
 
 
 @torch.no_grad()
-def _score_epoch(ckpt_path: str, rows, roots, init_bank: Dict[str, torch.Tensor]) -> None:
+def _score_epoch(ckpt_path: str, rows, roots, init_bank: Dict[str, torch.Tensor], device: torch.device) -> None:
     from .model import VLJEPA
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -222,7 +244,7 @@ def _score_epoch(ckpt_path: str, rows, roots, init_bank: Dict[str, torch.Tensor]
         _print(f"  warn missing keys: {missing[:6]}")
     if unexpected:
         _print(f"  warn unexpected keys: {unexpected[:6]}")
-    model = model.to(torch.device("cpu")).eval()
+    model = model.to(device).eval()
 
     # Cache this epoch's own phrase bank (same findings the gold rows use).
     findings = sorted({str(r["finding"]).strip().lower() for _, r in rows.iterrows()})
@@ -255,7 +277,9 @@ def _score_epoch(ckpt_path: str, rows, roots, init_bank: Dict[str, torch.Tensor]
         except (FileNotFoundError, OSError):
             n_skip += 1
             continue
-        img_g, img_p = model.encode_images(prior.unsqueeze(0), current.unsqueeze(0))
+        img_g, img_p = model.encode_images(
+            prior.unsqueeze(0).to(device), current.unsqueeze(0).to(device),
+        )
         pred = model.predict(img_g, img_p, [query_text(finding)])
         pred_n = F.normalize(pred.float(), dim=-1).cpu().squeeze(0)
         if finding not in epoch_bank or finding not in init_bank:
@@ -297,11 +321,11 @@ def _score_epoch(ckpt_path: str, rows, roots, init_bank: Dict[str, torch.Tensor]
     del model
 
 
-def part_b(ckpt_dir: str, epochs: List[int], limit: int) -> None:
+def part_b(ckpt_dir: str, epochs: List[int], limit: int, device: torch.device) -> None:
     _print("")
     _print("=" * 72)
     _print("PART B  same Ŝ scored against epoch sentences and pretrained sentences")
-    _print(f"stratified single-label gold, up to {limit} groups, CPU")
+    _print(f"stratified single-label gold, up to {limit} groups, device={device}")
     _print("=" * 72)
     from progression_classify import DEFAULT_GOLD_PARQUET
 
@@ -330,7 +354,7 @@ def part_b(ckpt_dir: str, epochs: List[int], limit: int) -> None:
             continue
         _print("")
         _print(f"--- epoch {ep}  {path} ---")
-        _score_epoch(path, rows, roots, init_bank)
+        _score_epoch(path, rows, roots, init_bank, device)
     _print("")
     _print("Read part B: recall columns are per true class.")
     _print("epoch_Y = sentences from that checkpoint. init_Y = pretrained BioViL-T.")
@@ -338,21 +362,107 @@ def part_b(ckpt_dir: str, epochs: List[int], limit: int) -> None:
     _print("Resolved recall on init_Y as well means Ŝ learned the original sentence.")
 
 
+@torch.no_grad()
+def part_c(limit: int, device: torch.device) -> None:
+    """Frozen image encoder vs the five original sentences. No Llama."""
+    from tempcxr.modules.image_encoder_jepa import BioViLTImageEncoderJEPA
+    from progression_classify import DEFAULT_GOLD_PARQUET
+
+    _print("")
+    _print("=" * 72)
+    _print("PART C  zero-shot: frozen BioViL-T image vs original sentences")
+    _print("No predictor. If resolved films already lose argmax, the sentence is a weak target.")
+    _print(f"device={device}")
+    _print("=" * 72)
+    gold = load_gold_pairs(DEFAULT_GOLD_PARQUET, DEFAULT_FINDINGS)
+    groups = group_gold_by_pair_finding(gold)
+    rows = _stratified_single(groups, limit)
+    roots = _gold_roots()
+    enc = _fresh_text().to(device)
+    findings = sorted({str(r["finding"]).strip().lower() for _, r in rows.iterrows()})
+    bank = _embed_bank(enc, findings)
+    del enc
+    image = BioViLTImageEncoderJEPA(mode="biovilt").to(device).eval()
+    for p in image.parameters():
+        p.requires_grad = False
+
+    correct = 0
+    n_by = defaultdict(int)
+    hit_by = defaultdict(int)
+    cos_on_true = defaultdict(lambda: defaultdict(float))
+    n_ok = 0
+    n_skip = 0
+    for _, row in rows.iterrows():
+        finding = str(row["finding"]).strip().lower()
+        gt = list(row["gt_labels"])
+        if len(gt) != 1 or finding not in bank:
+            continue
+        try:
+            prior = load_image_tensor(row["dataset"], row["parent_image_prev"], roots)
+            current = load_image_tensor(row["dataset"], row["parent_image_curr"], roots)
+        except (FileNotFoundError, OSError):
+            n_skip += 1
+            continue
+        img_g, _patches = image(
+            current.unsqueeze(0).to(device), prior.unsqueeze(0).to(device),
+        )
+        img_n = F.normalize(img_g.float(), dim=-1).cpu().squeeze(0)
+        cos = bank[finding] @ img_n
+        pred_i = int(cos.argmax())
+        gold_i = CLS_ORDER.index(gt[0])
+        n_ok += 1
+        n_by[gt[0]] += 1
+        if pred_i == gold_i:
+            correct += 1
+            hit_by[gt[0]] += 1
+        for c_i, cls in enumerate(CLS_ORDER):
+            cos_on_true[gt[0]][cls] += float(cos[c_i])
+        if n_ok % 50 == 0:
+            _print(f"  scored {n_ok}  skipped_images={n_skip}")
+
+    _print(f"  usable single-label groups: {n_ok}  missing images: {n_skip}")
+    acc = correct / max(n_ok, 1)
+    _print(f"  overall acc {acc:.3f}")
+    _print(f"  {'':12}" + "".join(f"{c[:8]:>10}" for c in CLS_ORDER))
+    recalls = [hit_by[cls] / max(n_by[cls], 1) for cls in CLS_ORDER]
+    _print("  recall      " + "".join(f"{r:10.3f}" for r in recalls))
+    _print("  n           " + "".join(f"{n_by[cls]:10d}" for cls in CLS_ORDER))
+    _print("  mean cos(image, sentence) on films of each true class (rows=true class)")
+    for gt_cls in CLS_ORDER:
+        vals = [
+            cos_on_true[gt_cls][cls] / max(n_by[gt_cls], 1) for cls in CLS_ORDER
+        ]
+        _print(f"  {gt_cls[:12]:12}" + "".join(f"{v:10.3f}" for v in vals))
+    _print("")
+    _print("Read part C: the resolved row is resolved films only.")
+    _print("If that row's resolved column is not the largest, the original")
+    _print("sentence already loses to another class before any training.")
+    del image
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt-dir", default=DEFAULT_CKPT_DIR)
     parser.add_argument("--skip-pred", action="store_true")
+    parser.add_argument("--skip-zeroshot", action="store_true")
     parser.add_argument("--pred-epochs", default="1,5")
-    parser.add_argument("--pred-limit", type=int, default=250)
+    parser.add_argument("--pred-limit", type=int, default=0,
+                        help="single-label groups. 0 = all")
+    parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "8")))
+    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    limit = args.pred_limit if args.pred_limit > 0 else 10 ** 9
+    _print(f"device={device}  pred_limit={'all' if args.pred_limit <= 0 else args.pred_limit}")
     if not os.path.isdir(args.ckpt_dir):
         _print(f"checkpoint dir not found: {args.ckpt_dir}")
         return 1
     part_a(args.ckpt_dir)
+    if not args.skip_zeroshot:
+        part_c(limit, device)
     if not args.skip_pred:
         epochs = [int(x) for x in args.pred_epochs.split(",") if x.strip()]
-        part_b(args.ckpt_dir, epochs, args.pred_limit)
+        part_b(args.ckpt_dir, epochs, limit, device)
     return 0
 
 
