@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=vljepa_frzy
+#SBATCH --job-name=vljepa_nudge
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_frzy_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_frzy_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_nudge_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_nudge_%j.err
 
 # ============================================================
 # Option-2 VL-JEPA (Chen et al. arXiv:2512.10942 predictor).
@@ -20,7 +20,8 @@
 #   pred   : last 8 Llama-3.2-1B layers, bidirectional
 #   loss   : 5-way InfoNCE; all five phrases live (no stop-grad)
 #   freeze : image frozen, BioViL-T text frozen, Llama predictor unfrozen
-#   ckpt   : checkpoints_vljepa_frzy/  (fresh; does not resume sgneg)
+#   nudge  : learned offset on improving and worsening only, hinged off stable
+#   ckpt   : checkpoints_vljepa_nudge/  (fresh; does not resume frzy)
 #   grain  : one silver (pair, finding) per example
 #   eval   : CheXTemporal gold set-match after every epoch
 #
@@ -102,7 +103,10 @@ checks = [
     ("stopgrad_negatives", model),
     ("STOPGRAD_NEG_PHRASES = False", train),
     ("FREEZE_TEXT_ENCODER = True", train),
-    ("checkpoints_vljepa_frzy", train),
+    ("checkpoints_vljepa_nudge", train),
+    ("class_nudge", model),
+    ("stable_separation_loss", model),
+    ("NUDGE_SEP_MARGIN = 0.5", train),
     ("SCRATCH_BASE_DEFAULT = \"/scratch/m000081/eprakash\"", (root / "cluster_paths.py").read_text()),
     ("LlamaPredictor", model),
     ("embed_query", model),
@@ -125,7 +129,7 @@ if bad:
 print("[abort-check] OK  option-2 VL-JEPA")
 print("[abort-check] OK  query=What is the progression of {finding}?")
 print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
-print("[abort-check] OK  text frozen; stop-grad off; fresh ckpt dir frzy")
+print("[abort-check] OK  text frozen; improving/worsening nudge; fresh ckpt dir nudge")
 print("[abort-check] OK  cycle-6 paths /scratch/m000081/eprakash")
 print("[abort-check] OK  BioViL-T pair image + Llama query + BioViL-T Y-encoder")
 print("[abort-check] OK  gold set-match after every epoch")

@@ -2,7 +2,9 @@
 
 Loss is 5-way InfoNCE: predicted Ŝ vs frozen BioViL-T embeddings of
 ``{Finding} is {class}.`` (gold = positive, other four = negatives).
-Text encoder is frozen so the five sentences cannot drift. Fresh run.
+Text encoder is frozen. Improving and worsening each get a learned nudge
+added after the encoder, with a hinge that keeps them away from stable.
+Fresh run (does not resume checkpoints_vljepa_frzy).
 Rank-0 runs CheXTemporal gold set-match after every epoch.
 
     torchrun --nproc_per_node=4 -m vljepa.train
@@ -46,7 +48,13 @@ from losses_jepa import patch_token_feature_stats
 from .cluster_paths import gold_image_dirs, image_roots as cluster_image_roots
 from .dataset import VLJEPAFindingDataset, flatten_target_texts, vljepa_collate_fn
 from .eval_gold import eval_gold_setmatch
-from .model import VLJEPA, class_infonce_loss, llama_hub_cache, resolve_llama_local
+from .model import (
+    VLJEPA,
+    class_infonce_loss,
+    llama_hub_cache,
+    resolve_llama_local,
+    stable_separation_loss,
+)
 from .prompts import QUERY_TEMPLATE, TARGET_TEMPLATE
 
 N_CLS = len(CLS_ORDER)
@@ -70,6 +78,11 @@ SAVE_EVERY_N_EPOCHS = 1
 FREEZE_IMAGE_ENCODER = True
 FREEZE_TEXT_ENCODER = True
 STOPGRAD_NEG_PHRASES = False
+# Learned offset on the frozen improving / worsening sentences only.
+# Hinge: cosine to the frozen stable sentence should fall to this or below.
+NUDGE_LR = 1e-4
+NUDGE_SEP_MARGIN = 0.5
+NUDGE_SEP_WEIGHT = 1.0
 N_LLAMA_LAYERS = 8
 LLAMA_NAME = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
 llama_hub_cache()
@@ -86,11 +99,11 @@ IMAGE_ROOTS = cluster_image_roots()
 
 CHECKPOINT_DIR = os.environ.get(
     "VLJEPA_CHECKPOINT_DIR",
-    os.path.join(_ROOT, "checkpoints_vljepa_frzy"),
+    os.path.join(_ROOT, "checkpoints_vljepa_nudge"),
 )
 LOG_DIR = os.environ.get(
     "VLJEPA_LOG_DIR",
-    os.path.join(_ROOT, "logs_vljepa_frzy"),
+    os.path.join(_ROOT, "logs_vljepa_nudge"),
 )
 CSV_LOG = os.path.join(LOG_DIR, "val_metrics_vljepa.csv")
 FEAT_CSV_LOG = os.path.join(LOG_DIR, "feat_std_vljepa.csv")
@@ -189,6 +202,12 @@ def build_optimizer(model: VLJEPA):
         groups.append({"params": text_params, "lr": LR * TEXT_LR_MULT})
     if image_params:
         groups.append({"params": image_params, "lr": LR * IMAGE_LR_MULT})
+    # No weight decay: decay would pull the nudge back onto the frozen sentence.
+    groups.append({
+        "params": [model.class_nudge],
+        "lr": NUDGE_LR,
+        "weight_decay": 0.0,
+    })
     return AdamW(groups, weight_decay=WEIGHT_DECAY)
 
 
@@ -208,11 +227,15 @@ def run_val(raw_model, loader, device, class_weights, desc):
         out = raw_model(
             prior, current, batch["query_text"], target_texts=targets,
         )
-        loss, logits = class_infonce_loss(
+        loss_nce, logits = class_infonce_loss(
             out["pred"], out["target_global"], labels,
             temperature=TEMPERATURE, class_weights=class_weights,
             stopgrad_negatives=STOPGRAD_NEG_PHRASES,
         )
+        loss_sep, _, _ = stable_separation_loss(
+            out["target_global"], margin=NUDGE_SEP_MARGIN,
+        )
+        loss = loss_nce + NUDGE_SEP_WEIGHT * loss_sep
         pred_cls = logits.argmax(dim=-1)
         total += float(loss.item()) * labels.shape[0]
         correct += int((pred_cls == labels).sum().item())
@@ -235,6 +258,10 @@ def train_one_epoch(
     running = 0.0
     correct = 0
     n = 0
+    sep_sum = 0.0
+    cos_imp_sum = 0.0
+    cos_wor_sum = 0.0
+    n_batches = 0
     pbar = tqdm(loader, desc=f"vljepa train ep{epoch}", disable=rank != 0)
     last_stats = {}
     for batch in pbar:
@@ -245,11 +272,15 @@ def train_one_epoch(
         out = raw_model(
             prior, current, batch["query_text"], target_texts=targets,
         )
-        loss, logits = class_infonce_loss(
+        loss_nce, logits = class_infonce_loss(
             out["pred"], out["target_global"], labels,
             temperature=TEMPERATURE, class_weights=class_weights,
             stopgrad_negatives=STOPGRAD_NEG_PHRASES,
         )
+        loss_sep, cos_imp, cos_wor = stable_separation_loss(
+            out["target_global"], margin=NUDGE_SEP_MARGIN,
+        )
+        loss = loss_nce + NUDGE_SEP_WEIGHT * loss_sep
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -260,6 +291,10 @@ def train_one_epoch(
         running += float(loss.item()) * labels.shape[0]
         correct += int((pred_cls == labels).sum().item())
         n += int(labels.shape[0])
+        sep_sum += float(loss_sep.detach().item())
+        cos_imp_sum += float(cos_imp.detach().item())
+        cos_wor_sum += float(cos_wor.detach().item())
+        n_batches += 1
         global_step += 1
         if rank == 0:
             last_stats = feat_stats_from_out(out, labels.shape[0])
@@ -277,8 +312,17 @@ def train_one_epoch(
                 loss=f"{running / max(n, 1):.4f}",
                 acc=f"{correct / max(n, 1):.3f}",
                 tgt_off=f"{last_stats.get('target_offdiag', 0):.3f}",
+                sep=f"{cos_imp_sum / max(n_batches, 1):.3f}/{cos_wor_sum / max(n_batches, 1):.3f}",
             )
-    return running / max(n, 1), correct / max(n, 1), global_step
+    nb = max(n_batches, 1)
+    return (
+        running / max(n, 1),
+        correct / max(n, 1),
+        global_step,
+        cos_imp_sum / nb,
+        cos_wor_sum / nb,
+        sep_sum / nb,
+    )
 
 
 def parse_args():
@@ -309,6 +353,10 @@ def main():
         print(
             f"[vljepa]   loss   = 5-way InfoNCE τ={TEMPERATURE} "
             f"stopgrad_neg={STOPGRAD_NEG_PHRASES}"
+        )
+        print(
+            f"[vljepa]   nudge  = improving+worsening  lr={NUDGE_LR} "
+            f"sep_margin={NUDGE_SEP_MARGIN} sep_weight={NUDGE_SEP_WEIGHT}"
         )
         print(f"[vljepa]   freeze image={FREEZE_IMAGE_ENCODER} "
               f"text={FREEZE_TEXT_ENCODER}")
@@ -454,7 +502,7 @@ def main():
     for epoch in range(start_epoch, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_loss, train_acc, global_step = train_one_epoch(
+        train_loss, train_acc, global_step, cos_imp, cos_wor, sep = train_one_epoch(
             model, raw_model, train_loader, optimizer, scheduler,
             device, class_weights, epoch, rank,
             global_step=global_step, feat_csv=feat_f,
@@ -466,6 +514,9 @@ def main():
         train_acc = ddp_reduce(train_acc, device, world_size)
         val_loss = ddp_reduce(val_loss, device, world_size)
         val_acc = ddp_reduce(val_acc, device, world_size)
+        cos_imp = ddp_reduce(cos_imp, device, world_size)
+        cos_wor = ddp_reduce(cos_wor, device, world_size)
+        sep = ddp_reduce(sep, device, world_size)
 
         if rank == 0:
             print(
@@ -473,7 +524,8 @@ def main():
                 f"train loss={train_loss:.4f} acc={train_acc:.3f} | "
                 f"val loss={val_loss:.4f} acc={val_acc:.3f} (n={val_n}) | "
                 f"img_std={val_feat.get('img_patch_std', 0):.4f} "
-                f"tgt_offdiag={val_feat.get('target_offdiag', 0):.4f}"
+                f"tgt_offdiag={val_feat.get('target_offdiag', 0):.4f} "
+                f"sep={sep:.4f} cos_imp_sta={cos_imp:.4f} cos_wor_sta={cos_wor:.4f}"
             )
             ckpt = {
                 "epoch": epoch,
@@ -488,6 +540,8 @@ def main():
                     "llama_local": LLAMA_LOCAL,
                     "freeze_image_encoder": FREEZE_IMAGE_ENCODER,
                     "freeze_text_encoder": FREEZE_TEXT_ENCODER,
+                    "class_nudge": True,
+                    "nudge_sep_margin": NUDGE_SEP_MARGIN,
                     "temperature": TEMPERATURE,
                     "query_template": QUERY_TEMPLATE,
                     "target_template": TARGET_TEMPLATE,
