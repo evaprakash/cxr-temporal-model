@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=vljepa_nudge
+#SBATCH --job-name=vljepa_margin
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_nudge_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_nudge_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_margin_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_margin_%j.err
 
 # ============================================================
 # Option-2 VL-JEPA (Chen et al. arXiv:2512.10942 predictor).
@@ -20,8 +20,9 @@
 #   pred   : last 8 Llama-3.2-1B layers, bidirectional
 #   loss   : 5-way InfoNCE; all five phrases live (no stop-grad)
 #   freeze : image frozen, BioViL-T text frozen, Llama predictor unfrozen
-#   nudge  : learned offset on improving and worsening only, hinged off stable
-#   ckpt   : checkpoints_vljepa_nudge/  (fresh; does not resume frzy)
+#   margin : train only, +0.05 on the stable cosine when the label is
+#            improving or worsening. Gold argmax does not add it.
+#   ckpt   : checkpoints_vljepa_margin/  (fresh; does not resume nudge or frzy)
 #   grain  : one silver (pair, finding) per example
 #   eval   : CheXTemporal gold set-match after every epoch
 #
@@ -103,10 +104,9 @@ checks = [
     ("stopgrad_negatives", model),
     ("STOPGRAD_NEG_PHRASES = False", train),
     ("FREEZE_TEXT_ENCODER = True", train),
-    ("checkpoints_vljepa_nudge", train),
-    ("class_nudge", model),
-    ("stable_separation_loss", model),
-    ("NUDGE_SEP_MARGIN = 0.5", train),
+    ("checkpoints_vljepa_margin", train),
+    ("STABLE_MARGIN = 0.05", train),
+    ("stable_margin", model),
     ("SCRATCH_BASE_DEFAULT = \"/scratch/m000081/eprakash\"", (root / "cluster_paths.py").read_text()),
     ("LlamaPredictor", model),
     ("embed_query", model),
@@ -122,6 +122,10 @@ for needle, src in checks:
         bad.append(f"  missing {needle!r}")
 if "target_image_encoder" in train:
     bad.append("  train.py still looks like image-JEPA (target_image_encoder)")
+if "class_nudge" in model or "class_nudge" in train:
+    bad.append("  class_nudge still present")
+if "stable_separation_loss" in model or "stable_separation_loss" in train:
+    bad.append("  stable_separation_loss still present")
 if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
@@ -129,7 +133,7 @@ if bad:
 print("[abort-check] OK  option-2 VL-JEPA")
 print("[abort-check] OK  query=What is the progression of {finding}?")
 print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
-print("[abort-check] OK  text frozen; improving/worsening nudge; fresh ckpt dir nudge")
+print("[abort-check] OK  text frozen; stable margin 0.05; fresh ckpt dir margin")
 print("[abort-check] OK  cycle-6 paths /scratch/m000081/eprakash")
 print("[abort-check] OK  BioViL-T pair image + Llama query + BioViL-T Y-encoder")
 print("[abort-check] OK  gold set-match after every epoch")

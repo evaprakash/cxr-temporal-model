@@ -38,7 +38,6 @@ LLAMA_NAME_DEFAULT = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1
 N_LLAMA_LAYERS_DEFAULT = 8
 MAX_QUERY_LEN = 64
 MAX_QUERY_LEN_SMOKE = 32
-N_CLS = len(CLS_ORDER)
 
 # Llama-3.2-1B config (used when hub weights are unavailable).
 _LLAMA32_1B = dict(
@@ -633,9 +632,6 @@ class VLJEPA(nn.Module):
         )
         self.freeze_image_encoder = bool(freeze_image_encoder)
         self.freeze_text_encoder = bool(freeze_text_encoder)
-        # Added after the frozen Y-encoder. Zero init = the pretrained sentence.
-        # Slots are improving, then worsening (CLS_ORDER indices 0 and 2).
-        self.class_nudge = nn.Parameter(torch.zeros(2, txt_dim))
         if self.freeze_image_encoder:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
@@ -667,28 +663,6 @@ class VLJEPA(nn.Module):
         ctx = torch.no_grad() if self.freeze_text_encoder else torch.enable_grad()
         with ctx:
             return self.text_encoder.forward_contrastive(texts)
-
-    def _add_class_nudges(self, target_global: torch.Tensor) -> torch.Tensor:
-        """Add the improving and worsening nudges. Rows are CLS_ORDER.
-
-        ``target_global`` is ``(B*C, D)`` or ``(C, D)`` with C = 5.
-        Stable, new, and resolved are unchanged. The text encoder stays frozen;
-        only ``class_nudge`` is trainable.
-        """
-        dim = target_global.shape[-1]
-        flat = target_global.reshape(-1, N_CLS, dim)
-        nudge = self.class_nudge.to(dtype=flat.dtype)
-        imp_i = CLS_ORDER.index("improving")
-        wor_i = CLS_ORDER.index("worsening")
-        rows = []
-        for i in range(N_CLS):
-            row = flat[:, i]
-            if i == imp_i:
-                row = row + nudge[0]
-            elif i == wor_i:
-                row = row + nudge[1]
-            rows.append(row)
-        return torch.stack(rows, dim=1).reshape(target_global.shape)
 
     def predict(
         self,
@@ -724,7 +698,7 @@ class VLJEPA(nn.Module):
         }
         if target_texts is not None:
             t_g, t_loc, t_mask = self.encode_targets(target_texts)
-            out["target_global"] = self._add_class_nudges(t_g)
+            out["target_global"] = t_g
             out["target_local"] = t_loc
             out["target_mask"] = t_mask
         if aux is not None:
@@ -753,7 +727,6 @@ class VLJEPA(nn.Module):
         img_g, img_p = self.encode_images(prior, current)
         pred = self.predict(img_g, img_p, queries)
         tgt = torch.cat([_cached(t) for t in targets], dim=0)
-        tgt = self._add_class_nudges(tgt)
         pred_n = F.normalize(pred.float(), dim=-1)
         tgt_n = F.normalize(tgt.float(), dim=-1)
         return (pred_n * tgt_n).sum(dim=-1).squeeze(0)
@@ -766,6 +739,7 @@ def class_infonce_loss(
     temperature: float = 0.07,
     class_weights: Optional[torch.Tensor] = None,
     stopgrad_negatives: bool = True,
+    stable_margin: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """In-example 5-way InfoNCE.
 
@@ -777,6 +751,11 @@ def class_infonce_loss(
     flow only through the gold phrase. Softmax still sees all five
     cosines, so Ŝ is trained 5-way; the four wrong sentences cannot
     walk away from Ŝ on other rows.
+
+    ``stable_margin`` is added to the stable cosine, before dividing by
+    temperature, only on rows whose label is improving or worsening.
+    Returned logits are the raw cosines divided by temperature, with no
+    margin, so argmax matches gold.
     """
     bsz = pred.shape[0]
     if target_global.dim() == 2:
@@ -795,27 +774,15 @@ def class_infonce_loss(
     else:
         tgt_used = tgt_n
     logits = torch.einsum("bd,bcd->bc", pred_n, tgt_used) / float(temperature)
-    loss = F.cross_entropy(logits, labels, weight=class_weights)
+    loss_logits = logits
+    if float(stable_margin) != 0.0:
+        labels = labels.to(device=logits.device)
+        i_imp = CLS_ORDER.index("improving")
+        i_wor = CLS_ORDER.index("worsening")
+        i_sta = CLS_ORDER.index("stable")
+        apply = ((labels == i_imp) | (labels == i_wor)).unsqueeze(1).to(logits.dtype)
+        bump = torch.zeros_like(logits)
+        bump[:, i_sta] = float(stable_margin) / float(temperature)
+        loss_logits = logits + bump * apply
+    loss = F.cross_entropy(loss_logits, labels, weight=class_weights)
     return loss, logits
-
-
-def stable_separation_loss(
-    target_global: torch.Tensor,
-    margin: float = 0.5,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Hinge that pushes nudged improving and worsening off the stable sentence.
-
-    ``target_global`` is ``(B*C, D)`` in ``CLS_ORDER``, already including nudges.
-    Stable itself is not nudged. Returns ``(loss, mean cos improving-stable,
-    mean cos worsening-stable)``.
-    """
-    dim = target_global.shape[-1]
-    tgt = F.normalize(target_global.float().reshape(-1, N_CLS, dim), dim=-1)
-    i_imp = CLS_ORDER.index("improving")
-    i_sta = CLS_ORDER.index("stable")
-    i_wor = CLS_ORDER.index("worsening")
-    sta = tgt[:, i_sta]
-    cos_imp = (tgt[:, i_imp] * sta).sum(dim=-1)
-    cos_wor = (tgt[:, i_wor] * sta).sum(dim=-1)
-    loss = F.relu(cos_imp - float(margin)).mean() + F.relu(cos_wor - float(margin)).mean()
-    return loss, cos_imp.mean(), cos_wor.mean()
