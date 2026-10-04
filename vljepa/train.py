@@ -2,9 +2,10 @@
 
 Loss is 5-way InfoNCE: predicted Ŝ vs frozen BioViL-T embeddings of
 ``{Finding} is {class}.`` (gold = positive, other four = negatives).
-Text encoder is frozen. On improving or worsening rows, training adds
-0.05 to the stable cosine before dividing by temperature. Gold argmax
-does not. Fresh run (does not resume a previous checkpoint dir).
+Text encoder is frozen. When the label is not resolved, the resolved
+sentence is left out of the training softmax. Rows labeled resolved
+still compete against all five. Gold argmax scores all five.
+Fresh run (does not resume a previous checkpoint dir).
 Rank-0 runs CheXTemporal gold set-match after every epoch.
 
     torchrun --nproc_per_node=4 -m vljepa.train
@@ -77,9 +78,9 @@ SAVE_EVERY_N_EPOCHS = 1
 FREEZE_IMAGE_ENCODER = True
 FREEZE_TEXT_ENCODER = True
 STOPGRAD_NEG_PHRASES = False
-# Training only. Added to the stable cosine, before /τ, when the label is
-# improving or worsening. Gold argmax does not add this.
-STABLE_MARGIN = 0.05
+# Training only. Non-resolved rows drop the resolved sentence from the
+# softmax. Gold argmax still scores all five.
+DROP_RESOLVED_NEGATIVE = True
 N_LLAMA_LAYERS = 8
 LLAMA_NAME = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
 llama_hub_cache()
@@ -96,11 +97,11 @@ IMAGE_ROOTS = cluster_image_roots()
 
 CHECKPOINT_DIR = os.environ.get(
     "VLJEPA_CHECKPOINT_DIR",
-    os.path.join(_ROOT, "checkpoints_vljepa_margin"),
+    os.path.join(_ROOT, "checkpoints_vljepa_resolved"),
 )
 LOG_DIR = os.environ.get(
     "VLJEPA_LOG_DIR",
-    os.path.join(_ROOT, "logs_vljepa_margin"),
+    os.path.join(_ROOT, "logs_vljepa_resolved"),
 )
 CSV_LOG = os.path.join(LOG_DIR, "val_metrics_vljepa.csv")
 FEAT_CSV_LOG = os.path.join(LOG_DIR, "feat_std_vljepa.csv")
@@ -129,14 +130,6 @@ def ddp_reduce(value, device, world_size):
     tensor = torch.tensor(value, device=device, dtype=torch.float64)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     tensor /= world_size
-    return float(tensor.item())
-
-
-def ddp_sum(value, device, world_size):
-    if world_size <= 1:
-        return float(value)
-    tensor = torch.tensor(value, device=device, dtype=torch.float64)
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return float(tensor.item())
 
 
@@ -210,27 +203,6 @@ def build_optimizer(model: VLJEPA):
     return AdamW(groups, weight_decay=WEIGHT_DECAY)
 
 
-def _stable_gaps(logits: torch.Tensor, labels: torch.Tensor):
-    """Sum and count of raw (cos_gold - cos_stable) on improving and worsening rows.
-
-    ``logits`` are unmargined cos/τ. Positive means the gold sentence is ahead of stable.
-    """
-    cos = logits.detach() * float(TEMPERATURE)
-    i_imp = CLS_ORDER.index("improving")
-    i_wor = CLS_ORDER.index("worsening")
-    i_sta = CLS_ORDER.index("stable")
-    out = []
-    for i_cls in (i_imp, i_wor):
-        mask = labels == i_cls
-        n_row = int(mask.sum().item())
-        if n_row == 0:
-            out.append((0.0, 0))
-        else:
-            gap = (cos[mask, i_cls] - cos[mask, i_sta]).sum().item()
-            out.append((float(gap), n_row))
-    return out
-
-
 @torch.no_grad()
 def run_val(raw_model, loader, device, class_weights, desc):
     raw_model.eval()
@@ -251,7 +223,7 @@ def run_val(raw_model, loader, device, class_weights, desc):
             out["pred"], out["target_global"], labels,
             temperature=TEMPERATURE, class_weights=class_weights,
             stopgrad_negatives=STOPGRAD_NEG_PHRASES,
-            stable_margin=STABLE_MARGIN,
+            drop_resolved_negative=DROP_RESOLVED_NEGATIVE,
         )
         pred_cls = logits.argmax(dim=-1)
         total += float(loss.item()) * labels.shape[0]
@@ -275,10 +247,6 @@ def train_one_epoch(
     running = 0.0
     correct = 0
     n = 0
-    gap_imp_sum = 0.0
-    gap_wor_sum = 0.0
-    gap_imp_n = 0
-    gap_wor_n = 0
     pbar = tqdm(loader, desc=f"vljepa train ep{epoch}", disable=rank != 0)
     last_stats = {}
     for batch in pbar:
@@ -293,7 +261,7 @@ def train_one_epoch(
             out["pred"], out["target_global"], labels,
             temperature=TEMPERATURE, class_weights=class_weights,
             stopgrad_negatives=STOPGRAD_NEG_PHRASES,
-            stable_margin=STABLE_MARGIN,
+            drop_resolved_negative=DROP_RESOLVED_NEGATIVE,
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -305,11 +273,6 @@ def train_one_epoch(
         running += float(loss.item()) * labels.shape[0]
         correct += int((pred_cls == labels).sum().item())
         n += int(labels.shape[0])
-        (g_imp, n_imp), (g_wor, n_wor) = _stable_gaps(logits, labels)
-        gap_imp_sum += g_imp
-        gap_wor_sum += g_wor
-        gap_imp_n += n_imp
-        gap_wor_n += n_wor
         global_step += 1
         if rank == 0:
             last_stats = feat_stats_from_out(out, labels.shape[0])
@@ -327,16 +290,11 @@ def train_one_epoch(
                 loss=f"{running / max(n, 1):.4f}",
                 acc=f"{correct / max(n, 1):.3f}",
                 tgt_off=f"{last_stats.get('target_offdiag', 0):.3f}",
-                gap=f"{gap_imp_sum / max(gap_imp_n, 1):+.3f}/{gap_wor_sum / max(gap_wor_n, 1):+.3f}",
             )
     return (
         running / max(n, 1),
         correct / max(n, 1),
         global_step,
-        gap_imp_sum,
-        gap_imp_n,
-        gap_wor_sum,
-        gap_wor_n,
     )
 
 
@@ -370,8 +328,8 @@ def main():
             f"stopgrad_neg={STOPGRAD_NEG_PHRASES}"
         )
         print(
-            f"[vljepa]   margin = +{STABLE_MARGIN} on stable cosine "
-            f"when label is improving or worsening (train only)"
+            f"[vljepa]   resolved = drop from softmax unless it is the label "
+            f"(drop_resolved_negative={DROP_RESOLVED_NEGATIVE})"
         )
         print(f"[vljepa]   freeze image={FREEZE_IMAGE_ENCODER} "
               f"text={FREEZE_TEXT_ENCODER}")
@@ -517,10 +475,7 @@ def main():
     for epoch in range(start_epoch, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        (
-            train_loss, train_acc, global_step,
-            gap_imp_sum, gap_imp_n, gap_wor_sum, gap_wor_n,
-        ) = train_one_epoch(
+        train_loss, train_acc, global_step = train_one_epoch(
             model, raw_model, train_loader, optimizer, scheduler,
             device, class_weights, epoch, rank,
             global_step=global_step, feat_csv=feat_f,
@@ -532,13 +487,6 @@ def main():
         train_acc = ddp_reduce(train_acc, device, world_size)
         val_loss = ddp_reduce(val_loss, device, world_size)
         val_acc = ddp_reduce(val_acc, device, world_size)
-        gap_imp_sum = ddp_sum(gap_imp_sum, device, world_size)
-        gap_imp_n = ddp_sum(gap_imp_n, device, world_size)
-        gap_wor_sum = ddp_sum(gap_wor_sum, device, world_size)
-        gap_wor_n = ddp_sum(gap_wor_n, device, world_size)
-        gap_imp = gap_imp_sum / max(gap_imp_n, 1.0)
-        gap_wor = gap_wor_sum / max(gap_wor_n, 1.0)
-
         if rank == 0:
             print(
                 f"[vljepa] epoch {epoch}: "
@@ -546,7 +494,7 @@ def main():
                 f"val loss={val_loss:.4f} acc={val_acc:.3f} (n={val_n}) | "
                 f"img_std={val_feat.get('img_patch_std', 0):.4f} "
                 f"tgt_offdiag={val_feat.get('target_offdiag', 0):.4f} "
-                f"stable_margin={STABLE_MARGIN} gap_imp={gap_imp:+.4f} gap_wor={gap_wor:+.4f}"
+                f"drop_resolved={DROP_RESOLVED_NEGATIVE}"
             )
             ckpt = {
                 "epoch": epoch,
@@ -561,7 +509,7 @@ def main():
                     "llama_local": LLAMA_LOCAL,
                     "freeze_image_encoder": FREEZE_IMAGE_ENCODER,
                     "freeze_text_encoder": FREEZE_TEXT_ENCODER,
-                    "stable_margin": STABLE_MARGIN,
+                    "drop_resolved_negative": DROP_RESOLVED_NEGATIVE,
                     "temperature": TEMPERATURE,
                     "query_template": QUERY_TEMPLATE,
                     "target_template": TARGET_TEMPLATE,

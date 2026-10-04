@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=vljepa_margin
+#SBATCH --job-name=vljepa_resfix
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_margin_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_margin_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_resfix_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_resfix_%j.err
 
 # ============================================================
 # Option-2 VL-JEPA (Chen et al. arXiv:2512.10942 predictor).
@@ -20,9 +20,9 @@
 #   pred   : last 8 Llama-3.2-1B layers, bidirectional
 #   loss   : 5-way InfoNCE; all five phrases live (no stop-grad)
 #   freeze : image frozen, BioViL-T text frozen, Llama predictor unfrozen
-#   margin : train only, +0.05 on the stable cosine when the label is
-#            improving or worsening. Gold argmax does not add it.
-#   ckpt   : checkpoints_vljepa_margin/  (fresh; does not resume nudge or frzy)
+#   resolved: train only. If the label is not resolved, that sentence is
+#            left out of the softmax. Gold argmax still scores all five.
+#   ckpt   : checkpoints_vljepa_resolved/  (fresh; does not resume margin)
 #   grain  : one silver (pair, finding) per example
 #   eval   : CheXTemporal gold set-match after every epoch
 #
@@ -104,9 +104,9 @@ checks = [
     ("stopgrad_negatives", model),
     ("STOPGRAD_NEG_PHRASES = False", train),
     ("FREEZE_TEXT_ENCODER = True", train),
-    ("checkpoints_vljepa_margin", train),
-    ("STABLE_MARGIN = 0.05", train),
-    ("stable_margin", model),
+    ("checkpoints_vljepa_resolved", train),
+    ("DROP_RESOLVED_NEGATIVE = True", train),
+    ("drop_resolved_negative", model),
     ("SCRATCH_BASE_DEFAULT = \"/scratch/m000081/eprakash\"", (root / "cluster_paths.py").read_text()),
     ("LlamaPredictor", model),
     ("embed_query", model),
@@ -126,6 +126,8 @@ if "class_nudge" in model or "class_nudge" in train:
     bad.append("  class_nudge still present")
 if "stable_separation_loss" in model or "stable_separation_loss" in train:
     bad.append("  stable_separation_loss still present")
+if "STABLE_MARGIN" in train or "stable_margin" in model:
+    bad.append("  stable margin still present")
 if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
@@ -133,7 +135,7 @@ if bad:
 print("[abort-check] OK  option-2 VL-JEPA")
 print("[abort-check] OK  query=What is the progression of {finding}?")
 print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
-print("[abort-check] OK  text frozen; stable margin 0.05; fresh ckpt dir margin")
+print("[abort-check] OK  text frozen; drop resolved unless it is the label; fresh ckpt dir resolved")
 print("[abort-check] OK  cycle-6 paths /scratch/m000081/eprakash")
 print("[abort-check] OK  BioViL-T pair image + Llama query + BioViL-T Y-encoder")
 print("[abort-check] OK  gold set-match after every epoch")

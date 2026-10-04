@@ -739,7 +739,7 @@ def class_infonce_loss(
     temperature: float = 0.07,
     class_weights: Optional[torch.Tensor] = None,
     stopgrad_negatives: bool = True,
-    stable_margin: float = 0.0,
+    drop_resolved_negative: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """In-example 5-way InfoNCE.
 
@@ -752,10 +752,10 @@ def class_infonce_loss(
     cosines, so Ŝ is trained 5-way; the four wrong sentences cannot
     walk away from Ŝ on other rows.
 
-    ``stable_margin`` is added to the stable cosine, before dividing by
-    temperature, only on rows whose label is improving or worsening.
-    Returned logits are the raw cosines divided by temperature, with no
-    margin, so argmax matches gold.
+    When ``drop_resolved_negative`` is True and the label is not resolved,
+    the resolved logit is removed from the softmax. Rows whose label is
+    resolved still compete against all five sentences. Returned logits
+    are the raw scores, so argmax matches gold.
     """
     bsz = pred.shape[0]
     if target_global.dim() == 2:
@@ -775,14 +775,11 @@ def class_infonce_loss(
         tgt_used = tgt_n
     logits = torch.einsum("bd,bcd->bc", pred_n, tgt_used) / float(temperature)
     loss_logits = logits
-    if float(stable_margin) != 0.0:
+    if drop_resolved_negative:
         labels = labels.to(device=logits.device)
-        i_imp = CLS_ORDER.index("improving")
-        i_wor = CLS_ORDER.index("worsening")
-        i_sta = CLS_ORDER.index("stable")
-        apply = ((labels == i_imp) | (labels == i_wor)).unsqueeze(1).to(logits.dtype)
-        bump = torch.zeros_like(logits)
-        bump[:, i_sta] = float(stable_margin) / float(temperature)
-        loss_logits = logits + bump * apply
+        i_res = CLS_ORDER.index("resolved")
+        block = torch.zeros_like(logits, dtype=torch.bool)
+        block[labels != i_res, i_res] = True
+        loss_logits = logits.masked_fill(block, float("-inf"))
     loss = F.cross_entropy(loss_logits, labels, weight=class_weights)
     return loss, logits
