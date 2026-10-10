@@ -243,7 +243,6 @@ def report(name: str, vecs: torch.Tensor, rows: Sequence[Tuple[str, str, int, st
     for k, (a, b) in enumerate(NEGATION_PAIRS):
         cos = float((vecs[base + 2 * k] * vecs[base + 2 * k + 1]).sum())
         _print(f"  {cos:.4f}   {a}  ||  {b}")
-    del neg_texts
 
     _maybe_tsne(name, vecs[: len(rows)], rows)
 
@@ -257,6 +256,13 @@ def _maybe_tsne(name: str, vecs: torch.Tensor, rows: Sequence[Tuple[str, str, in
     except ImportError as exc:
         _print(f"t-SNE skipped ({exc})")
         return
+    try:
+        _write_tsne(name, vecs, rows, TSNE, plt)
+    except Exception as exc:
+        _print(f"t-SNE skipped ({type(exc).__name__}: {exc})")
+
+
+def _write_tsne(name, vecs, rows, TSNE, plt) -> None:
     perplexity = min(15, max(5, len(rows) // 4))
     xy = TSNE(
         n_components=2, perplexity=perplexity, init="pca", learning_rate="auto",
