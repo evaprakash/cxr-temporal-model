@@ -1,11 +1,10 @@
-"""DDP trainer for option-2 VL-JEPA.
+"""DDP trainer for five-guess VL-JEPA.
 
-Loss is 5-way InfoNCE: predicted Ŝ vs frozen BioViL-T embeddings of
-``{Finding} is {class}.`` (gold = positive, other four = negatives).
-Text encoder is frozen. When the label is not resolved, the resolved
-sentence is left out of the training softmax. Rows labeled resolved
-still compete against all five. Gold argmax scores all five.
-Fresh run (does not resume a previous checkpoint dir).
+The predictor emits five guesses, one per progression class. Guess c is
+scored only against the frozen BioViL-T embedding of
+``{Finding} is {class c}.``. The gold guess is pulled onto its sentence.
+Each other guess is pushed off its own sentence. Image and text encoders
+stay frozen. Fresh checkpoint dir (does not resume an older run).
 Rank-0 runs CheXTemporal gold set-match after every epoch.
 
     torchrun --nproc_per_node=4 -m vljepa.train
@@ -51,7 +50,7 @@ from .dataset import VLJEPAFindingDataset, flatten_target_texts, vljepa_collate_
 from .eval_gold import eval_gold_setmatch
 from .model import (
     VLJEPA,
-    class_infonce_loss,
+    five_guess_loss,
     llama_hub_cache,
     resolve_llama_local,
 )
@@ -77,10 +76,7 @@ SAVE_EVERY_N_EPOCHS = 1
 
 FREEZE_IMAGE_ENCODER = True
 FREEZE_TEXT_ENCODER = True
-STOPGRAD_NEG_PHRASES = False
-# Training only. Non-resolved rows drop the resolved sentence from the
-# softmax. Gold argmax still scores all five.
-DROP_RESOLVED_NEGATIVE = True
+LOSS = "five_guess"
 N_LLAMA_LAYERS = 8
 LLAMA_NAME = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
 llama_hub_cache()
@@ -97,11 +93,11 @@ IMAGE_ROOTS = cluster_image_roots()
 
 CHECKPOINT_DIR = os.environ.get(
     "VLJEPA_CHECKPOINT_DIR",
-    os.path.join(_ROOT, "checkpoints_vljepa_resolved"),
+    os.path.join(_ROOT, "checkpoints_vljepa_fiveguess"),
 )
 LOG_DIR = os.environ.get(
     "VLJEPA_LOG_DIR",
-    os.path.join(_ROOT, "logs_vljepa_resolved"),
+    os.path.join(_ROOT, "logs_vljepa_fiveguess"),
 )
 CSV_LOG = os.path.join(LOG_DIR, "val_metrics_vljepa.csv")
 FEAT_CSV_LOG = os.path.join(LOG_DIR, "feat_std_vljepa.csv")
@@ -219,11 +215,9 @@ def run_val(raw_model, loader, device, class_weights, desc):
         out = raw_model(
             prior, current, batch["query_text"], target_texts=targets,
         )
-        loss, logits = class_infonce_loss(
+        loss, logits = five_guess_loss(
             out["pred"], out["target_global"], labels,
             temperature=TEMPERATURE, class_weights=class_weights,
-            stopgrad_negatives=STOPGRAD_NEG_PHRASES,
-            drop_resolved_negative=DROP_RESOLVED_NEGATIVE,
         )
         pred_cls = logits.argmax(dim=-1)
         total += float(loss.item()) * labels.shape[0]
@@ -257,11 +251,9 @@ def train_one_epoch(
         out = raw_model(
             prior, current, batch["query_text"], target_texts=targets,
         )
-        loss, logits = class_infonce_loss(
+        loss, logits = five_guess_loss(
             out["pred"], out["target_global"], labels,
             temperature=TEMPERATURE, class_weights=class_weights,
-            stopgrad_negatives=STOPGRAD_NEG_PHRASES,
-            drop_resolved_negative=DROP_RESOLVED_NEGATIVE,
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -318,18 +310,14 @@ def main():
     if rank == 0:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(LOG_DIR, exist_ok=True)
-        print("[vljepa] option 2")
+        print("[vljepa] five guesses")
         print(f"[vljepa]   query  = {QUERY_TEMPLATE}  (Llama tok+embed)")
         print(f"[vljepa]   target = {TARGET_TEMPLATE}  (BioViL-T Y-encoder)")
         print(f"[vljepa]   image  = BioViL-T pair (prior+current)")
-        print(f"[vljepa]   pred   = Llama last {N_LLAMA_LAYERS} layers")
+        print(f"[vljepa]   pred   = Llama last {N_LLAMA_LAYERS} layers, {N_CLS} heads")
         print(
-            f"[vljepa]   loss   = 5-way InfoNCE τ={TEMPERATURE} "
-            f"stopgrad_neg={STOPGRAD_NEG_PHRASES}"
-        )
-        print(
-            f"[vljepa]   resolved = drop from softmax unless it is the label "
-            f"(drop_resolved_negative={DROP_RESOLVED_NEGATIVE})"
+            f"[vljepa]   loss   = five-guess BCE τ={TEMPERATURE} "
+            f"(gold guess pulled on; each other guess pushed off its sentence)"
         )
         print(f"[vljepa]   freeze image={FREEZE_IMAGE_ENCODER} "
               f"text={FREEZE_TEXT_ENCODER}")
@@ -423,7 +411,15 @@ def main():
     resume_path = args.resume or latest_ckpt(CHECKPOINT_DIR)
     if resume_path and os.path.isfile(resume_path):
         ckpt = torch.load(resume_path, map_location="cpu")
-        raw_model.load_state_dict(ckpt["model"], strict=False)
+        cfg = ckpt.get("vljepa_cfg") or {}
+        if cfg.get("loss") != LOSS or int(cfg.get("n_guesses", 0)) != N_CLS:
+            raise SystemExit(
+                f"[vljepa] refusing to resume {resume_path}: "
+                f"checkpoint loss={cfg.get('loss')!r} n_guesses={cfg.get('n_guesses')!r}. "
+                f"This run only resumes loss={LOSS!r} with {N_CLS} guesses. "
+                f"Use an empty {CHECKPOINT_DIR}."
+            )
+        raw_model.load_state_dict(ckpt["model"], strict=True)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -493,8 +489,7 @@ def main():
                 f"train loss={train_loss:.4f} acc={train_acc:.3f} | "
                 f"val loss={val_loss:.4f} acc={val_acc:.3f} (n={val_n}) | "
                 f"img_std={val_feat.get('img_patch_std', 0):.4f} "
-                f"tgt_offdiag={val_feat.get('target_offdiag', 0):.4f} "
-                f"drop_resolved={DROP_RESOLVED_NEGATIVE}"
+                f"tgt_offdiag={val_feat.get('target_offdiag', 0):.4f}"
             )
             ckpt = {
                 "epoch": epoch,
@@ -509,7 +504,8 @@ def main():
                     "llama_local": LLAMA_LOCAL,
                     "freeze_image_encoder": FREEZE_IMAGE_ENCODER,
                     "freeze_text_encoder": FREEZE_TEXT_ENCODER,
-                    "drop_resolved_negative": DROP_RESOLVED_NEGATIVE,
+                    "loss": LOSS,
+                    "n_guesses": N_CLS,
                     "temperature": TEMPERATURE,
                     "query_template": QUERY_TEMPLATE,
                     "target_template": TARGET_TEMPLATE,

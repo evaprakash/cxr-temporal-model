@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=vljepa_resfix
+#SBATCH --job-name=vljepa_five
 #SBATCH -p preempt
 #SBATCH -A marlowe-m000081
 #SBATCH --nodes=1
@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_resfix_%j.out
-#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_resfix_%j.err
+#SBATCH --output=/scratch/m000081/eprakash/logs/vljepa_five_%j.out
+#SBATCH --error=/scratch/m000081/eprakash/logs/vljepa_five_%j.err
 
 # ============================================================
 # Option-2 VL-JEPA (Chen et al. arXiv:2512.10942 predictor).
@@ -17,20 +17,19 @@
 #   image  : BioViL-T pair encoder (prior + current)
 #   query  : "What is the progression of {finding}?"  (Llama tok+embed)
 #   target : "{Finding} is {class}."  BioViL-T Y-encoder; pos=gold, neg=other 4
-#   pred   : last 8 Llama-3.2-1B layers, bidirectional
-#   loss   : 5-way InfoNCE; all five phrases live (no stop-grad)
+#   pred   : last 8 Llama-3.2-1B layers, bidirectional, five class heads
+#   loss   : five-guess BCE. Gold guess pulled onto its sentence.
+#            Each other guess pushed off its own sentence.
 #   freeze : image frozen, BioViL-T text frozen, Llama predictor unfrozen
-#   resolved: train only. If the label is not resolved, that sentence is
-#            left out of the softmax. Gold argmax still scores all five.
-#   ckpt   : checkpoints_vljepa_resolved/  (fresh; does not resume margin)
+#   ckpt   : checkpoints_vljepa_fiveguess/  (fresh; does not resume older runs)
 #   grain  : one silver (pair, finding) per example
 #   eval   : CheXTemporal gold set-match after every epoch
 #
 #     mkdir -p /scratch/m000081/eprakash/logs
 #     cd /scratch/m000081/eprakash/temporal/final/cxr-temporal-model
 #     git pull
+#     python -m vljepa.smoke_train_cpu     # 1 example x 5 epochs, writes a ckpt dir
 #     python -m vljepa.smoke_cluster       # paths + real Llama load/run
-#     python -m vljepa.smoke_test          # CPU shape check (tiny Llama)
 #     sbatch vljepa/train.sh
 #
 # Optional:
@@ -86,6 +85,7 @@ need = [
     "eval_gold.py",
     "prompts.py",
     "smoke_test.py",
+    "smoke_train_cpu.py",
     "smoke_cluster.py",
     "cluster_paths.py",
 ]
@@ -100,13 +100,10 @@ prompts = (root / "prompts.py").read_text()
 checks = [
     ('QUERY_TEMPLATE = "What is the progression of {finding}?"', prompts),
     ('TARGET_TEMPLATE = "{finding} is {cls}."', prompts),
-    ("class_infonce_loss", model),
-    ("stopgrad_negatives", model),
-    ("STOPGRAD_NEG_PHRASES = False", train),
+    ("five_guess_loss", model),
     ("FREEZE_TEXT_ENCODER = True", train),
-    ("checkpoints_vljepa_resolved", train),
-    ("DROP_RESOLVED_NEGATIVE = True", train),
-    ("drop_resolved_negative", model),
+    ("checkpoints_vljepa_fiveguess", train),
+    ('LOSS = "five_guess"', train),
     ("SCRATCH_BASE_DEFAULT = \"/scratch/m000081/eprakash\"", (root / "cluster_paths.py").read_text()),
     ("LlamaPredictor", model),
     ("embed_query", model),
@@ -122,20 +119,31 @@ for needle, src in checks:
         bad.append(f"  missing {needle!r}")
 if "target_image_encoder" in train:
     bad.append("  train.py still looks like image-JEPA (target_image_encoder)")
-if "class_nudge" in model or "class_nudge" in train:
-    bad.append("  class_nudge still present")
-if "stable_separation_loss" in model or "stable_separation_loss" in train:
-    bad.append("  stable_separation_loss still present")
-if "STABLE_MARGIN" in train or "stable_margin" in model:
-    bad.append("  stable margin still present")
+banned = (
+    "class_nudge",
+    "stable_separation_loss",
+    "STABLE_MARGIN",
+    "stable_margin",
+    "DROP_RESOLVED",
+    "drop_resolved_negative",
+    "STOPGRAD_NEG",
+    "stopgrad_negatives",
+    "checkpoints_vljepa_resolved",
+    "checkpoints_vljepa_margin",
+    "checkpoints_vljepa_nudge",
+    "class_infonce_loss",
+)
+for name in banned:
+    if name in model or name in train:
+        bad.append(f"  removed experiment still present: {name}")
 if bad:
     print("[abort-check] FAILED")
     print("\n".join(bad))
     sys.exit(1)
-print("[abort-check] OK  option-2 VL-JEPA")
+print("[abort-check] OK  five-guess VL-JEPA")
 print("[abort-check] OK  query=What is the progression of {finding}?")
-print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
-print("[abort-check] OK  text frozen; drop resolved unless it is the label; fresh ckpt dir resolved")
+print("[abort-check] OK  target={Finding} is {class}.  each guess scored on its own sentence")
+print("[abort-check] OK  image and text frozen; fresh ckpt dir fiveguess")
 print("[abort-check] OK  cycle-6 paths /scratch/m000081/eprakash")
 print("[abort-check] OK  BioViL-T pair image + Llama query + BioViL-T Y-encoder")
 print("[abort-check] OK  gold set-match after every epoch")
