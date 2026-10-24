@@ -25,6 +25,11 @@ SCRATCH_BASE_DEFAULT = "/scratch/m000081/eprakash"
 PROJECT_DIR_DEFAULT = (
     "/scratch/m000081/eprakash/temporal/final/cxr-temporal-model"
 )
+# Azure GPU box. /nvme is local to ccw-gpu-1, not the 15GB home quota,
+# and it is not persistent across a reboot.
+CCW_PEOPLE = "/nvme/people/eprakash"
+CCW_ALL_DATA = "/nvme/data/temporal/all_data"
+CCW_PROJECT = "/nvme/people/eprakash/cxr-temporal-model"
 GOLD_DATASETS = ("mimic", "chexpert", "rexgradient")
 
 
@@ -32,12 +37,27 @@ def repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+def on_ccw() -> bool:
+    """True on the Azure GPU node, where /nvme is mounted."""
+    return os.path.isdir(CCW_ALL_DATA) or os.path.isdir(CCW_PEOPLE)
+
+
 def scratch_base() -> str:
-    return os.environ.get("SCRATCH_BASE", SCRATCH_BASE_DEFAULT)
+    env = os.environ.get("SCRATCH_BASE")
+    if env:
+        return env
+    if on_ccw():
+        return CCW_PEOPLE
+    return SCRATCH_BASE_DEFAULT
 
 
 def project_dir() -> str:
-    return os.environ.get("PROJECT_DIR", PROJECT_DIR_DEFAULT)
+    env = os.environ.get("PROJECT_DIR")
+    if env:
+        return env
+    if on_ccw():
+        return CCW_PROJECT
+    return PROJECT_DIR_DEFAULT
 
 
 def chextemporal_dir() -> str:
@@ -48,6 +68,8 @@ def chextemporal_dir() -> str:
         os.path.join(repo_root(), "CheXTemporal"),
         os.path.join(scratch_base(), "temporal", "final", "CheXTemporal"),
         os.path.join(project_dir(), "CheXTemporal"),
+        "/nvme/data/temporal/CheXTemporal",
+        os.path.join(CCW_PEOPLE, "CheXTemporal"),
     ):
         if os.path.isdir(cand):
             return os.path.abspath(cand)
@@ -58,6 +80,8 @@ def image_roots_dir() -> str:
     env = os.environ.get("JEPA_IMAGE_ROOTS_DIR")
     if env:
         return env
+    if on_ccw():
+        return CCW_ALL_DATA
     local = os.path.join(repo_root(), "all_data")
     if os.path.isdir(local):
         return os.path.abspath(local)
@@ -103,6 +127,8 @@ def gold_image_dir(dataset: str, extra_bases: Optional[List[str]] = None) -> Opt
         project_dir(),
         chextemporal_dir(),
         os.path.dirname(chextemporal_dir()),
+        "/nvme/data/temporal",
+        CCW_PEOPLE,
     ]
     if extra_bases:
         bases.extend(extra_bases)

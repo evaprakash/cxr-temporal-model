@@ -1,15 +1,15 @@
-"""VL-JEPA for temporal CXR (option 2), five guesses.
+"""VL-JEPA for temporal CXR (option 2), paper query path.
 
     prior + current  ─►  BioViL-T image encoder (pair)  ─►  visual tokens
     query text       ─►  Llama tokenizer + embed_tokens ─►  query tokens
                          └─► Llama predictor (last 8 Llama-3.2-1B layers,
-                             bidirectional) ─► five guesses Ŝ_1..Ŝ_5
+                             bidirectional) ─► predicted target embedding Ŝ
     class phrases    ─►  BioViL-T text encoder (Y-encoder) ─►  S_Y^{1..5}
-                         Guess c is scored only against sentence c.
-                         The gold guess is pulled onto its sentence.
-                         Each other guess is pushed off its own sentence.
+                         InfoNCE(Ŝ, S_Y) with the gold class as the positive
+                         and the other four ``{Finding} is {class}.`` phrases
+                         as in-example negatives. Wrong-phrase Y embeddings
+                         are stop-grad so Y only moves through the gold sentence.
 
-Both encoders stay frozen. The answer sentences are a fixed key.
 Matches VL-JEPA (Chen et al., arXiv:2512.10942): query is Llama-side,
 target lives in a separate Y-encoder. Here the Y-encoder is BioViL-T.
 """
@@ -28,13 +28,14 @@ import torch.nn.functional as F
 from . import _root  # noqa: F401  — repo root on sys.path
 
 from progression_phrases import CLS_ORDER
+from tempcxr.modules.image_encoder_jepa import BioViLTImageEncoderJEPA
+from tempcxr.modules.text_encoder import BioViLTTextEncoder
 
 from .cluster_paths import hf_home as llama_hf_home
 from .prompts import class_target_texts, query_text
 
 LLAMA_NAME_DEFAULT = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
 N_LLAMA_LAYERS_DEFAULT = 8
-N_CLS = len(CLS_ORDER)
 MAX_QUERY_LEN = 64
 MAX_QUERY_LEN_SMOKE = 32
 
@@ -320,13 +321,12 @@ def _additive_pad_mask(pad_bool: torch.Tensor) -> torch.Tensor:
 
 
 class LlamaPredictor(nn.Module):
-    """Bidirectional Llama stack: visual tokens + query → one guess per class."""
+    """Bidirectional Llama stack: visual tokens + Llama-embedded query → Ŝ."""
 
     def __init__(
         self,
         vis_dim: int = 128,
         out_dim: int = 128,
-        n_cls: int = N_CLS,
         n_layers: int = N_LLAMA_LAYERS_DEFAULT,
         smoke: bool = False,
         llama_name: str = LLAMA_NAME_DEFAULT,
@@ -337,8 +337,6 @@ class LlamaPredictor(nn.Module):
         super().__init__()
         self.smoke = bool(smoke)
         self.n_layers = int(n_layers)
-        self.n_cls = int(n_cls)
-        self.out_dim = int(out_dim)
         self.gradient_checkpointing = bool(gradient_checkpointing) and not smoke
         self.max_query_len = int(
             max_query_len
@@ -356,8 +354,7 @@ class LlamaPredictor(nn.Module):
         self.hidden_size = hidden
         self.vis_proj = nn.Linear(vis_dim, hidden)
         self.type_embed = nn.Embedding(2, hidden)  # 0=vision, 1=query
-        # One linear head per progression class. Each head is one guess.
-        self.out_proj = nn.Linear(hidden, self.n_cls * self.out_dim)
+        self.out_proj = nn.Linear(hidden, out_dim)
         self.out_norm = nn.LayerNorm(hidden)
 
     def _load_tokenizer(self, smoke: bool, llama_name: str, llama_local: Optional[str]):
@@ -542,8 +539,6 @@ class LlamaPredictor(nn.Module):
         """
         vis_tokens  : (B, Nv, Dv)  BioViL-T pair tokens (global + patches)
         query_texts : list[str]    Llama-tokenized inside this module
-
-        Returns ``(B, C, D)``: one unit-norm guess per class.
         """
         bsz, n_vis, _ = vis_tokens.shape
         vis_h = self.vis_proj(vis_tokens.float())
@@ -585,8 +580,7 @@ class LlamaPredictor(nn.Module):
 
         mask_f = token_mask.unsqueeze(-1).to(hidden.dtype)
         pooled = (hidden * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
-        raw = self.out_proj(pooled).view(bsz, self.n_cls, self.out_dim)
-        pred = F.normalize(raw, dim=-1)
+        pred = F.normalize(self.out_proj(pooled), dim=-1)
 
         if not return_aux:
             return pred
@@ -607,7 +601,7 @@ class LlamaPredictor(nn.Module):
 
 
 class VLJEPA(nn.Module):
-    """Pair image + Llama query → five progression guesses."""
+    """Pair image + Llama query → BioViL-T progression-phrase embedding."""
 
     def __init__(
         self,
@@ -617,23 +611,24 @@ class VLJEPA(nn.Module):
         llama_name: str = LLAMA_NAME_DEFAULT,
         llama_local: Optional[str] = None,
         freeze_image_encoder: bool = True,
-        freeze_text_encoder: bool = True,
+        freeze_text_encoder: bool = False,
         gradient_checkpointing: bool = True,
     ):
         super().__init__()
-        from tempcxr.modules.image_encoder_jepa import BioViLTImageEncoderJEPA
-        from tempcxr.modules.text_encoder import BioViLTTextEncoder
-
         img_mode = "biovilt_no_pretrained" if smoke else image_mode
         self.image_encoder = BioViLTImageEncoderJEPA(mode=img_mode)
         # Y-encoder only (targets). Query does not go through here.
         self.text_encoder = BioViLTTextEncoder(mode="biovilt")
+        if not smoke:
+            from .text_lora import apply_text_lora
+            self.text_lora_path = apply_text_lora(self.text_encoder)
+        else:
+            self.text_lora_path = None
         vis_dim = int(self.image_encoder.embed_dim)
         txt_dim = int(self.text_encoder.proj_dim)
         self.predictor = LlamaPredictor(
             vis_dim=vis_dim,
             out_dim=txt_dim,
-            n_cls=N_CLS,
             n_layers=n_llama_layers,
             smoke=smoke,
             llama_name=llama_name,
@@ -723,7 +718,7 @@ class VLJEPA(nn.Module):
         finding: str,
         text_cache: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Return ``(C,)`` scores. Guess c is cosine-scored only against sentence c."""
+        """Return ``(C,)`` cosine scores of Ŝ vs the 5 class phrases."""
         queries = [query_text(finding)]
         targets = class_target_texts(finding)
         cache = text_cache if text_cache is not None else {}
@@ -739,35 +734,33 @@ class VLJEPA(nn.Module):
         tgt = torch.cat([_cached(t) for t in targets], dim=0)
         pred_n = F.normalize(pred.float(), dim=-1)
         tgt_n = F.normalize(tgt.float(), dim=-1)
-        if pred_n.dim() != 3:
-            raise ValueError(
-                f"five-guess predict() must return (B, C, D), got {tuple(pred_n.shape)}"
-            )
-        scores = (pred_n * tgt_n.unsqueeze(0)).sum(dim=-1)
-        return scores.squeeze(0)
+        return (pred_n * tgt_n).sum(dim=-1).squeeze(0)
 
 
-def five_guess_loss(
+def class_infonce_loss(
     pred: torch.Tensor,
     target_global: torch.Tensor,
     labels: torch.Tensor,
     temperature: float = 0.07,
     class_weights: Optional[torch.Tensor] = None,
+    stopgrad_negatives: bool = True,
+    drop_resolved_negative: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pull the gold guess onto its sentence and push the others off theirs.
+    """In-example 5-way InfoNCE.
 
-    ``pred``           (B, C, D) unit-norm guesses, one per class
+    ``pred``           (B, D) unit-norm predicted Ŝ
     ``target_global``  (B*C, D) or (B, C, D) class phrase embeddings
     ``labels``         (B,) gold class index
 
-    Guess c is compared only with sentence c. The gold entry is a positive
-    (pulled on). Each other entry is a negative (pushed off that sentence,
-    not pulled toward the gold sentence). Sentence embeddings are detached,
-    so the answer key stays fixed.
+    When ``stopgrad_negatives`` is True (default), Y-encoder gradients
+    flow only through the gold phrase. Softmax still sees all five
+    cosines, so Ŝ is trained 5-way; the four wrong sentences cannot
+    walk away from Ŝ on other rows.
 
-    Returned logits are those cosines divided by temperature. Argmax is the
-    class whose guess sits closest to its own sentence. When ``class_weights``
-    is set, each example is scaled by the weight of its gold class.
+    When ``drop_resolved_negative`` is True and the label is not resolved,
+    the resolved logit is removed from the softmax. Rows whose label is
+    resolved still compete against all five sentences. Returned logits
+    are the raw scores, so argmax matches gold.
     """
     bsz = pred.shape[0]
     if target_global.dim() == 2:
@@ -776,19 +769,22 @@ def five_guess_loss(
     else:
         targets = target_global
         n_cls = targets.shape[1]
-    if pred.dim() != 3 or pred.shape[1] != n_cls:
-        raise ValueError(
-            f"five-guess pred must be (B, {n_cls}, D), got {tuple(pred.shape)}"
-        )
-    labels = labels.to(device=pred.device)
     pred_n = F.normalize(pred.float(), dim=-1)
-    tgt_n = F.normalize(targets.float(), dim=-1).detach()
-    cos = (pred_n * tgt_n).sum(dim=-1)
-    logits = cos / float(temperature)
-    gold = F.one_hot(labels, n_cls).to(dtype=logits.dtype)
-    per = F.binary_cross_entropy_with_logits(logits, gold, reduction="none")
-    example = per.mean(dim=-1)
-    if class_weights is not None:
-        weights = class_weights.to(device=example.device, dtype=example.dtype)
-        example = example * weights[labels]
-    return example.mean(), logits
+    tgt_n = F.normalize(targets.float(), dim=-1)
+    if stopgrad_negatives:
+        labels = labels.to(device=tgt_n.device)
+        idx = torch.arange(bsz, device=tgt_n.device)
+        tgt_used = tgt_n.detach().clone()
+        tgt_used[idx, labels] = tgt_n[idx, labels]
+    else:
+        tgt_used = tgt_n
+    logits = torch.einsum("bd,bcd->bc", pred_n, tgt_used) / float(temperature)
+    loss_logits = logits
+    if drop_resolved_negative:
+        labels = labels.to(device=logits.device)
+        i_res = CLS_ORDER.index("resolved")
+        block = torch.zeros_like(logits, dtype=torch.bool)
+        block[labels != i_res, i_res] = True
+        loss_logits = logits.masked_fill(block, float("-inf"))
+    loss = F.cross_entropy(loss_logits, labels, weight=class_weights)
+    return loss, logits

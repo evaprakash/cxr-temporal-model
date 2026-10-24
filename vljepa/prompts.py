@@ -4,10 +4,10 @@ Query (predictor condition)
     ``What is the progression of {finding}?``
     Finding stays lowercase (``pleural effusion``).
 
-Targets (Y-encoder)
+Target / negatives (Y-encoder / InfoNCE)
     ``{Finding} is {class}.``
     Finding is sentence-cased (``Pleural effusion is stable.``).
-    One sentence per ``CLS_ORDER`` class. Guess c is scored only against sentence c.
+    Positive = gold class; negatives = the other four ``CLS_ORDER`` classes.
 """
 
 from __future__ import annotations

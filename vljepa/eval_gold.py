@@ -4,8 +4,8 @@ For each gold ``(pair, finding)``:
 
   1. Encode prior+current with BioViL-T (pair).
   2. Query = ``What is the progression of {finding}?`` (Llama tok+embed)
-  3. Predict five guesses, one per class.
-  4. Score cosine(guess c, BioViL-T Y-encoder(``{Finding} is {class c}.``)).
+  3. Predict Ŝ.
+  4. Score cosine(Ŝ, BioViL-T Y-encoder(``{Finding} is {class}.``)) for all 5 classes.
   5. Argmax / top-|GT| set-match (same tables as the JEPA trainer).
 """
 
@@ -125,11 +125,6 @@ def load_gold_groups(gold_parquet: Optional[str] = None):
 def load_vljepa_from_ckpt(ckpt_path: str, device: torch.device) -> VLJEPA:
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = ckpt.get("vljepa_cfg", {})
-    if cfg.get("loss") != "five_guess":
-        raise SystemExit(
-            f"[vljepa gold] {ckpt_path} is not a five-guess checkpoint "
-            f"(loss={cfg.get('loss')!r})"
-        )
     model = VLJEPA(
         image_mode="biovilt_no_pretrained",
         smoke=False,
@@ -137,7 +132,7 @@ def load_vljepa_from_ckpt(ckpt_path: str, device: torch.device) -> VLJEPA:
         llama_name=cfg.get("llama_name", "meta-llama/Llama-3.2-1B"),
         llama_local=cfg.get("llama_local"),
         freeze_image_encoder=bool(cfg.get("freeze_image_encoder", True)),
-        freeze_text_encoder=bool(cfg.get("freeze_text_encoder", True)),
+        freeze_text_encoder=bool(cfg.get("freeze_text_encoder", False)),
         gradient_checkpointing=False,
     )
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)

@@ -27,6 +27,7 @@ mlruns/
 *.pt
 *.pth
 *.ckpt
+!vljepa/lora/biovilt_text_epoch38.pt
 
 # Data
 *.parquet

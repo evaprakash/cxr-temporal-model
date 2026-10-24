@@ -2,7 +2,7 @@
 """CPU smoke test for option-2 VL-JEPA.
 
 Loads (or fabricates) 5 silver-style finding-examples, runs one forward
-+ five-guess step on CPU with the tiny Llama predictor, and prints every
++ InfoNCE step on CPU with the tiny Llama predictor, and prints every
 example's texts and every relevant tensor shape.
 
     python -m vljepa.smoke_test
@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from . import _root  # noqa: F401
 from .cluster_paths import image_roots as cluster_image_roots
 from .dataset import flatten_target_texts
-from .model import VLJEPA, five_guess_loss
+from .model import VLJEPA, class_infonce_loss
 from .prompts import QUERY_TEMPLATE, TARGET_TEMPLATE, class_target_texts, query_text
 from progression_phrases import CLS_ORDER
 
@@ -197,7 +197,7 @@ def _try_build_model():
         smoke=True,
         n_llama_layers=2,
         freeze_image_encoder=True,
-        freeze_text_encoder=True,
+        freeze_text_encoder=False,
         gradient_checkpointing=False,
     )
     model.eval()
@@ -218,7 +218,7 @@ def _build_stub_model():
                 n_layers=2, smoke=True, gradient_checkpointing=False,
             )
             self.freeze_image_encoder = True
-            self.freeze_text_encoder = True
+            self.freeze_text_encoder = False
 
         def encode_images(self, prior, current):
             return self.image_encoder(current, prior)
@@ -370,13 +370,7 @@ def main() -> int:
                 _print(f"  aux.{k:16s} {v}")
 
         labels = torch.tensor([ex["cls_idx"]], dtype=torch.long)
-        if out["pred"].dim() != 3 or out["pred"].shape[1] != len(CLS_ORDER):
-            all_ok = False
-            _print(
-                f"  pred shape {tuple(out['pred'].shape)} is not "
-                f"(1, {len(CLS_ORDER)}, D)"
-            )
-        loss, logits = five_guess_loss(
+        loss, logits = class_infonce_loss(
             out["pred"], out["target_global"], labels, temperature=0.07,
         )
         _print(f"  logits          {_shape(logits)}  values={logits.detach().tolist()}")
@@ -391,7 +385,7 @@ def main() -> int:
                 prior, current, [ex["query_text"]],
                 target_texts=ex["target_texts"],
             )
-            loss_b, _ = five_guess_loss(
+            loss_b, _ = class_infonce_loss(
                 out_b["pred"], out_b["target_global"], labels, temperature=0.07,
             )
             loss_b.backward()
@@ -419,12 +413,9 @@ def main() -> int:
     _print(f"  labels          {_shape(labels)}  {labels.tolist()}")
     try:
         out = model(prior, current, queries, target_texts=targets, return_aux=True)
-        loss, logits = five_guess_loss(
+        loss, logits = class_infonce_loss(
             out["pred"], out["target_global"], labels, temperature=0.07,
         )
-        if out["pred"].shape[1] != len(CLS_ORDER):
-            all_ok = False
-            _print(f"  batched pred has {out['pred'].shape[1]} guesses, expected {len(CLS_ORDER)}")
         _print(f"  pred            {_shape(out['pred'])}")
         _print(f"  target_global   {_shape(out['target_global'])}")
         _print(f"  logits          {_shape(logits)}")
