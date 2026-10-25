@@ -4,6 +4,7 @@
 #
 #   bash vljepa/run_ccw.sh smoke
 #   bash vljepa/run_ccw.sh train
+#   bash vljepa/run_ccw.sh check --ckpt <checkpoint dir>/epoch_N.pt
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -60,10 +61,13 @@ run() {
         NGPU="${SLURM_GPUS_ON_NODE:-4}"
         echo "[ccw] nproc_per_node=$NGPU"
         "$PY" -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train
+    elif [ "$MODE" = "check" ]; then
+        shift
+        "$PY" -m vljepa.check_class_signal "$@"
     else
-        echo "usage: bash vljepa/run_ccw.sh smoke|train" >&2
+        echo "usage: bash vljepa/run_ccw.sh smoke|train|check --ckpt <epoch_N.pt>" >&2
         return 1
     fi
 }
 
-run 2>&1 | tee -a "$LOG"
+run "$@" 2>&1 | tee -a "$LOG"
