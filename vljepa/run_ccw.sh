@@ -31,6 +31,20 @@ else
 fi
 export PYTHONUNBUFFERED=1
 
+# A fresh srun shell does not activate conda. The packages for this run
+# (torch, timm, pyarrow) live in the roentgen env on /nvme.
+ROENTGEN_PY="/nvme/people/eprakash/miniconda3/envs/roentgen/bin/python"
+if [ -x "$ROENTGEN_PY" ]; then
+    PY="$ROENTGEN_PY"
+elif command -v python >/dev/null 2>&1; then
+    PY="$(command -v python)"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="$(command -v python3)"
+else
+    echo "[ccw] no python found. Expected $ROENTGEN_PY" >&2
+    exit 1
+fi
+
 # Screen still shows the run. The file keeps the full gold report.
 run() {
     echo "[ccw] PROJECT_DIR=$PROJECT_DIR"
@@ -38,13 +52,14 @@ run() {
     echo "[ccw] hf=$VLJEPA_HF_HOME"
     echo "[ccw] ckpt=$VLJEPA_CHECKPOINT_DIR"
     echo "[ccw] log=$LOG"
+    echo "[ccw] python=$PY"
     if [ "$MODE" = "smoke" ]; then
         export CUDA_VISIBLE_DEVICES=""
-        python -m vljepa.smoke_ccw_cpu
+        "$PY" -m vljepa.smoke_ccw_cpu
     elif [ "$MODE" = "train" ]; then
         NGPU="${SLURM_GPUS_ON_NODE:-4}"
         echo "[ccw] nproc_per_node=$NGPU"
-        python -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train
+        "$PY" -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train
     else
         echo "usage: bash vljepa/run_ccw.sh smoke|train" >&2
         return 1
