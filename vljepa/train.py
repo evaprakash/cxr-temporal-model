@@ -80,7 +80,7 @@ FREEZE_TEXT_ENCODER = True
 STOPGRAD_NEG_PHRASES = False
 # Training only. Non-resolved rows drop the resolved sentence from the
 # softmax. Gold argmax still scores all five.
-DROP_RESOLVED_NEGATIVE = True
+DROP_RESOLVED_NEGATIVE = False
 N_LLAMA_LAYERS = 8
 LLAMA_NAME = os.environ.get("VLJEPA_LLAMA_NAME", "meta-llama/Llama-3.2-1B")
 llama_hub_cache()
@@ -97,11 +97,11 @@ IMAGE_ROOTS = cluster_image_roots()
 
 CHECKPOINT_DIR = os.environ.get(
     "VLJEPA_CHECKPOINT_DIR",
-    os.path.join(_ROOT, "checkpoints_vljepa_lora"),
+    os.path.join(_ROOT, "checkpoints_vljepa_lora_5way"),
 )
 LOG_DIR = os.environ.get(
     "VLJEPA_LOG_DIR",
-    os.path.join(_ROOT, "logs_vljepa_lora"),
+    os.path.join(_ROOT, "logs_vljepa_lora_5way"),
 )
 CSV_LOG = os.path.join(LOG_DIR, "val_metrics_vljepa.csv")
 FEAT_CSV_LOG = os.path.join(LOG_DIR, "feat_std_vljepa.csv")
@@ -328,7 +328,7 @@ def main():
             f"stopgrad_neg={STOPGRAD_NEG_PHRASES}"
         )
         print(
-            f"[vljepa]   resolved = drop from softmax unless it is the label "
+            f"[vljepa]   resolved = all five sentences stay in the softmax "
             f"(drop_resolved_negative={DROP_RESOLVED_NEGATIVE})"
         )
         print(f"[vljepa]   freeze image={FREEZE_IMAGE_ENCODER} "
@@ -426,9 +426,9 @@ def main():
     if resume_path and os.path.isfile(resume_path):
         ckpt = torch.load(resume_path, map_location="cpu")
         cfg = ckpt.get("vljepa_cfg", {})
-        if not cfg.get("text_lora"):
+        if not cfg.get("text_lora") or cfg.get("drop_resolved_negative", True):
             raise SystemExit(
-                f"[vljepa] refusing {resume_path}: not a LoRA-text checkpoint. "
+                f"[vljepa] refusing {resume_path}: not a 5-way LoRA checkpoint. "
                 f"Use an empty {CHECKPOINT_DIR}."
             )
         raw_model.load_state_dict(ckpt["model"], strict=False)

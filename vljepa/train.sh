@@ -20,9 +20,9 @@
 #   pred   : last 8 Llama-3.2-1B layers, bidirectional
 #   loss   : 5-way InfoNCE; all five phrases live (no stop-grad)
 #   freeze : image frozen, BioViL-T text frozen (LoRA answer key), Llama unfrozen
-#   resolved: train only. If the label is not resolved, that sentence is
-#            left out of the softmax. Gold argmax still scores all five.
-#   ckpt   : checkpoints_vljepa_lora/  (fresh; does not resume older runs)
+#   resolved: all five sentences stay in the training softmax.
+#   ckpt   : checkpoints_vljepa_lora_5way/  (fresh; does not resume the
+#            run that called resolved on every film)
 #   grain  : one silver (pair, finding) per example
 #   eval   : CheXTemporal gold set-match after every epoch
 #
@@ -104,9 +104,9 @@ checks = [
     ("stopgrad_negatives", model),
     ("STOPGRAD_NEG_PHRASES = False", train),
     ("FREEZE_TEXT_ENCODER = True", train),
-    ("checkpoints_vljepa_lora", train),
+    ("checkpoints_vljepa_lora_5way", train),
     ("apply_text_lora", model),
-    ("DROP_RESOLVED_NEGATIVE = True", train),
+    ("DROP_RESOLVED_NEGATIVE = False", train),
     ("drop_resolved_negative", model),
     ("SCRATCH_BASE_DEFAULT = \"/scratch/m000081/eprakash\"", (root / "cluster_paths.py").read_text()),
     ("LlamaPredictor", model),
@@ -136,7 +136,7 @@ if bad:
 print("[abort-check] OK  option-2 VL-JEPA")
 print("[abort-check] OK  query=What is the progression of {finding}?")
 print("[abort-check] OK  target={Finding} is {class}.  + 5-way InfoNCE")
-print("[abort-check] OK  text frozen with LoRA answer key; image frozen; fresh ckpt dir lora")
+print("[abort-check] OK  text frozen with LoRA answer key; image frozen; 5-way softmax")
 print("[abort-check] OK  cycle-6 paths /scratch/m000081/eprakash")
 print("[abort-check] OK  BioViL-T pair image + Llama query + BioViL-T Y-encoder")
 print("[abort-check] OK  gold set-match after every epoch")
