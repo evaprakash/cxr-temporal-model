@@ -301,6 +301,28 @@ def tune_bonus(scores: np.ndarray, labels: np.ndarray, objective=macro_f1,
     return bonus
 
 
+def fit_ce_bias(scores: np.ndarray, labels: np.ndarray, temperature: float,
+                steps: int = 3000, lr: float = 0.5) -> np.ndarray:
+    """Per-class bias b minimizing class-balanced CE of softmax(scores / T + b).
+
+    This is the bias a linear head would learn under the supervised loss.
+    Returned in score units (b * T) so it adds to the raw scores.
+    """
+    counts = np.bincount(labels, minlength=N_CLS).astype(np.float64)
+    w = (counts.sum() / (N_CLS * np.maximum(counts, 1)))[labels]
+    onehot = np.eye(N_CLS)[labels]
+    z = scores / temperature
+    b = np.zeros(N_CLS)
+    for _ in range(steps):
+        logits = z + b
+        logits -= logits.max(1, keepdims=True)
+        p = np.exp(logits)
+        p /= p.sum(1, keepdims=True)
+        b -= lr * (w[:, None] * (p - onehot)).sum(0) / w.sum()
+    b -= b[STABLE]
+    return b * temperature
+
+
 def print_rank_checks(name: str, scores: np.ndarray, labels: np.ndarray) -> None:
     margin = win_margin(scores)
     counts = Counter(labels.tolist())
@@ -349,8 +371,9 @@ def gold_results(scores, gts, findings, bonus):
 
 
 def report(val_scores, val_labels, gold_scores, gold_gts, gold_findings, show_full,
-           kind="cosine", model_name="vljepa"):
+           kind="cosine", model_name="vljepa", gold_oracle=False):
     grid = BONUS_GRIDS[kind]
+    temperature = 0.07 if kind == "cosine" else 1.0
     _print(f"\n[check] model: {model_name}   scores: {kind}s")
     _print(f"[check] silver val films: {len(val_labels)}   gold groups: {len(gold_gts)}")
     gold_single = np.array(["|" not in g for g in gold_gts])
@@ -368,7 +391,13 @@ def report(val_scores, val_labels, gold_scores, gold_gts, gold_findings, show_fu
     bonuses = {
         "F1 bonus": tune_bonus(val_scores, val_labels, macro_f1, grid),
         "recall bonus": tune_bonus(val_scores, val_labels, macro_recall, grid),
+        "CE bias": fit_ce_bias(val_scores, val_labels, temperature),
     }
+    if gold_oracle:
+        # Diagnostic only: tuned on the gold labels it is scored on.
+        bonuses["GOLD oracle"] = tune_bonus(
+            gold_single_scores, gold_single_labels, macro_f1, grid,
+        )
     _print(f"\n=== Per-class bonuses chosen on silver val (stable fixed at 0; {kind} units)")
     _print(f"  {'class':<10}" + "".join(f"{k:>14}" for k in bonuses))
     for c, cls in enumerate(CLS_ORDER):
@@ -418,6 +447,8 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--no-full-report", action="store_true")
+    p.add_argument("--gold-oracle", action="store_true",
+                   help="also tune bonuses on gold itself (upper bound; never report it)")
     args = p.parse_args()
 
     if args.reuse:
@@ -427,7 +458,7 @@ def main() -> int:
         _print(f"[check] reusing scores from {args.reuse}")
         report(data["val_scores"], data["val_labels"], data["gold_scores"],
                data["gold_gts"], data["gold_findings"], not args.no_full_report,
-               kind, name)
+               kind, name, args.gold_oracle)
         return 0
     if not args.ckpt:
         p.error("--ckpt or --reuse is required")
@@ -462,7 +493,7 @@ def main() -> int:
              score_kind=scorer.kind, model_name=name)
     _print(f"[check] saved scores to {out}")
     report(val_scores, val_labels, gold_scores, gold_gts, gold_findings,
-           not args.no_full_report, scorer.kind, name)
+           not args.no_full_report, scorer.kind, name, args.gold_oracle)
     return 0
 
 
