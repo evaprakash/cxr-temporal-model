@@ -626,6 +626,8 @@ class VLJEPA(nn.Module):
             self.text_lora_path = None
         vis_dim = int(self.image_encoder.embed_dim)
         txt_dim = int(self.text_encoder.proj_dim)
+        if llama_local is None and not smoke:
+            llama_local = resolve_llama_local()
         self.predictor = LlamaPredictor(
             vis_dim=vis_dim,
             out_dim=txt_dim,

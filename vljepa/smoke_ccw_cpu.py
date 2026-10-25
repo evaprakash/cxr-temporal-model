@@ -51,10 +51,18 @@ def main() -> int:
     text_trainable = sum(p.requires_grad for p in model.text_encoder.parameters())
     image_trainable = sum(p.requires_grad for p in model.image_encoder.parameters())
     _print(f"[smoke] text lora = {model.text_lora_path}")
+    _print(f"[smoke] llama init = {model.predictor.init_source}")
+    _print(f"[smoke] tokenizer = {model.predictor.tokenizer_source}")
     _print(f"[smoke] trainable text params = {text_trainable}")
     _print(f"[smoke] trainable image params = {image_trainable}")
     if text_trainable or image_trainable:
         _print("[smoke] text and image encoders must stay frozen")
+        return 1
+    if not str(model.predictor.init_source).startswith("pretrained:"):
+        _print("[smoke] Llama weights did not load from the local snapshot")
+        return 1
+    if "bert-base-uncased" in str(model.predictor.tokenizer_source):
+        _print("[smoke] Llama tokenizer did not load from the local snapshot")
         return 1
 
     groups = load_gold_groups().iloc[:1].reset_index(drop=True)
