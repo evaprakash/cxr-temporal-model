@@ -44,7 +44,7 @@ run() {
     elif [ "$MODE" = "train" ]; then
         NGPU="${SLURM_GPUS_ON_NODE:-4}"
         echo "[ccw] nproc_per_node=$NGPU"
-        torchrun --nproc_per_node="$NGPU" -m vljepa.train
+        python -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train
     else
         echo "usage: bash vljepa/run_ccw.sh smoke|train" >&2
         return 1
