@@ -23,19 +23,32 @@ mkdir -p "$VLJEPA_HF_HOME/hub" "$VLJEPA_LOG_DIR" "$VLJEPA_CHECKPOINT_DIR"
 HI_ML="$ROOT/tempcxr/modules/hi-ml/hi-ml-multimodal/src"
 export PYTHONPATH="${ROOT}:${HI_ML}${PYTHONPATH:+:$PYTHONPATH}"
 
-echo "[ccw] PROJECT_DIR=$PROJECT_DIR"
-echo "[ccw] all_data=$JEPA_IMAGE_ROOTS_DIR"
-echo "[ccw] hf=$VLJEPA_HF_HOME"
-echo "[ccw] ckpt=$VLJEPA_CHECKPOINT_DIR"
-
 MODE="${1:-smoke}"
-if [ "$MODE" = "smoke" ]; then
-    export CUDA_VISIBLE_DEVICES=""
-    python -m vljepa.smoke_ccw_cpu
-elif [ "$MODE" = "train" ]; then
-    NGPU="${SLURM_GPUS_ON_NODE:-4}"
-    torchrun --nproc_per_node="$NGPU" -m vljepa.train
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    LOG="$VLJEPA_LOG_DIR/vljepa_lora_${MODE}_${SLURM_JOB_ID}.log"
 else
-    echo "usage: bash vljepa/run_ccw.sh smoke|train" >&2
-    exit 1
+    LOG="$VLJEPA_LOG_DIR/vljepa_lora_${MODE}_$(date +%Y%m%d_%H%M%S).log"
 fi
+export PYTHONUNBUFFERED=1
+
+# Screen still shows the run. The file keeps the full gold report.
+run() {
+    echo "[ccw] PROJECT_DIR=$PROJECT_DIR"
+    echo "[ccw] all_data=$JEPA_IMAGE_ROOTS_DIR"
+    echo "[ccw] hf=$VLJEPA_HF_HOME"
+    echo "[ccw] ckpt=$VLJEPA_CHECKPOINT_DIR"
+    echo "[ccw] log=$LOG"
+    if [ "$MODE" = "smoke" ]; then
+        export CUDA_VISIBLE_DEVICES=""
+        python -m vljepa.smoke_ccw_cpu
+    elif [ "$MODE" = "train" ]; then
+        NGPU="${SLURM_GPUS_ON_NODE:-4}"
+        echo "[ccw] nproc_per_node=$NGPU"
+        torchrun --nproc_per_node="$NGPU" -m vljepa.train
+    else
+        echo "usage: bash vljepa/run_ccw.sh smoke|train" >&2
+        return 1
+    fi
+}
+
+run 2>&1 | tee -a "$LOG"
