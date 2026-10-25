@@ -16,7 +16,12 @@ decision rule hides it. AUROC near 0.5 means the scores do not separate
 that class.
 
     python -m vljepa.check_class_signal --ckpt checkpoints_vljepa_lora_5way/epoch_9.pt
+    python -m vljepa.check_class_signal --supervised \\
+        --ckpt checkpoints_supervised_progression_unfrozen/epoch_5.pt
     python -m vljepa.check_class_signal --reuse <scores.npz>   # rerun the math only
+
+The supervised model is scored on the same silver val films (splits_jepa.csv)
+with its five logits in place of cosines.
 """
 
 from __future__ import annotations
@@ -42,7 +47,10 @@ from progression_phrases import CLS_ORDER
 
 N_CLS = len(CLS_ORDER)
 STABLE = CLS_ORDER.index("stable")
-BONUS_GRID = np.round(np.arange(-0.15, 0.3001, 0.005), 4)
+BONUS_GRIDS = {
+    "cosine": np.round(np.arange(-0.15, 0.3001, 0.005), 4),
+    "logit": np.round(np.arange(-3.0, 6.0001, 0.05), 4),
+}
 
 
 def _print(msg: str = "") -> None:
@@ -52,20 +60,97 @@ def _print(msg: str = "") -> None:
 # ----------------------------------------------------------------------
 # Scoring (needs the model; imported lazily so --reuse runs anywhere)
 # ----------------------------------------------------------------------
-def _target_bank(model, finding, cache):
-    import torch.nn.functional as F
+class VLJEPAScorer:
+    """Five sentence cosines of the VL-JEPA guess."""
 
-    from .prompts import class_target_texts
+    kind = "cosine"
 
-    if finding not in cache:
-        g, _, _ = model.encode_targets(class_target_texts(finding))
-        cache[finding] = F.normalize(g.float(), dim=-1)
-    return cache[finding]
+    def __init__(self, model):
+        self.model = model
+        self.bank = {}
+        self.text_cache = {}
+
+    def _targets(self, finding):
+        import torch.nn.functional as F
+
+        from .prompts import class_target_texts
+
+        if finding not in self.bank:
+            g, _, _ = self.model.encode_targets(class_target_texts(finding))
+            self.bank[finding] = F.normalize(g.float(), dim=-1)
+        return self.bank[finding]
+
+    def batch(self, prior, current, findings, queries):
+        import torch
+        import torch.nn.functional as F
+
+        img_g, img_p = self.model.encode_images(prior, current)
+        pred = F.normalize(self.model.predict(img_g, img_p, queries).float(), dim=-1)
+        tgt = torch.stack([self._targets(f) for f in findings])
+        return torch.einsum("bd,bcd->bc", pred, tgt)
+
+    def one(self, prior, current, finding):
+        return self.model.score_classes(prior, current, finding, text_cache=self.text_cache)
 
 
-def score_silver_val(model, device, batch_size, num_workers, limit):
+class SupervisedScorer:
+    """Five logits of the unfrozen supervised BioViL-T + linear head.
+
+    Mirrors ``SupervisedProgressionModel`` in train_supervised_progression.py:
+    ``Linear([norm(image pair); norm(finding text)])``.
+    """
+
+    kind = "logit"
+
+    def __init__(self, ckpt_path, device):
+        import torch
+        import torch.nn as nn
+
+        from tempcxr.modules.image_encoder_jepa import BioViLTImageEncoderJEPA
+        from tempcxr.modules.text_encoder import BioViLTTextEncoder
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if "image_encoder" not in ckpt or "finding_vocab" in ckpt:
+            raise SystemExit(f"[check] {ckpt_path} is not an unfrozen supervised checkpoint")
+        if list(ckpt.get("classes", CLS_ORDER)) != list(CLS_ORDER):
+            raise SystemExit(f"[check] class order mismatch: {ckpt.get('classes')}")
+        self.image_encoder = BioViLTImageEncoderJEPA(mode="biovilt")
+        self.text_encoder = BioViLTTextEncoder(mode="biovilt")
+        self.image_encoder.load_state_dict(ckpt["image_encoder"])
+        self.text_encoder.load_state_dict(ckpt["text_encoder"])
+        self.head = nn.Linear(int(ckpt.get("in_dim", 256)), N_CLS)
+        self.head.load_state_dict({k.split("fc.", 1)[-1]: v for k, v in ckpt["head"].items()})
+        for m in (self.image_encoder, self.text_encoder, self.head):
+            m.to(device).eval()
+            for p in m.parameters():
+                p.requires_grad = False
+        self.text_cache = {}
+        _print(f"[check] supervised epoch {ckpt.get('epoch')} "
+               f"(train_loss {ckpt.get('train_loss')})")
+
+    def _text(self, finding):
+        import torch.nn.functional as F
+
+        if finding not in self.text_cache:
+            t, _, _ = self.text_encoder.forward_contrastive([finding])
+            self.text_cache[finding] = F.normalize(t.float(), dim=-1)
+        return self.text_cache[finding]
+
+    def batch(self, prior, current, findings, queries=None):
+        import torch
+        import torch.nn.functional as F
+
+        img, _ = self.image_encoder(current, prior)
+        img = F.normalize(img.float(), dim=-1)
+        txt = torch.cat([self._text(f) for f in findings], dim=0)
+        return self.head(torch.cat([img, txt], dim=-1))
+
+    def one(self, prior, current, finding):
+        return self.batch(prior, current, [finding]).squeeze(0)
+
+
+def score_silver_val(scorer, device, batch_size, num_workers, limit):
     import torch
-    import torch.nn.functional as F
     from torch.utils.data import DataLoader, Subset
     from tqdm import tqdm
 
@@ -85,25 +170,18 @@ def score_silver_val(model, device, batch_size, num_workers, limit):
         pin_memory=True,
         collate_fn=vljepa_collate_fn,
     )
-    cache = {}
     scores, labels = [], []
     with torch.no_grad():
         for batch in tqdm(loader, desc="silver val", file=sys.stdout):
             prior = batch["prior_image"].to(device, non_blocking=True)
             current = batch["current_image"].to(device, non_blocking=True)
-            img_g, img_p = model.encode_images(prior, current)
-            pred = F.normalize(
-                model.predict(img_g, img_p, batch["query_text"]).float(), dim=-1,
-            )
-            tgt = torch.stack(
-                [_target_bank(model, f, cache) for f in batch["finding"]]
-            )
-            scores.append(torch.einsum("bd,bcd->bc", pred, tgt).cpu().numpy())
+            s = scorer.batch(prior, current, batch["finding"], batch["query_text"])
+            scores.append(s.float().cpu().numpy())
             labels.append(batch["cls_idx"].numpy())
     return np.concatenate(scores), np.concatenate(labels)
 
 
-def score_gold(model, device, limit):
+def score_gold(scorer, device, limit):
     import torch
     from tqdm import tqdm
 
@@ -124,7 +202,6 @@ def score_gold(model, device, limit):
         **discover_gold_image_roots(os.path.dirname(os.path.abspath(DEFAULT_GOLD_PARQUET))),
         **gold_image_dirs(),
     }
-    text_cache = {}
     scores, gts, findings = [], [], []
     skipped = 0
     with torch.no_grad():
@@ -136,11 +213,10 @@ def score_gold(model, device, limit):
             except (FileNotFoundError, OSError):
                 skipped += 1
                 continue
-            s = model.score_classes(
+            s = scorer.one(
                 prior.unsqueeze(0).to(device),
                 current.unsqueeze(0).to(device),
                 str(row["finding"]),
-                text_cache=text_cache,
             )
             scores.append(s.float().cpu().numpy())
             gts.append("|".join(sorted(str(x).strip().lower() for x in row["gt_labels"])))
@@ -205,7 +281,7 @@ def macro_recall(pred: np.ndarray, labels: np.ndarray) -> float:
 
 
 def tune_bonus(scores: np.ndarray, labels: np.ndarray, objective=macro_f1,
-               rounds: int = 3) -> np.ndarray:
+               grid: np.ndarray = BONUS_GRIDS["cosine"], rounds: int = 3) -> np.ndarray:
     """Coordinate ascent on ``objective``. Stable is held at 0."""
     bonus = np.zeros(N_CLS)
     best = objective((scores + bonus).argmax(1), labels)
@@ -214,7 +290,7 @@ def tune_bonus(scores: np.ndarray, labels: np.ndarray, objective=macro_f1,
         for c in range(N_CLS):
             if c == STABLE:
                 continue
-            for v in BONUS_GRID:
+            for v in grid:
                 trial = bonus.copy()
                 trial[c] = v
                 f = objective((scores + trial).argmax(1), labels)
@@ -272,8 +348,11 @@ def gold_results(scores, gts, findings, bonus):
     ]
 
 
-def report(val_scores, val_labels, gold_scores, gold_gts, gold_findings, show_full):
-    _print(f"\n[check] silver val films: {len(val_labels)}   gold groups: {len(gold_gts)}")
+def report(val_scores, val_labels, gold_scores, gold_gts, gold_findings, show_full,
+           kind="cosine", model_name="vljepa"):
+    grid = BONUS_GRIDS[kind]
+    _print(f"\n[check] model: {model_name}   scores: {kind}s")
+    _print(f"[check] silver val films: {len(val_labels)}   gold groups: {len(gold_gts)}")
     gold_single = np.array(["|" not in g for g in gold_gts])
     gold_single_labels = np.array(
         [CLS_ORDER.index(g) for g in gold_gts[gold_single]], dtype=np.int64,
@@ -287,10 +366,10 @@ def report(val_scores, val_labels, gold_scores, gold_gts, gold_findings, show_fu
     # calling a rare class, so it can push resolved down; macro recall
     # ignores class shares.
     bonuses = {
-        "F1 bonus": tune_bonus(val_scores, val_labels, macro_f1),
-        "recall bonus": tune_bonus(val_scores, val_labels, macro_recall),
+        "F1 bonus": tune_bonus(val_scores, val_labels, macro_f1, grid),
+        "recall bonus": tune_bonus(val_scores, val_labels, macro_recall, grid),
     }
-    _print("\n=== Per-class bonuses chosen on silver val (stable fixed at 0)")
+    _print(f"\n=== Per-class bonuses chosen on silver val (stable fixed at 0; {kind} units)")
     _print(f"  {'class':<10}" + "".join(f"{k:>14}" for k in bonuses))
     for c, cls in enumerate(CLS_ORDER):
         _print(f"  {cls:<10}" + "".join(f"{b[c]:>+14.3f}" for b in bonuses.values()))
@@ -318,17 +397,20 @@ def report(val_scores, val_labels, gold_scores, gold_gts, gold_findings, show_fu
                        ("multi_jaccard", "multi Jaccard")):
         _print(f"  {label:<14}" + "".join(f"{summaries[k][key]:>14.4f}" for k in runs))
     if show_full:
-        for name, b in bonuses.items():
+        for bonus_name, b in bonuses.items():
             print_setmatch_report(
                 gold_results(gold_scores, gold_gts, gold_findings, b),
-                f"vljepa + silver-val {name}",
+                f"{model_name} + silver-val {bonus_name}",
                 ", bonus=" + ",".join(f"{x:+.3f}" for x in b),
             )
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--ckpt", help="VL-JEPA checkpoint to score")
+    p.add_argument("--ckpt", help="checkpoint to score")
+    p.add_argument("--supervised", action="store_true",
+                   help="--ckpt is an unfrozen supervised checkpoint "
+                        "(checkpoints_supervised_progression_unfrozen/epoch_N.pt)")
     p.add_argument("--reuse", help="scores .npz from an earlier run; skips the model")
     p.add_argument("--out", help="where to save scores (default next to the checkpoint)")
     p.add_argument("--val-limit", type=int, default=None)
@@ -340,37 +422,47 @@ def main() -> int:
 
     if args.reuse:
         data = np.load(args.reuse, allow_pickle=True)
+        kind = str(data["score_kind"]) if "score_kind" in data else "cosine"
+        name = str(data["model_name"]) if "model_name" in data else "vljepa"
         _print(f"[check] reusing scores from {args.reuse}")
         report(data["val_scores"], data["val_labels"], data["gold_scores"],
-               data["gold_gts"], data["gold_findings"], not args.no_full_report)
+               data["gold_gts"], data["gold_findings"], not args.no_full_report,
+               kind, name)
         return 0
     if not args.ckpt:
         p.error("--ckpt or --reuse is required")
 
     import torch
 
-    from .eval_gold import load_vljepa_from_ckpt
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _print(f"[check] ckpt   = {args.ckpt}")
     _print(f"[check] device = {device}")
-    model = load_vljepa_from_ckpt(args.ckpt, device)
-    _print(f"[check] text lora = {getattr(model, 'text_lora_path', None)}")
+    if args.supervised:
+        scorer = SupervisedScorer(args.ckpt, device)
+        name = "supervised"
+    else:
+        from .eval_gold import load_vljepa_from_ckpt
+
+        model = load_vljepa_from_ckpt(args.ckpt, device)
+        _print(f"[check] text lora = {getattr(model, 'text_lora_path', None)}")
+        scorer = VLJEPAScorer(model)
+        name = "vljepa"
 
     val_scores, val_labels = score_silver_val(
-        model, device, args.batch_size, args.num_workers, args.val_limit,
+        scorer, device, args.batch_size, args.num_workers, args.val_limit,
     )
-    gold_scores, gold_gts, gold_findings = score_gold(model, device, args.gold_limit)
+    gold_scores, gold_gts, gold_findings = score_gold(scorer, device, args.gold_limit)
 
     out = args.out or os.path.join(
         os.path.dirname(os.path.abspath(args.ckpt)),
         "class_signal_" + os.path.splitext(os.path.basename(args.ckpt))[0] + ".npz",
     )
     np.savez(out, val_scores=val_scores, val_labels=val_labels,
-             gold_scores=gold_scores, gold_gts=gold_gts, gold_findings=gold_findings)
+             gold_scores=gold_scores, gold_gts=gold_gts, gold_findings=gold_findings,
+             score_kind=scorer.kind, model_name=name)
     _print(f"[check] saved scores to {out}")
     report(val_scores, val_labels, gold_scores, gold_gts, gold_findings,
-           not args.no_full_report)
+           not args.no_full_report, scorer.kind, name)
     return 0
 
 
