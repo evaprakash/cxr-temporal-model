@@ -323,6 +323,51 @@ def fit_ce_bias(scores: np.ndarray, labels: np.ndarray, temperature: float,
     return b * temperature
 
 
+def _softmax(z: np.ndarray) -> np.ndarray:
+    z = z - z.max(1, keepdims=True)
+    p = np.exp(z)
+    return p / p.sum(1, keepdims=True)
+
+
+def fit_calibration(scores: np.ndarray, labels: np.ndarray, t0: float,
+                    steps: int = 5000, lr: float = 0.5):
+    """Temperature T and per-class bias b so softmax(scores / T + b) is
+    calibrated on these labels (plain CE, no class weights)."""
+    onehot = np.eye(N_CLS)[labels]
+    log_t, b = np.log(t0), np.zeros(N_CLS)
+    for _ in range(steps):
+        t = np.exp(log_t)
+        err = _softmax(scores / t + b) - onehot
+        b -= lr * err.mean(0)
+        log_t -= 0.1 * lr * (err * (-scores / t)).sum(1).mean()
+    return float(np.exp(log_t)), b - b[STABLE]
+
+
+def em_target_prior(p_src: np.ndarray, prior_src: np.ndarray,
+                    iters: int = 2000, tol: float = 1e-10) -> np.ndarray:
+    """Saerens et al. (2002): class shares of an unlabeled set, from
+    posteriors calibrated under ``prior_src``."""
+    prior = prior_src.copy()
+    for _ in range(iters):
+        q = p_src * (prior / prior_src)
+        q /= q.sum(1, keepdims=True)
+        new = q.mean(0)
+        if np.abs(new - prior).max() < tol:
+            return new
+        prior = new
+    return prior
+
+
+def em_prior_bonus(val_scores, val_labels, gold_scores, t0):
+    """Score-unit bonus that moves silver-calibrated posteriors to the gold
+    class shares estimated without gold labels."""
+    t, b = fit_calibration(val_scores, val_labels, t0)
+    prior_src = np.bincount(val_labels, minlength=N_CLS) / len(val_labels)
+    prior_gold = em_target_prior(_softmax(gold_scores / t + b), prior_src)
+    bonus = t * (b + np.log(prior_gold / prior_src))
+    return bonus - bonus[STABLE], t, prior_src, prior_gold
+
+
 def print_rank_checks(name: str, scores: np.ndarray, labels: np.ndarray) -> None:
     margin = win_margin(scores)
     counts = Counter(labels.tolist())
@@ -393,6 +438,18 @@ def report(val_scores, val_labels, gold_scores, gold_gts, gold_findings, show_fu
         "recall bonus": tune_bonus(val_scores, val_labels, macro_recall, grid),
         "CE bias": fit_ce_bias(val_scores, val_labels, temperature),
     }
+    em_bonus, em_t, prior_src, prior_gold = em_prior_bonus(
+        val_scores, val_labels, gold_scores, temperature,
+    )
+    bonuses["EM prior"] = em_bonus
+    gold_counts = Counter(c for g in gold_gts for c in g.split("|"))
+    gold_true = np.array([gold_counts.get(c, 0) for c in CLS_ORDER], dtype=float)
+    gold_true /= gold_true.sum()
+    _print(f"\n=== EM prior (no gold labels): temperature fit on silver val = {em_t:.4f}")
+    _print(f"  {'class':<10} {'silver val':>11} {'gold est.':>10} {'gold true':>10}")
+    for c, cls in enumerate(CLS_ORDER):
+        _print(f"  {cls:<10} {prior_src[c]:>11.3f} {prior_gold[c]:>10.3f} {gold_true[c]:>10.3f}")
+    _print("  (gold true is shown only to judge the estimate; it is not used)")
     if gold_oracle:
         # Diagnostic only: tuned on the gold labels it is scored on.
         bonuses["GOLD oracle"] = tune_bonus(
