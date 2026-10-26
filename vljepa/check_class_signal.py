@@ -502,6 +502,63 @@ def preview_bias(val_scores, val_labels, gold_scores, gold_gts, gold_findings,
         _print(f"\n  reference: combined {ref['combined']:.4f}   macro F1 {ref['macro_f1']:.4f}")
 
 
+def weighted_ce(scores, labels, temperature, class_weights):
+    w = np.asarray(class_weights, dtype=np.float64)[labels]
+    z = scores / temperature
+    z = z - z.max(1, keepdims=True)
+    logp = z - np.log(np.exp(z).sum(1, keepdims=True))
+    return float(-(w * logp[np.arange(len(labels)), labels]).sum() / w.sum())
+
+
+def resolved_only_table(val_scores, val_labels, gold_scores, gold_gts, gold_findings,
+                        kind, model_name, class_weights, ref=None):
+    """Shift only the resolved score, by an amount chosen on SILVER VAL alone."""
+    res = CLS_ORDER.index("resolved")
+    temperature = 0.07 if kind == "cosine" else 1.0
+    step = 0.0025 if kind == "cosine" else 0.025
+    grid = np.round(np.arange(-40 * step, 120 * step + 1e-9, step), 4)
+    counts = np.bincount(val_labels, minlength=N_CLS).astype(np.float64)
+    balanced = counts.sum() / (N_CLS * np.maximum(counts, 1))
+
+    def shifted(scores, v):
+        out = scores.copy()
+        out[:, res] += v
+        return out
+
+    rules = {}
+    rules["silver macro F1"] = max(
+        grid, key=lambda v: macro_f1(shifted(val_scores, v).argmax(1), val_labels))
+    rules["silver resolved F1"] = max(
+        grid, key=lambda v: per_class_f1(shifted(val_scores, v).argmax(1), val_labels)[res])
+    rules["silver CE, train wts"] = min(
+        grid, key=lambda v: weighted_ce(shifted(val_scores, v), val_labels,
+                                        temperature, class_weights))
+    rules["silver CE, balanced"] = min(
+        grid, key=lambda v: weighted_ce(shifted(val_scores, v), val_labels,
+                                        temperature, balanced))
+
+    single_scores, single_labels = gold_single(gold_scores, gold_gts)
+    true_n = np.bincount(single_labels, minlength=N_CLS)
+    _print(f"\n=== Resolved-only shift chosen on SILVER VAL ({model_name}, {kind} units)")
+    _print("  only the resolved score moves; gold is scored once with the chosen shift")
+    _print(f"  {'rule':<22} {'shift':>7} {'silv mF1':>9} {'combined':>9} {'macroF1':>8} "
+           + "".join(f"{c[:4] + ' F1':>9}" for c in CLS_ORDER) + f"{'res n':>7}")
+    if ref is not None:
+        _print(f"  {'supervised (ref)':<22} {'':>7} {'':>9} {ref['combined']:>9.4f} "
+               f"{ref['macro_f1']:>8.4f} " + "".join(f"{x:>9.3f}" for x in ref["f1"]))
+    for name, v in [("no shift", 0.0), *rules.items()]:
+        b = np.zeros(N_CLS)
+        b[res] = v
+        silver_mf1 = macro_f1((val_scores + b).argmax(1), val_labels)
+        pred = (single_scores + b).argmax(1)
+        f1 = per_class_f1(pred, single_labels)
+        combined = summarize_setmatch(
+            gold_results(gold_scores, gold_gts, gold_findings, b))["combined_score"]
+        _print(f"  {name:<22} {v:>+7.4f} {silver_mf1:>9.4f} {combined:>9.4f} {f1.mean():>8.4f} "
+               + "".join(f"{x:>9.3f}" for x in f1) + f"{int((pred == res).sum()):>7d}")
+    _print(f"  gold true resolved (single-label): {true_n[res]}")
+
+
 def reference_metrics(path):
     data = np.load(path, allow_pickle=True)
     scores, gts, findings = data["gold_scores"], data["gold_gts"], data["gold_findings"]
@@ -656,6 +713,8 @@ def main() -> int:
                    help="only print the one-class-at-a-time nudge table (needs --reuse)")
     p.add_argument("--preview-bias", action="store_true",
                    help="only print the learned per-class bias preview (needs --reuse)")
+    p.add_argument("--resolved-only", action="store_true",
+                   help="only print the silver-chosen resolved-only shift table (needs --reuse)")
     p.add_argument("--class-weights", type=float, nargs=N_CLS,
                    default=[0.366, 0.140, 0.233, 0.432, 3.829],
                    help="training loss class weights, CLS_ORDER order "
@@ -670,6 +729,12 @@ def main() -> int:
         kind = str(data["score_kind"]) if "score_kind" in data else "cosine"
         name = str(data["model_name"]) if "model_name" in data else "vljepa"
         _print(f"[check] reusing scores from {args.reuse}")
+        if args.resolved_only:
+            ref = reference_metrics(args.ref) if args.ref else None
+            resolved_only_table(data["val_scores"], data["val_labels"], data["gold_scores"],
+                                data["gold_gts"], data["gold_findings"], kind, name,
+                                np.array(args.class_weights), ref)
+            return 0
         if args.preview_bias:
             ref = reference_metrics(args.ref) if args.ref else None
             preview_bias(data["val_scores"], data["val_labels"], data["gold_scores"],
