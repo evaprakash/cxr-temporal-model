@@ -56,6 +56,7 @@ def eval_gold_setmatch(
     device: torch.device,
 ) -> Optional[dict]:
     model.eval()
+    shift = getattr(model, "class_shift", None)
     results = []
     skipped = 0
     text_cache: Dict[str, torch.Tensor] = {}
@@ -86,7 +87,10 @@ def eval_gold_setmatch(
             current.unsqueeze(0),
             str(row["finding"]),
             text_cache=text_cache,
-        ).detach().float().cpu().tolist()
+        ).detach().float().cpu()
+        if shift is not None:
+            scores = scores + shift
+        scores = scores.tolist()
         results.append(
             topk_set_match(
                 scores,
@@ -105,11 +109,13 @@ def eval_gold_setmatch(
     if not results:
         print("[vljepa gold] set-match: no groups evaluated")
         return None
+    shift_note = "" if shift is None else (
+        ", class_shift=" + ",".join(f"{x:+.4f}" for x in shift.tolist()))
     print_setmatch_report(
         results,
         "vljepa",
         f", query={QUERY_TEMPLATE!r}, target={TARGET_TEMPLATE!r}, "
-        f"epoch={epoch}",
+        f"epoch={epoch}{shift_note}",
     )
     return summarize_setmatch(results)
 
@@ -122,7 +128,14 @@ def load_gold_groups(gold_parquet: Optional[str] = None):
     return group_gold_by_pair_finding(gold)
 
 
-def load_vljepa_from_ckpt(ckpt_path: str, device: torch.device) -> VLJEPA:
+def load_vljepa_from_ckpt(
+    ckpt_path: str,
+    device: torch.device,
+    shift_json: Optional[str] = None,
+    use_shift: bool = True,
+) -> VLJEPA:
+    """``class_shift`` (from a *_shifted.pt checkpoint or ``shift_json``) is
+    kept off the state dict; only eval_gold_setmatch adds it before argmax."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = ckpt.get("vljepa_cfg", {})
     model = VLJEPA(
@@ -140,6 +153,21 @@ def load_vljepa_from_ckpt(ckpt_path: str, device: torch.device) -> VLJEPA:
         print(f"[vljepa gold] missing keys: {missing[:8]}...")
     if unexpected:
         print(f"[vljepa gold] unexpected keys: {unexpected[:8]}...")
+    model.class_shift = None
+    if use_shift:
+        shift = ckpt.get("class_shift")
+        source = ckpt_path
+        if shift_json:
+            import json
+
+            with open(shift_json) as f:
+                info = json.load(f)
+            if info.get("class_order") != list(CLS_ORDER):
+                raise ValueError(f"{shift_json}: class order {info.get('class_order')}")
+            shift, source = info["class_shift"], shift_json
+        if shift is not None:
+            model.class_shift = torch.tensor(shift, dtype=torch.float32)
+            print(f"[vljepa gold] class shift {shift} from {source}")
     return model.to(device).eval()
 
 
@@ -147,9 +175,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--shift-json", default=None,
+                        help="apply a saved class shift (vljepa/results/.../epoch_N.shift.json)")
+    parser.add_argument("--no-shift", action="store_true",
+                        help="ignore any class shift stored in the checkpoint")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_vljepa_from_ckpt(args.ckpt, device)
+    model = load_vljepa_from_ckpt(
+        args.ckpt, device, shift_json=args.shift_json, use_shift=not args.no_shift,
+    )
     groups = load_gold_groups()
     if args.limit:
         groups = groups.iloc[: args.limit].reset_index(drop=True)

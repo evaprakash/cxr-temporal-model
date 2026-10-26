@@ -5,6 +5,8 @@
 #   bash vljepa/run_ccw.sh smoke
 #   bash vljepa/run_ccw.sh train
 #   bash vljepa/run_ccw.sh check --ckpt <checkpoint dir>/epoch_N.pt
+#   bash vljepa/run_ccw.sh shift --ckpt <checkpoint dir>/epoch_N.pt
+#   bash vljepa/run_ccw.sh gold  --ckpt <checkpoint dir>/epoch_N_shifted.pt
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -64,8 +66,14 @@ run() {
     elif [ "$MODE" = "check" ]; then
         shift
         "$PY" -m vljepa.check_class_signal "$@"
+    elif [ "$MODE" = "shift" ]; then
+        shift
+        "$PY" -m vljepa.save_class_shift "$@"
+    elif [ "$MODE" = "gold" ]; then
+        shift
+        "$PY" -m vljepa.eval_gold "$@"
     else
-        echo "usage: bash vljepa/run_ccw.sh smoke|train|check --ckpt <epoch_N.pt>" >&2
+        echo "usage: bash vljepa/run_ccw.sh smoke|train|check|shift|gold --ckpt <epoch_N.pt>" >&2
         return 1
     fi
 }
