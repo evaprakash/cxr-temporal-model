@@ -302,14 +302,17 @@ def tune_bonus(scores: np.ndarray, labels: np.ndarray, objective=macro_f1,
 
 
 def fit_ce_bias(scores: np.ndarray, labels: np.ndarray, temperature: float,
-                steps: int = 3000, lr: float = 0.5) -> np.ndarray:
-    """Per-class bias b minimizing class-balanced CE of softmax(scores / T + b).
+                steps: int = 3000, lr: float = 0.5,
+                class_weights: np.ndarray = None) -> np.ndarray:
+    """Per-class bias b minimizing weighted CE of softmax(scores / T + b).
 
-    This is the bias a linear head would learn under the supervised loss.
+    Default weights are fully balanced (the supervised baseline's loss).
     Returned in score units (b * T) so it adds to the raw scores.
     """
     counts = np.bincount(labels, minlength=N_CLS).astype(np.float64)
-    w = (counts.sum() / (N_CLS * np.maximum(counts, 1)))[labels]
+    if class_weights is None:
+        class_weights = counts.sum() / (N_CLS * np.maximum(counts, 1))
+    w = np.asarray(class_weights, dtype=np.float64)[labels]
     onehot = np.eye(N_CLS)[labels]
     z = scores / temperature
     b = np.zeros(N_CLS)
@@ -465,6 +468,40 @@ def per_class_table(gold_scores, gold_gts, gold_findings, kind, model_name, ref=
                    f"{n:>6d} {true_n[c]:>5d} {f1[STABLE]:>8.3f} {f1.mean():>8.4f} {combined:>9.4f}")
 
 
+def preview_bias(val_scores, val_labels, gold_scores, gold_gts, gold_findings,
+                 kind, model_name, class_weights, ref=None):
+    """Bias a learned per-class term would settle at under the training loss,
+    fit on silver val with the predictor held fixed, then scored on gold."""
+    temperature = 0.07 if kind == "cosine" else 1.0
+    single_scores, single_labels = gold_single(gold_scores, gold_gts)
+    true_n = np.bincount(single_labels, minlength=N_CLS)
+    runs = {
+        "no bias": np.zeros(N_CLS),
+        "training weights": fit_ce_bias(val_scores, val_labels, temperature,
+                                        class_weights=class_weights),
+        "balanced weights": fit_ce_bias(val_scores, val_labels, temperature),
+    }
+    _print(f"\n=== Preview: learned per-class bias, fit on silver val ({model_name}, T={temperature})")
+    _print("  training weights: " + ", ".join(
+        f"{c} {w:.3f}" for c, w in zip(CLS_ORDER, class_weights)))
+    _print(f"  {'':<18}" + "".join(f"{c[:9]:>10}" for c in CLS_ORDER))
+    for name, b in runs.items():
+        if name != "no bias":
+            _print(f"  {name + ' bias':<18}" + "".join(f"{x:>+10.3f}" for x in b))
+    for name, b in runs.items():
+        pred = (single_scores + b).argmax(1)
+        f1 = per_class_f1(pred, single_labels)
+        combined = summarize_setmatch(
+            gold_results(gold_scores, gold_gts, gold_findings, b))["combined_score"]
+        _print(f"\n  --- GOLD with {name}: combined {combined:.4f}   macro F1 {f1.mean():.4f}")
+        _print(f"  {'class':<10} {'F1':>7} {'ref F1':>7} {'calls':>6} {'true':>5}")
+        for c, cls in enumerate(CLS_ORDER):
+            ref_f1 = f"{ref['f1'][c]:>7.3f}" if ref is not None else f"{'-':>7}"
+            _print(f"  {cls:<10} {f1[c]:>7.3f} {ref_f1} {int((pred == c).sum()):>6d} {true_n[c]:>5d}")
+    if ref is not None:
+        _print(f"\n  reference: combined {ref['combined']:.4f}   macro F1 {ref['macro_f1']:.4f}")
+
+
 def reference_metrics(path):
     data = np.load(path, allow_pickle=True)
     scores, gts, findings = data["gold_scores"], data["gold_gts"], data["gold_findings"]
@@ -617,6 +654,12 @@ def main() -> int:
                    help="only print the one-knob balancing table (needs --reuse)")
     p.add_argument("--per-class", action="store_true",
                    help="only print the one-class-at-a-time nudge table (needs --reuse)")
+    p.add_argument("--preview-bias", action="store_true",
+                   help="only print the learned per-class bias preview (needs --reuse)")
+    p.add_argument("--class-weights", type=float, nargs=N_CLS,
+                   default=[0.366, 0.140, 0.233, 0.432, 3.829],
+                   help="training loss class weights, CLS_ORDER order "
+                        "(default: the vljepa CBW weights printed at startup)")
     p.add_argument("--ref", help="scores .npz of a reference model (e.g. supervised) "
                                  "to compare improving / worsening F1 against")
     p.add_argument("--margin", type=float, default=0.02)
@@ -627,6 +670,12 @@ def main() -> int:
         kind = str(data["score_kind"]) if "score_kind" in data else "cosine"
         name = str(data["model_name"]) if "model_name" in data else "vljepa"
         _print(f"[check] reusing scores from {args.reuse}")
+        if args.preview_bias:
+            ref = reference_metrics(args.ref) if args.ref else None
+            preview_bias(data["val_scores"], data["val_labels"], data["gold_scores"],
+                         data["gold_gts"], data["gold_findings"], kind, name,
+                         np.array(args.class_weights), ref)
+            return 0
         if args.per_class:
             ref = reference_metrics(args.ref) if args.ref else None
             per_class_table(data["gold_scores"], data["gold_gts"], data["gold_findings"],
