@@ -144,7 +144,7 @@ def load_vljepa_from_ckpt(
         n_llama_layers=int(cfg.get("n_llama_layers", 8)),
         llama_name=cfg.get("llama_name", "meta-llama/Llama-3.2-1B"),
         llama_local=cfg.get("llama_local"),
-        freeze_image_encoder=bool(cfg.get("freeze_image_encoder", True)),
+        freeze_image_encoder=True,
         freeze_text_encoder=bool(cfg.get("freeze_text_encoder", False)),
         gradient_checkpointing=False,
     )

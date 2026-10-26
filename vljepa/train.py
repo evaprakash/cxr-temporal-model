@@ -301,6 +301,12 @@ def train_one_epoch(
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--init-from", type=str, default=None,
+                   help="start from this checkpoint's model weights only (fresh "
+                        "optimizer and schedule); needs an empty checkpoint dir")
+    p.add_argument("--unfreeze-image", action="store_true",
+                   help="train the BioViL-T image encoder at LR * IMAGE_LR_MULT; "
+                        "its BatchNorm stats and dropout stay frozen")
     p.add_argument("--skip-gold", action="store_true")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
@@ -314,6 +320,14 @@ def main():
 
     epochs = args.epochs or EPOCHS
     batch_size = args.batch_size or BATCH_SIZE
+    freeze_image = FREEZE_IMAGE_ENCODER and not args.unfreeze_image
+    if args.init_from:
+        init_dir = os.path.dirname(os.path.abspath(args.init_from))
+        if init_dir == os.path.abspath(CHECKPOINT_DIR):
+            raise SystemExit(
+                f"[vljepa] --init-from {args.init_from} is inside {CHECKPOINT_DIR}; "
+                "set VLJEPA_CHECKPOINT_DIR to a new folder so the source run stays intact"
+            )
 
     if rank == 0:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -331,8 +345,13 @@ def main():
             f"[vljepa]   resolved = all five sentences stay in the softmax "
             f"(drop_resolved_negative={DROP_RESOLVED_NEGATIVE})"
         )
-        print(f"[vljepa]   freeze image={FREEZE_IMAGE_ENCODER} "
+        print(f"[vljepa]   freeze image={freeze_image} "
               f"text={FREEZE_TEXT_ENCODER}")
+        if not freeze_image:
+            print(f"[vljepa]   image lr = {LR * IMAGE_LR_MULT:g} "
+                  f"(BatchNorm stats + dropout frozen)")
+        if args.init_from:
+            print(f"[vljepa]   init from = {args.init_from} (weights only)")
         from .text_lora import lora_ckpt_path
         print(f"[vljepa]   text lora = {lora_ckpt_path()}")
         print(f"[vljepa]   ckpt   = {CHECKPOINT_DIR}")
@@ -387,7 +406,7 @@ def main():
         n_llama_layers=N_LLAMA_LAYERS,
         llama_name=LLAMA_NAME,
         llama_local=LLAMA_LOCAL,
-        freeze_image_encoder=FREEZE_IMAGE_ENCODER,
+        freeze_image_encoder=freeze_image,
         freeze_text_encoder=FREEZE_TEXT_ENCODER,
         gradient_checkpointing=True,
     ).to(device)
@@ -431,6 +450,12 @@ def main():
                 f"[vljepa] refusing {resume_path}: not a 5-way LoRA checkpoint. "
                 f"Use an empty {CHECKPOINT_DIR}."
             )
+        if bool(cfg.get("freeze_image_encoder", True)) != freeze_image:
+            raise SystemExit(
+                f"[vljepa] refusing {resume_path}: it was trained with "
+                f"freeze_image_encoder={cfg.get('freeze_image_encoder', True)}, "
+                f"this run has {freeze_image}. Use a new checkpoint dir."
+            )
         raw_model.load_state_dict(ckpt["model"], strict=False)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -440,6 +465,23 @@ def main():
         best_val = float(ckpt.get("best_val_loss", best_val))
         if rank == 0:
             print(f"[vljepa] resumed {resume_path} → next epoch {start_epoch}")
+            if args.init_from:
+                print(f"[vljepa] {CHECKPOINT_DIR} already has epochs; "
+                      f"ignoring --init-from {args.init_from}")
+    elif args.init_from:
+        ckpt = torch.load(args.init_from, map_location="cpu")
+        cfg = ckpt.get("vljepa_cfg", {})
+        if not cfg.get("text_lora") or cfg.get("drop_resolved_negative", True):
+            raise SystemExit(
+                f"[vljepa] refusing --init-from {args.init_from}: "
+                "not a 5-way LoRA checkpoint"
+            )
+        missing, unexpected = raw_model.load_state_dict(ckpt["model"], strict=False)
+        if rank == 0:
+            print(f"[vljepa] initialised weights from {args.init_from} "
+                  f"(epoch {ckpt.get('epoch')}); fresh optimizer and schedule; "
+                  f"missing={len(missing)} unexpected={len(unexpected)}")
+        del ckpt
 
     gold_groups = None
     gold_roots = None
@@ -515,7 +557,10 @@ def main():
                     "n_llama_layers": N_LLAMA_LAYERS,
                     "llama_name": LLAMA_NAME,
                     "llama_local": LLAMA_LOCAL,
-                    "freeze_image_encoder": FREEZE_IMAGE_ENCODER,
+                    "freeze_image_encoder": freeze_image,
+                    "freeze_image_norm": True,
+                    "image_lr": None if freeze_image else LR * IMAGE_LR_MULT,
+                    "init_from": args.init_from,
                     "freeze_text_encoder": FREEZE_TEXT_ENCODER,
                     "drop_resolved_negative": DROP_RESOLVED_NEGATIVE,
                     "text_lora": True,

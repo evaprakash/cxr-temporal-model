@@ -4,6 +4,7 @@
 #
 #   bash vljepa/run_ccw.sh smoke
 #   bash vljepa/run_ccw.sh train
+#   bash vljepa/run_ccw.sh train_img      # epoch_5.pt weights, image encoder unfrozen, 5 epochs
 #   bash vljepa/run_ccw.sh check --ckpt <checkpoint dir>/epoch_N.pt
 #   bash vljepa/run_ccw.sh shift --ckpt <checkpoint dir>/epoch_N.pt
 #   bash vljepa/run_ccw.sh gold  --ckpt <checkpoint dir>/epoch_N_shifted.pt
@@ -11,6 +12,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+if [ "${1:-}" = "train_img" ]; then
+    export VLJEPA_CHECKPOINT_DIR="${VLJEPA_CHECKPOINT_DIR:-$ROOT/checkpoints_vljepa_lora_5way_imgft}"
+    export VLJEPA_LOG_DIR="${VLJEPA_LOG_DIR:-/nvme/people/eprakash/logs/vljepa_lora_5way_imgft}"
+    VLJEPA_INIT_FROM="${VLJEPA_INIT_FROM:-$ROOT/checkpoints_vljepa_lora_5way/epoch_5.pt}"
+fi
 
 export SCRATCH_BASE="${SCRATCH_BASE:-/nvme/people/eprakash}"
 export PROJECT_DIR="${PROJECT_DIR:-$ROOT}"
@@ -63,6 +70,12 @@ run() {
         NGPU="${SLURM_GPUS_ON_NODE:-4}"
         echo "[ccw] nproc_per_node=$NGPU"
         "$PY" -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train
+    elif [ "$MODE" = "train_img" ]; then
+        shift
+        NGPU="${SLURM_GPUS_ON_NODE:-4}"
+        echo "[ccw] nproc_per_node=$NGPU init_from=$VLJEPA_INIT_FROM"
+        "$PY" -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train \
+            --init-from "$VLJEPA_INIT_FROM" --unfreeze-image --epochs 5 "$@"
     elif [ "$MODE" = "check" ]; then
         shift
         "$PY" -m vljepa.check_class_signal "$@"
@@ -76,7 +89,7 @@ run() {
         shift
         "$PY" -m vljepa.check_worsening "$@"
     else
-        echo "usage: bash vljepa/run_ccw.sh smoke|train|check|shift|gold|worsening ..." >&2
+        echo "usage: bash vljepa/run_ccw.sh smoke|train|train_img|check|shift|gold|worsening ..." >&2
         return 1
     fi
 }

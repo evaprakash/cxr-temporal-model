@@ -613,7 +613,11 @@ class VLJEPA(nn.Module):
         freeze_image_encoder: bool = True,
         freeze_text_encoder: bool = False,
         gradient_checkpointing: bool = True,
+        freeze_image_norm: bool = True,
     ):
+        """``freeze_image_norm`` keeps a trainable image encoder in eval mode,
+        so BatchNorm running stats and dropout stay at their pretrained
+        behaviour while gradients still update the weights."""
         super().__init__()
         img_mode = "biovilt_no_pretrained" if smoke else image_mode
         self.image_encoder = BioViLTImageEncoderJEPA(mode=img_mode)
@@ -639,6 +643,7 @@ class VLJEPA(nn.Module):
         )
         self.freeze_image_encoder = bool(freeze_image_encoder)
         self.freeze_text_encoder = bool(freeze_text_encoder)
+        self.freeze_image_norm = bool(freeze_image_norm)
         if self.freeze_image_encoder:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
@@ -650,7 +655,7 @@ class VLJEPA(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.freeze_image_encoder:
+        if self.freeze_image_encoder or self.freeze_image_norm:
             self.image_encoder.eval()
         if self.freeze_text_encoder:
             self.text_encoder.eval()
