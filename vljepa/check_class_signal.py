@@ -431,6 +431,40 @@ def knob_table(val_labels, gold_scores, gold_gts, gold_findings, kind, model_nam
            + "".join(f"{n:>7d}" for n in true_n))
 
 
+def per_class_table(gold_scores, gold_gts, gold_findings, kind, model_name, ref=None):
+    """Nudge one class at a time (all others fixed) and report the best F1
+    that class can reach, plus what it costs the rest."""
+    grid = BONUS_GRIDS[kind]
+    single_scores, single_labels = gold_single(gold_scores, gold_gts)
+    true_n = np.bincount(single_labels, minlength=N_CLS)
+
+    _print(f"\n=== One class nudged at a time on GOLD ({model_name}, {kind} units)")
+    _print("  best F1 = highest F1 that class reaches when only it is nudged;")
+    _print("  matched = nudge where that class is called as often as it truly occurs")
+    _print(f"  {'class':<10} {'row':<8} {'nudge':>7} {'own F1':>7} {'ref F1':>7} "
+           f"{'calls':>6} {'true':>5} {'stab F1':>8} {'macroF1':>8} {'combined':>9}")
+    for c, cls in enumerate(CLS_ORDER):
+        if c == STABLE:
+            continue
+        rows = []
+        for v in grid:
+            b = np.zeros(N_CLS)
+            b[c] = v
+            pred = (single_scores + b).argmax(1)
+            f1 = per_class_f1(pred, single_labels)
+            rows.append((v, f1, int((pred == c).sum())))
+        best = max(rows, key=lambda r: r[1][c])
+        matched = min(rows, key=lambda r: abs(r[2] - true_n[c]))
+        for tag, (v, f1, n) in (("best F1", best), ("matched", matched)):
+            b = np.zeros(N_CLS)
+            b[c] = v
+            combined = summarize_setmatch(
+                gold_results(gold_scores, gold_gts, gold_findings, b))["combined_score"]
+            ref_f1 = f"{ref['f1'][c]:>7.3f}" if ref is not None else f"{'-':>7}"
+            _print(f"  {cls:<10} {tag:<8} {v:>+7.3f} {f1[c]:>7.3f} {ref_f1} "
+                   f"{n:>6d} {true_n[c]:>5d} {f1[STABLE]:>8.3f} {f1.mean():>8.4f} {combined:>9.4f}")
+
+
 def reference_metrics(path):
     data = np.load(path, allow_pickle=True)
     scores, gts, findings = data["gold_scores"], data["gold_gts"], data["gold_findings"]
@@ -581,6 +615,8 @@ def main() -> int:
                    help="also tune bonuses on gold itself (upper bound; never report it)")
     p.add_argument("--knob", action="store_true",
                    help="only print the one-knob balancing table (needs --reuse)")
+    p.add_argument("--per-class", action="store_true",
+                   help="only print the one-class-at-a-time nudge table (needs --reuse)")
     p.add_argument("--ref", help="scores .npz of a reference model (e.g. supervised) "
                                  "to compare improving / worsening F1 against")
     p.add_argument("--margin", type=float, default=0.02)
@@ -591,6 +627,11 @@ def main() -> int:
         kind = str(data["score_kind"]) if "score_kind" in data else "cosine"
         name = str(data["model_name"]) if "model_name" in data else "vljepa"
         _print(f"[check] reusing scores from {args.reuse}")
+        if args.per_class:
+            ref = reference_metrics(args.ref) if args.ref else None
+            per_class_table(data["gold_scores"], data["gold_gts"], data["gold_findings"],
+                            kind, name, ref)
+            return 0
         if args.knob:
             ref = reference_metrics(args.ref) if args.ref else None
             knob_table(data["val_labels"], data["gold_scores"], data["gold_gts"],
