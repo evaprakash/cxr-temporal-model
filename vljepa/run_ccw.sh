@@ -72,8 +72,11 @@ run() {
     elif [ "$MODE" = "gold" ]; then
         shift
         "$PY" -m vljepa.eval_gold "$@"
+    elif [ "$MODE" = "worsening" ]; then
+        shift
+        "$PY" -m vljepa.check_worsening "$@"
     else
-        echo "usage: bash vljepa/run_ccw.sh smoke|train|check|shift|gold --ckpt <epoch_N.pt>" >&2
+        echo "usage: bash vljepa/run_ccw.sh smoke|train|check|shift|gold|worsening ..." >&2
         return 1
     fi
 }
