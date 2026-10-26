@@ -88,6 +88,38 @@ def per_finding_table(vj, sup):
               f"{va:>7.3f} {sa:>7.3f}  {called_s}")
 
 
+def class_rates(scores, labels):
+    pred = scores.argmax(1)
+    out = []
+    for c in range(N_CLS):
+        n_pred = int((pred == c).sum())
+        tp = int(((pred == c) & (labels == c)).sum())
+        n_true = int((labels == c).sum())
+        out.append((n_true, n_pred, tp / n_true if n_true else float("nan"),
+                    tp / n_pred if n_pred else float("nan")))
+    return out
+
+
+def silver_table(vj_path, sup_path, shift):
+    vj, sup = np.load(vj_path, allow_pickle=True), np.load(sup_path, allow_pickle=True)
+    vj_scores = vj["val_scores"] + (0 if shift is None else np.asarray(shift)[None, :])
+    labels = vj["val_labels"]
+    if len(labels) != len(sup["val_labels"]) or not (labels == sup["val_labels"]).all():
+        raise SystemExit("[worsening] the two npz files do not hold the same silver val films")
+    sup_scores = sup["val_scores"]
+
+    print(f"\n=== Part 1b: silver val (n={len(labels)}), how often each model calls each class")
+    print(f"  {'class':<10} {'n_true':>7} {'VJ n_pred':>9} {'SUP n_pred':>10} "
+          f"{'VJ rec':>7} {'SUP rec':>7} {'VJ prec':>7} {'SUP prec':>8}")
+    for c, (v, s) in enumerate(zip(class_rates(vj_scores, labels), class_rates(sup_scores, labels))):
+        print(f"  {CLS_ORDER[c]:<10} {v[0]:>7d} {v[1]:>9d} {s[1]:>10d} "
+              f"{v[2]:>7.3f} {s[2]:>7.3f} {v[3]:>7.3f} {s[3]:>8.3f}")
+    ws = (labels == WORSENING) | (labels == STABLE)
+    rank = [auroc(x[ws, WORSENING] - x[ws, STABLE], labels[ws] == WORSENING)
+            for x in (vj_scores, sup_scores)]
+    print(f"  worsening vs stable AUROC: VJ {rank[0]:.3f}   SUP {rank[1]:.3f}")
+
+
 def sentence_table(ckpt_path, findings):
     import torch
     import torch.nn.functional as F
@@ -129,6 +161,7 @@ def main() -> int:
         print(f"[worsening] VL-JEPA class shift {shift}")
     vj = load_single(args.vljepa, shift)
     per_finding_table(vj, load_single(args.supervised))
+    silver_table(args.vljepa, args.supervised, shift)
     if args.ckpt:
         sentence_table(args.ckpt, sorted(set(vj[2])))
     return 0
