@@ -368,6 +368,79 @@ def em_prior_bonus(val_scores, val_labels, gold_scores, t0):
     return bonus - bonus[STABLE], t, prior_src, prior_gold
 
 
+def per_class_f1(pred: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    out = np.zeros(N_CLS)
+    for c in range(N_CLS):
+        tp = int(((pred == c) & (labels == c)).sum())
+        n_pred, n_true = int((pred == c).sum()), int((labels == c).sum())
+        p = tp / n_pred if n_pred else 0.0
+        r = tp / n_true if n_true else 0.0
+        out[c] = 2 * p * r / (p + r) if p + r else 0.0
+    return out
+
+
+def gold_single(gold_scores, gold_gts):
+    keep = np.array(["|" not in g for g in gold_gts])
+    labels = np.array([CLS_ORDER.index(g) for g in gold_gts[keep]], dtype=np.int64)
+    return gold_scores[keep], labels
+
+
+def knob_bonus(alpha: float, prior: np.ndarray, temperature: float) -> np.ndarray:
+    """One-knob balancing: alpha * T * log(1 / silver share), stable at 0.
+    alpha=0 is the raw model; alpha=1 fully undoes the silver class mix."""
+    b = alpha * temperature * -np.log(prior)
+    return b - b[STABLE]
+
+
+def knob_table(val_labels, gold_scores, gold_gts, gold_findings, kind, model_name,
+               ref=None, margin=0.02):
+    temperature = 0.07 if kind == "cosine" else 1.0
+    prior = np.bincount(val_labels, minlength=N_CLS) / len(val_labels)
+    single_scores, single_labels = gold_single(gold_scores, gold_gts)
+    imp, wor = CLS_ORDER.index("improving"), CLS_ORDER.index("worsening")
+
+    _print(f"\n=== One-knob balancing on GOLD ({model_name}, {kind}s, T={temperature})")
+    _print("  bonus per class = alpha * T * log(1 / silver share); stable fixed at 0")
+    _print("  silver shares: " + ", ".join(
+        f"{c} {prior[i]:.3f}" for i, c in enumerate(CLS_ORDER)))
+    if ref is not None:
+        _print("  reference (no bonus): combined {:.4f}  macro F1 {:.4f}  F1 ".format(
+            ref["combined"], ref["macro_f1"])
+            + " ".join(f"{c[:4]} {ref['f1'][i]:.3f}" for i, c in enumerate(CLS_ORDER)))
+        _print(f"  ok = improving and worsening F1 both within {margin:.2f} of the reference")
+    header = (f"  {'alpha':>5} {'combined':>9} {'macroF1':>8} "
+              + "".join(f"{c[:4] + ' F1':>9}" for c in CLS_ORDER)
+              + "".join(f"{c[:4] + ' n':>7}" for c in CLS_ORDER))
+    _print(header + ("    ok" if ref is not None else ""))
+    for alpha in np.round(np.arange(0.0, 1.0001, 0.05), 2):
+        b = knob_bonus(alpha, prior, temperature)
+        pred = (single_scores + b).argmax(1)
+        f1 = per_class_f1(pred, single_labels)
+        combined = summarize_setmatch(
+            gold_results(gold_scores, gold_gts, gold_findings, b))["combined_score"]
+        counts = np.bincount(pred, minlength=N_CLS)
+        line = (f"  {alpha:>5.2f} {combined:>9.4f} {f1.mean():>8.4f} "
+                + "".join(f"{x:>9.3f}" for x in f1)
+                + "".join(f"{n:>7d}" for n in counts))
+        if ref is not None:
+            ok = f1[imp] >= ref["f1"][imp] - margin and f1[wor] >= ref["f1"][wor] - margin
+            line += "   yes" if ok else "    no"
+        _print(line)
+    true_n = np.bincount(single_labels, minlength=N_CLS)
+    _print(f"  {'true':>5} {'':>9} {'':>8} " + " " * 9 * N_CLS
+           + "".join(f"{n:>7d}" for n in true_n))
+
+
+def reference_metrics(path):
+    data = np.load(path, allow_pickle=True)
+    scores, gts, findings = data["gold_scores"], data["gold_gts"], data["gold_findings"]
+    single_scores, single_labels = gold_single(scores, gts)
+    f1 = per_class_f1(single_scores.argmax(1), single_labels)
+    combined = summarize_setmatch(
+        gold_results(scores, gts, findings, np.zeros(N_CLS)))["combined_score"]
+    return {"f1": f1, "macro_f1": float(f1.mean()), "combined": combined}
+
+
 def print_rank_checks(name: str, scores: np.ndarray, labels: np.ndarray) -> None:
     margin = win_margin(scores)
     counts = Counter(labels.tolist())
@@ -506,6 +579,11 @@ def main() -> int:
     p.add_argument("--no-full-report", action="store_true")
     p.add_argument("--gold-oracle", action="store_true",
                    help="also tune bonuses on gold itself (upper bound; never report it)")
+    p.add_argument("--knob", action="store_true",
+                   help="only print the one-knob balancing table (needs --reuse)")
+    p.add_argument("--ref", help="scores .npz of a reference model (e.g. supervised) "
+                                 "to compare improving / worsening F1 against")
+    p.add_argument("--margin", type=float, default=0.02)
     args = p.parse_args()
 
     if args.reuse:
@@ -513,6 +591,11 @@ def main() -> int:
         kind = str(data["score_kind"]) if "score_kind" in data else "cosine"
         name = str(data["model_name"]) if "model_name" in data else "vljepa"
         _print(f"[check] reusing scores from {args.reuse}")
+        if args.knob:
+            ref = reference_metrics(args.ref) if args.ref else None
+            knob_table(data["val_labels"], data["gold_scores"], data["gold_gts"],
+                       data["gold_findings"], kind, name, ref, args.margin)
+            return 0
         report(data["val_scores"], data["val_labels"], data["gold_scores"],
                data["gold_gts"], data["gold_findings"], not args.no_full_report,
                kind, name, args.gold_oracle)
