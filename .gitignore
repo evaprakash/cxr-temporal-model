@@ -37,3 +37,6 @@ mlruns/
 # hi-ml is a separate Microsoft submodule — see README for setup
 tempcxr/modules/hi-ml/
 tempcxr/modules/pretrained/
+
+# MS-CXR-T scores hold PhysioNet labels
+mscxrt_scores/
