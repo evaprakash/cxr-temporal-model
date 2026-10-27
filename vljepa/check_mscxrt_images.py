@@ -14,11 +14,15 @@ prefix does not matter.
         --root /scratch/m000081/yunhe/dataset/MIMIC-CXR/mimic-cxr-jpg/2.0.0 \\
         --only mscxrt_clean_missing_urls.txt --found-list found.txt
     tar -czf mscxrt_missing.tgz -C <root> -T found.txt
+
+    # copy every found image to ./mscxrt/pXX/pXXXXXXXX/sXXXXXXXX/<id>.jpg
+    python3 vljepa/check_mscxrt_images.py --root <root> --copy
 """
 
 import argparse
 import csv
 import os
+import shutil
 from collections import Counter
 
 
@@ -38,6 +42,10 @@ def main():
                                   "e.g. mscxrt_clean_missing_urls.txt from prepare")
     p.add_argument("--found-list", help="write the found paths here, relative to --root (for tar -T)")
     p.add_argument("--missing-list", help="write the still-missing paths here")
+    p.add_argument("--copy", action="store_true",
+                   help="copy the found images into --copy-dir, keeping the layout after files/")
+    p.add_argument("--copy-dir", default="mscxrt",
+                   help="where --copy puts images (default: ./mscxrt in the current directory)")
     args = p.parse_args()
 
     if args.only:
@@ -76,6 +84,20 @@ def main():
         with open(args.missing_list, "w") as f:
             f.write("".join(r + "\n" for r in missing))
         print(f"[check] wrote {len(missing)} missing paths to {args.missing_list}")
+    if args.copy:
+        dest_root = os.path.abspath(args.copy_dir)
+        copied = skipped = 0
+        for rel in found:
+            src = os.path.join(args.root, rel)
+            dst = os.path.join(dest_root, rel[len("files/"):])
+            if os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(src):
+                skipped += 1
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            copied += 1
+        print(f"[check] copied {copied} images to {dest_root} "
+              f"({skipped} already there){'; missing ones were not copied' if missing else ''}")
 
 
 if __name__ == "__main__":
