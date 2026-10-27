@@ -56,18 +56,42 @@ DEFAULT_CSV = os.environ.get("MSCXRT_CSV", os.path.join(REPO_ROOT, "mscxrt_label
 DEFAULT_CLEAN = os.path.join(REPO_ROOT, "mscxrt_clean.csv")
 DEFAULT_MIMIC = os.environ.get("MIMIC_CXR_JPG", "/nvme/data/cxr/mimic-cxr-jpg/2.0.0")
 DEFAULT_SCORES = os.path.join(REPO_ROOT, "mscxrt_scores")
+PHYSIONET = "https://physionet.org/files/mimic-cxr-jpg/2.0.0/"
 
 
 def study_digits(x) -> str:
     return re.sub(r"\D", "", str(x)).lstrip("0")
 
 
-def local_path(path: str, mimic_root: str) -> str:
+def local_path(path: str, roots) -> str:
+    """First existing copy under any root (as root/files/pXX/... or root/pXX/...);
+    the first candidate if none exists."""
     path = str(path).strip()
     i = path.find("/files/")
     if i < 0:
         raise ValueError(f"no /files/ in MS-CXR-T image path: {path}")
-    return os.path.join(mimic_root, path[i + 1:])
+    rel = path[i + 1:]
+    cands = [os.path.join(r, rel) for r in roots] + [os.path.join(r, rel[len("files/"):]) for r in roots]
+    return next((c for c in cands if os.path.isfile(c)), cands[0])
+
+
+def explain_missing(paths, root):
+    """Where the copy under ``root`` stops: no patient folder, no study folder, or no file."""
+    from collections import Counter
+
+    why, by_group = Counter(), Counter()
+    for p in paths:
+        study_dir = os.path.dirname(p)
+        patient_dir = os.path.dirname(study_dir)
+        if not os.path.isdir(patient_dir):
+            why["no patient folder"] += 1
+        elif not os.path.isdir(study_dir):
+            why["no study folder"] += 1
+        else:
+            why["study folder without this file"] += 1
+        by_group[os.path.basename(os.path.dirname(patient_dir))] += 1
+    print("  why: " + ", ".join(f"{k} {v}" for k, v in why.most_common()))
+    print("  by folder: " + ", ".join(f"{k} {v}" for k, v in sorted(by_group.items())))
 
 
 # ----------------------------------------------------------------------
@@ -109,12 +133,26 @@ def prepare(args) -> int:
           f"either {int((img_hit | study_hit).sum())} of {len(df)}")
     df = df[~(img_hit | study_hit)].reset_index(drop=True)
 
-    df["prev_path"] = df["img_path_prev"].map(lambda p: local_path(p, args.mimic_root))
-    df["curr_path"] = df["img_path_curr"].map(lambda p: local_path(p, args.mimic_root))
+    roots = [args.mimic_root] + [r for r in args.alt_root if os.path.isdir(r)]
+    print(f"[mscxrt] image roots, in order: {roots}")
+    df["prev_path"] = df["img_path_prev"].map(lambda p: local_path(p, roots))
+    df["curr_path"] = df["img_path_curr"].map(lambda p: local_path(p, roots))
     present = df["prev_path"].map(os.path.isfile) & df["curr_path"].map(os.path.isfile)
     if not present.all():
-        print(f"[mscxrt] {int((~present).sum())} kept pairs have a missing image, e.g. "
-              f"{df.loc[~present, 'curr_path'].iloc[0]}")
+        missing = [p for p in pd.concat([df.loc[~present, "prev_path"], df.loc[~present, "curr_path"]])
+                   if not os.path.isfile(p)]
+        print(f"[mscxrt] {int((~present).sum())} clean pairs have a missing image "
+              f"({len(set(missing))} distinct files), e.g. {missing[0]}")
+        explain_missing(sorted(set(missing)), args.mimic_root)
+        list_path = os.path.splitext(args.out)[0] + "_missing_urls.txt"
+        with open(list_path, "w") as f:
+            for p in sorted(set(missing)):
+                f.write(PHYSIONET + p[p.find("files/"):] + "\n")
+        print(f"[mscxrt] wrote the missing files' PhysioNet URLs to {list_path}")
+        if not args.allow_missing:
+            print("[mscxrt] stopping without writing the clean CSV. Fix the image copy, or pass "
+                  "--allow-missing to score only the pairs that have both images.")
+            return 1
     df = df[present].reset_index(drop=True)
     df["finding"] = df["disease_name"].str.strip().str.lower()
     df["key"] = (df["patient_id"] + "_" + df["study_id_prev"] + "_"
@@ -321,6 +359,10 @@ def main() -> int:
     a.add_argument("--csv", default=DEFAULT_CSV)
     a.add_argument("--silver", help="silver_findings.parquet (default: CheXTemporal on this machine)")
     a.add_argument("--mimic-root", default=DEFAULT_MIMIC)
+    a.add_argument("--alt-root", nargs="*",
+                   default=[os.path.join(os.environ.get("JEPA_IMAGE_ROOTS_DIR", "/nvme/data/temporal/all_data"), "mimic")],
+                   help="other folders to look in when an image is missing under --mimic-root")
+    a.add_argument("--allow-missing", action="store_true")
     a.add_argument("--out", default=DEFAULT_CLEAN)
 
     a = sub.add_parser("score")

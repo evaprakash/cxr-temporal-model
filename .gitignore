@@ -42,3 +42,4 @@ tempcxr/modules/pretrained/
 mscxrt_scores/
 # score files hold per-film labels; the repo is public
 vljepa/results/**/*.npz
+mscxrt_*missing_urls.txt
