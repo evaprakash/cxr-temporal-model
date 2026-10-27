@@ -40,3 +40,5 @@ tempcxr/modules/pretrained/
 
 # MS-CXR-T scores hold PhysioNet labels
 mscxrt_scores/
+# score files hold per-film labels; the repo is public
+vljepa/results/**/*.npz

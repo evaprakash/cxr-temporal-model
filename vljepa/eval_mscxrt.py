@@ -290,19 +290,21 @@ def compare(args) -> int:
         rows = []
         for b in boots:
             r = metrics(scores[b], labels[b])
-            rows.append([r[k] for k in keys] + [r["auc"]["improving"], r["auc"]["worsening"]])
+            rows.append([r[k] for k in keys] + [r["f1"][c] for c in VALID]
+                        + [r["auc"]["improving"], r["auc"]["worsening"]])
         return np.array(rows)
 
     print(f"\n=== Paired bootstrap ({args.boot} resamples of the same pairs), model minus {args.ref}")
     print("  95% range = where the true difference most likely lies; if it spans 0, it is a tie.")
     print("  P = share of resamples where the model is ahead.")
     ref_boot = boot_stats(runs[args.ref][0])
-    cols = keys + ["auc_improving", "auc_worsening"]
+    cols = keys + [f"f1_{c}" for c in VALID] + ["auc_improving", "auc_worsening"]
     for name in runs:
         if name == args.ref:
             continue
         diff = boot_stats(runs[name][0]) - ref_boot
         point = ([m[name][k] - m[args.ref][k] for k in keys]
+                 + [m[name]["f1"][c] - m[args.ref]["f1"][c] for c in VALID]
                  + [m[name]["auc"][c] - m[args.ref]["auc"][c] for c in ("improving", "worsening")])
         print(f"\n  {name} minus {args.ref}")
         for j, col in enumerate(cols):

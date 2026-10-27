@@ -290,9 +290,12 @@ def main() -> int:
     single_idx = np.flatnonzero(single)
     boots_single = rng.integers(0, len(single_idx), size=(args.boot, len(single_idx)))
 
-    def macro_f1_rows(pred_single):
-        return np.array([per_class_f1(pred_single[b], labels[single_idx][b]).mean()
+    def f1_rows(pred_single):
+        return np.array([per_class_f1(pred_single[b], labels[single_idx][b])
                          for b in boots_single])
+
+    def macro_f1_rows(pred_single):
+        return f1_rows(pred_single).mean(1)
 
     print(f"\n=== Paired bootstrap on gold, model minus supervised "
           f"(95% CI; P = share of draws where the model is ahead)")
@@ -320,6 +323,28 @@ def main() -> int:
                 "d_combined": [round(point_c, 4), round(lo_c, 4), round(hi_c, 4), round(pr_c, 3)],
                 "d_macro_f1": [round(point_f, 4), round(lo_f, 4), round(hi_f, 4), round(pr_f, 3)],
             }
+
+    print("\n=== Headline: model with its silver resolved-only shift minus supervised with no shift")
+    print("  (each model in the form you would report it; 95% CI; P = share of draws ahead)")
+    g_s, p_s = outcomes["supervised"]["none"]
+    f1_s = f1_rows(p_s[single_idx])
+    results["headline"] = {}
+    for name in models:
+        if name == "supervised":
+            continue
+        g_m, p_m = outcomes[name]["silver resolved-only"]
+        f1_m = f1_rows(p_m[single_idx])
+        point_f1 = per_class_f1(p_m[single], labels[single]) - per_class_f1(p_s[single], labels[single])
+        rows = [("combined", g_m.mean() - g_s.mean(), (g_m[boots] - g_s[boots]).mean(1)),
+                ("macro F1", point_f1.mean(), f1_m.mean(1) - f1_s.mean(1))]
+        rows += [(f"{c} F1", point_f1[i], f1_m[:, i] - f1_s[:, i]) for i, c in enumerate(CLS_ORDER)]
+        print(f"\n  {name} + silver resolved-only  minus  supervised")
+        results["headline"][name] = {}
+        for label, point_d, draws in rows:
+            lo, hi, pr = ci(draws)
+            print(f"  {label:<14} {point_d:>+8.4f}   [{lo:>+7.4f}, {hi:>+7.4f}]   P {pr:.2f}")
+            results["headline"][name][label] = [round(float(point_d), 4), round(lo, 4),
+                                                round(hi, 4), round(pr, 3)]
 
     print("\n=== Ranking on gold single-label, AUROC of (class - stable) score; no cutoff involved")
     s_scores = {name: m["gold_scores"][single] for name, m in models.items()}
