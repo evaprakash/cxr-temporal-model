@@ -23,7 +23,27 @@ import argparse
 import csv
 import os
 import shutil
+import sys
+import time
 from collections import Counter
+
+
+def progress(items, label):
+    """Yield items while drawing a one-line bar on stderr."""
+    n = len(items)
+    start = last = time.time()
+    for i, item in enumerate(items, 1):
+        yield item
+        now = time.time()
+        if i == n or now - last > 0.2:
+            last = now
+            done = int(30 * i / max(n, 1))
+            rate = i / max(now - start, 1e-9)
+            eta = (n - i) / rate if rate else 0
+            sys.stderr.write(f"\r{label} [{'#' * done}{'.' * (30 - done)}] {i}/{n} "
+                             f"{rate:.0f}/s eta {eta:.0f}s ")
+            sys.stderr.flush()
+    sys.stderr.write("\n")
 
 
 def rel_files_path(path):
@@ -66,7 +86,7 @@ def main():
         raise SystemExit(f"[check] no files/ folder under {args.root}")
 
     found, missing = [], []
-    for rel in sorted(wanted):
+    for rel in progress(sorted(wanted), "checking"):
         (found if os.path.isfile(os.path.join(args.root, rel)) else missing).append(rel)
 
     print(f"[check] {source}: {len(wanted)} distinct images")
@@ -87,7 +107,7 @@ def main():
     if args.copy:
         dest_root = os.path.abspath(args.copy_dir)
         copied = skipped = 0
-        for rel in found:
+        for rel in progress(found, "copying "):
             src = os.path.join(args.root, rel)
             dst = os.path.join(dest_root, rel[len("files/"):])
             if os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(src):
