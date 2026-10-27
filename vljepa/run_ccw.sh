@@ -8,6 +8,7 @@
 #   bash vljepa/run_ccw.sh check --ckpt <checkpoint dir>/epoch_N.pt
 #   bash vljepa/run_ccw.sh shift --ckpt <checkpoint dir>/epoch_N.pt
 #   bash vljepa/run_ccw.sh gold  --ckpt <checkpoint dir>/epoch_N_shifted.pt
+#   bash vljepa/run_ccw.sh rules --vljepa <npz> --supervised <npz>   # no GPU needed
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -88,8 +89,11 @@ run() {
     elif [ "$MODE" = "worsening" ]; then
         shift
         "$PY" -m vljepa.check_worsening "$@"
+    elif [ "$MODE" = "rules" ]; then
+        shift
+        "$PY" -m vljepa.compare_shift_rules "$@"
     else
-        echo "usage: bash vljepa/run_ccw.sh smoke|train|train_img|check|shift|gold|worsening ..." >&2
+        echo "usage: bash vljepa/run_ccw.sh smoke|train|train_img|check|shift|gold|worsening|rules ..." >&2
         return 1
     fi
 }
