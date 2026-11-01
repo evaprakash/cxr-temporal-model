@@ -44,3 +44,8 @@ mscxrt_scores/
 vljepa/results/**/*.npz
 mscxrt_*missing_urls.txt
 mscxrt/
+# BAAP eval: checkpoint, and boxes / scores / QA images derived from PhysioNet data
+baap_eval/ckpt/
+baap_eval/boxes/
+baap_eval/scores/
+baap_eval/qa/
