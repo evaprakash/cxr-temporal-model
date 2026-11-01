@@ -216,6 +216,9 @@ class BAAP(nn.Module):
     @torch.no_grad()
     def logits(self, prior_patches, current_patches, prior_boxes, current_boxes, anatomy_idx):
         """One pair: patches [196, 768], boxes [N, 4] in the 224 frame -> [N, 3] logits."""
+        return self.roi_logits(prior_patches, current_patches, prior_boxes, current_boxes, anatomy_idx)
+
+    def roi_logits(self, prior_patches, current_patches, prior_boxes, current_boxes, anatomy_idx):
         def pool(p, boxes):
             m = box_patch_mask(boxes).float()
             return (m @ p) / m.sum(1, keepdim=True).clamp(min=1.0)

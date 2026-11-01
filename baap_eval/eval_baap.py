@@ -341,11 +341,16 @@ def boxes(args) -> int:
         pairs = [((gold_key(r["dataset"], r["parent_image_prev"]), p),
                   (gold_key(r["dataset"], r["parent_image_curr"]), c))
                  for r, p, c in gold_items(args.limit)]
+    elif args.set == "gold_bboxes":
+        from grounding_eval.eval_grounding import grounding_rows
+
+        pairs = [((r["prev_key"], r["prev_path"]), (r["curr_key"], r["curr_path"]))
+                 for r in grounding_rows(None, args.limit)]
     else:
         pairs = [((mimic_key(r["img_path_prev"]), p), (mimic_key(r["img_path_curr"]), c))
                  for r, p, c in mscxrt_items(args.clean, args.mimic_root, args.limit)]
     todo = dict(kv for pair in pairs for kv in pair)
-    out_path = args.out or default_boxes(args.set)
+    out_path = args.out or default_boxes("gold" if args.set == "gold_bboxes" else args.set)
     done = {}
     if os.path.isfile(out_path) and not args.overwrite:
         with open(out_path) as f:
@@ -708,7 +713,8 @@ def main() -> int:
                        help="how per-anatomy outputs become one pair prediction (BAAP paper: softmax)")
 
     a = sub.add_parser("boxes")
-    a.add_argument("--set", required=True, choices=["gold", "mscxrt"])
+    a.add_argument("--set", required=True, choices=["gold", "mscxrt", "gold_bboxes"],
+                   help="gold_bboxes: images of the grounding box set, added to cxas_gold.json")
     a.add_argument("--out")
     a.add_argument("--clean", default=DEFAULT_CLEAN)
     a.add_argument("--mimic-root", nargs="*", default=mimic_default)

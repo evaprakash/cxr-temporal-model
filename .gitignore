@@ -49,3 +49,4 @@ baap_eval/ckpt/
 baap_eval/boxes/
 baap_eval/scores/
 baap_eval/qa/
+grounding_eval/out/
