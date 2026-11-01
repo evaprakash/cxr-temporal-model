@@ -607,6 +607,24 @@ def load_gold_npz(spec: str):
     return name, scores, d["gold_gts"], d["gold_findings"]
 
 
+def split_mimic_by_imagenome(datasets, keys, split_dir):
+    """Relabel MIMIC groups by whether both studies are in Chest ImaGenome silver
+    train or valid (BAAP's training data): mimic_seen, otherwise mimic_unseen."""
+    import pandas as pd
+
+    seen = set()
+    for s in ("train", "valid"):
+        seen |= set(pd.read_csv(os.path.join(split_dir, f"{s}.csv"), dtype=str)["study_id"])
+    out = datasets.copy()
+    for i, k in enumerate(keys):
+        ds, _, prev, curr, _ = str(k).split("|", 4)
+        if ds == "mimic":
+            out[i] = "mimic_seen" if prev in seen and curr in seen else "mimic_unseen"
+    print(f"[compare] MIMIC groups by Chest ImaGenome split: "
+          f"{dict(Counter(x for x in out if str(x).startswith('mimic')))}")
+    return out
+
+
 def compare_gold(args) -> int:
     runs = {}
     b = np.load(args.baap, allow_pickle=True)
@@ -653,7 +671,9 @@ def compare_gold(args) -> int:
             print(f"  {k:<18} {diff:>+8.4f}   [{lo:>+7.4f}, {hi:>+7.4f}]   P {p:.2f}")
             report["diff_vs_" + ref][name][k] = {"diff": diff, "lo": float(lo), "hi": float(hi), "p": p}
 
-    datasets = b["gold_datasets"]
+    datasets = b["gold_datasets"].copy()
+    if args.imagenome_splits:
+        datasets = split_mimic_by_imagenome(datasets, b["gold_keys"], args.imagenome_splits)
     keys = ["combined", "macro_f1", "acc_3class", "macro_f1_3class"]
     print(f"\n=== Per dataset (BAAP may have trained on gold MIMIC pairs). [95% range] of model "
           f"minus {ref}, {args.boot} resamples within each dataset")
@@ -776,6 +796,9 @@ def main() -> int:
     a.add_argument("--boot", type=int, default=2000)
     a.add_argument("--seed", type=int, default=0)
     a.add_argument("--json", help="also write the numbers here")
+    a.add_argument("--imagenome-splits",
+                   help="Chest ImaGenome silver splits folder (train.csv, valid.csv): report gold "
+                        "MIMIC separately for pairs BAAP could have trained on")
 
     a = sub.add_parser("qa")
     scoring_args(a)
