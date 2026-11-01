@@ -94,6 +94,11 @@ TEMPERATURE = 0.07
 BAAP_STANDIN = {"new": "worsening", "resolved": "improving"}
 METHODS = ["gradcam", "swap", "text", "text_contrast", "text_presence", "text_orth"]
 N_CLS = len(CLS_ORDER)
+PRESENCE = {
+    "there_is": ("There is {f}.", "There is no {f}."),
+    "bare": ("{F}.", "No {f}."),
+    "present": ("{F} is present.", "{F} is absent."),
+}
 METRICS = ["cnr", "pointing_game", "iou_eqarea", "pixel_auroc", "energy_in_box"]
 METRIC_NAMES = {"cnr": "CNR", "pointing_game": "pointing game", "iou_eqarea": "mIoU",
                 "pixel_auroc": "pixel AUROC", "energy_in_box": "energy in box"}
@@ -228,20 +233,22 @@ class Film:
         self.tensor = apply_augmentation(BASE_TRANSFORM(img), None).unsqueeze(0).to(device)
 
 
-def phrase_vector(t7, target: int, method: str):
-    """Text direction for a map. ``t7``: the five class sentences, then the present
-    and absent sentences (see sentence_bank)."""
-    import torch.nn.functional as F
+def phrase_vector(t, target: int, method: str):
+    """Text direction for a map. ``t``: the five class sentences, then present/absent
+    sentence pairs (see sentence_bank). text_presence averages the pairs' directions;
+    text_orth removes their whole span."""
+    import torch
 
-    cls, presence = t7[:N_CLS], t7[N_CLS] - t7[N_CLS + 1]
+    cls, rest = t[:N_CLS], t[N_CLS:]
+    presence = rest[0::2] - rest[1::2]
     if method == "text":
         return cls[target]
     if method == "text_presence":
-        return presence
+        return presence.mean(0)
     v = cls[target] - cls[[c for c in range(N_CLS) if c != target]].mean(0)
     if method == "text_orth":
-        u = F.normalize(presence, dim=-1)
-        v = v - (v @ u) * u
+        q, _ = torch.linalg.qr(presence.T)
+        v = v - q @ (q.T @ v)
     return v
 
 
@@ -260,11 +267,12 @@ class BioViLFamily:
 
     frame = "biovil"
 
-    def __init__(self, image_encoder, score, device, phrases=None, token_map=None):
+    def __init__(self, image_encoder, score, device, text_encoder=None, token_map=None):
         self.enc = image_encoder
         self.score = score
         self.device = device
-        self.phrases = phrases
+        self.text_encoder = text_encoder
+        self.phrases = sentence_bank(text_encoder) if text_encoder is not None else None
         self.token_map = token_map
 
     def load(self, path):
@@ -317,19 +325,23 @@ class BioViLFamily:
         return None if cam is None else grid_to_frame(cam)
 
 
-def sentence_bank(text_encoder):
-    """finding -> [7, 128] unit-norm embeddings: ``{Finding} is {class}.`` for the five
-    classes, then ``There is {finding}.`` and ``There is no {finding}.``"""
+def sentence_bank(text_encoder, presence: str = "there_is"):
+    """finding -> unit-norm embeddings: ``{Finding} is {class}.`` for the five classes,
+    then a present and an absent sentence per wording in PRESENCE (all of them for
+    ``presence="all"``)."""
     import torch
     import torch.nn.functional as F
 
-    from vljepa.prompts import class_target_texts
+    from vljepa.prompts import cap_finding, class_target_texts
 
     bank = {}
+    wordings = list(PRESENCE) if presence == "all" else [presence]
 
     def phrases(finding):
         if finding not in bank:
-            texts = class_target_texts(finding) + [f"There is {finding}.", f"There is no {finding}."]
+            texts = class_target_texts(finding)
+            for w in wordings:
+                texts += [s.format(f=finding, F=cap_finding(finding)) for s in PRESENCE[w]]
             with torch.no_grad():
                 t, _, _ = text_encoder.forward_contrastive(texts)
             bank[finding] = F.normalize(t.float(), dim=-1)
@@ -360,7 +372,7 @@ def load_biovilt(device):
         sims = (F.normalize(g.float(), dim=-1) @ txt.T)[0]
         return torch.stack([sims[i].max() for i in idx]) / TEMPERATURE
 
-    return BioViLFamily(m.image_encoder, score, device, sentence_bank(m.text_encoder))
+    return BioViLFamily(m.image_encoder, score, device, m.text_encoder)
 
 
 def load_supervised(ckpt, device):
@@ -376,7 +388,7 @@ def load_supervised(ckpt, device):
             txt = s._text(finding)
         return s.head(torch.cat([F.normalize(g.float(), dim=-1), txt], dim=-1))[0]
 
-    return BioViLFamily(s.image_encoder, score, device, sentence_bank(s.text_encoder))
+    return BioViLFamily(s.image_encoder, score, device, s.text_encoder)
 
 
 def load_vljepa(ckpt, shift_json, device, text_source="predictor"):
@@ -405,7 +417,7 @@ def load_vljepa(ckpt, shift_json, device, text_source="predictor"):
                                     return_hidden=True)
         return model.predictor.out_proj(hidden[0, 1:1 + p.shape[1]]).float() @ v
 
-    return BioViLFamily(model.image_encoder, score, device, sentence_bank(model.text_encoder),
+    return BioViLFamily(model.image_encoder, score, device, model.text_encoder,
                         token_map if text_source == "predictor" else None)
 
 
@@ -570,8 +582,10 @@ def maps(args) -> int:
             raise SystemExit("[grounding] --text-encoder biovilt needs a BioViL-T family model")
         from tempcxr.modules.text_encoder import BioViLTTextEncoder
 
-        te = BioViLTTextEncoder(mode="biovilt").to(device).eval()
-        model.phrases, model.token_map = sentence_bank(te), None
+        model.text_encoder = BioViLTTextEncoder(mode="biovilt").to(device).eval()
+        model.token_map = None
+    if isinstance(model, BioViLFamily):
+        model.phrases = sentence_bank(model.text_encoder, args.presence)
 
     rows = grounding_rows(args.parquet, args.limit)
     name = f"{args.name}_{args.method}"
@@ -722,6 +736,10 @@ def main() -> int:
                    help="biovilt: score this model's image patch embeddings against the "
                         "original BioViL-T text encoder (how much grounding the image "
                         "encoder kept)")
+    a.add_argument("--presence", default="there_is", choices=list(PRESENCE) + ["all"],
+                   help="present/absent wording for text_presence and text_orth: there_is "
+                        "('There is X.' / 'There is no X.'), bare ('X.' / 'No X.'), present "
+                        "('X is present.' / 'X is absent.'), all (text_orth removes all three)")
     a.add_argument("--parquet", help="gold box parquet (default CheXTemporal/gold_bboxes.parquet)")
     a.add_argument("--render", type=int, default=0, help="write PNGs for the first N rows")
     a.add_argument("--limit", type=int)
