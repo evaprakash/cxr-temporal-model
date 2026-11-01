@@ -652,6 +652,37 @@ def compare_gold(args) -> int:
             diff = point[name][k] - point[ref][k]
             print(f"  {k:<18} {diff:>+8.4f}   [{lo:>+7.4f}, {hi:>+7.4f}]   P {p:.2f}")
             report["diff_vs_" + ref][name][k] = {"diff": diff, "lo": float(lo), "hi": float(hi), "p": p}
+
+    datasets = b["gold_datasets"]
+    keys = ["combined", "macro_f1", "acc_3class", "macro_f1_3class"]
+    print(f"\n=== Per dataset (BAAP may have trained on gold MIMIC pairs). [95% range] of model "
+          f"minus {ref}, {args.boot} resamples within each dataset")
+    report["per_dataset"] = {}
+    for ds in sorted(set(datasets)):
+        keep = datasets == ds
+        m = int(keep.sum())
+        sub = {name: GoldTable(s[keep], g[keep], f[keep]) for name, (s, g, f) in runs.items()}
+        pt = {name: {k: float(v[0]) for k, v in t.metrics().items()} for name, t in sub.items()}
+        ws = np.stack([np.bincount(rng.integers(0, m, m), minlength=m)
+                       for _ in range(args.boot)]).astype(float)
+        bt = {name: t.metrics(ws) for name, t in sub.items()}
+        print(f"\n  {ds} ({m} groups)")
+        print(f"  {'metric':<18}" + "".join(f"{n[:14]:>15}" for n in runs))
+        report["per_dataset"][ds] = {"groups": m, "point": pt, "diff_vs_" + ref: {}}
+        for k in keys:
+            print(f"  {k:<18}" + "".join(f"{pt[n][k]:>15.4f}" for n in runs))
+        for name in runs:
+            if name == ref:
+                continue
+            cells = []
+            report["per_dataset"][ds]["diff_vs_" + ref][name] = {}
+            for k in keys:
+                lo, hi = np.percentile(bt[name][k] - bt[ref][k], [2.5, 97.5])
+                diff = pt[name][k] - pt[ref][k]
+                cells.append(f"{k} {diff:+.3f} [{lo:+.3f}, {hi:+.3f}]")
+                report["per_dataset"][ds]["diff_vs_" + ref][name][k] = {
+                    "diff": diff, "lo": float(lo), "hi": float(hi)}
+            print(f"    {name} minus {ref}: " + "; ".join(cells))
     if args.json:
         with open(args.json, "w") as f:
             json.dump(report, f, indent=2)
