@@ -26,6 +26,10 @@ Two kinds of map (--method):
            decision. The frozen VL-JEPA encoder is BioViL-T's, so its swap map
            is BioViL-T's.
 
+--model anatomy is a control with no model: a flat map over the patch cells BAAP
+pools for the finding. If BAAP scores no better, its lead comes from being
+restricted to those regions, not from where inside them it looks.
+
 All maps are scored in the BioViL-T 448 crop (Resize 512, CenterCrop 448), so
 every model is judged on the same pixels; BAAP's 224 map is resampled into it.
 
@@ -393,6 +397,25 @@ class BAAPModel:
         return baap_to_frame(cam, film.orig)
 
 
+class AnatomyPrior(BAAPModel):
+    """Control: a flat map over the patch cells BAAP pools for this finding, no model.
+    Its pred column is meaningless."""
+
+    def _flat(self, prior: Film, current: Film, finding: str):
+        from baap_eval.baap_model import box_patch_mask
+
+        _, _, bp, bc, _ = self._inputs(prior, current, finding)
+        return tuple(box_patch_mask(b).any(0).float().view(GRID, GRID) for b in (bp, bc))
+
+    def gradcam(self, prior: Film, current: Film, finding: str, target: Optional[int]):
+        mp, mc = self._flat(prior, current, finding)
+        return mp, mc, np.zeros(len(CLS_ORDER)), -1 if target is None else target
+
+    def swap(self, prior: Film, current: Film, finding: str):
+        mp, mc = self._flat(prior, current, finding)
+        return mp, mc, np.zeros(len(CLS_ORDER))
+
+
 # ----------------------------------------------------------------------
 # maps
 # ----------------------------------------------------------------------
@@ -447,7 +470,8 @@ def maps(args) -> int:
     else:
         from baap_eval.eval_baap import DEFAULT_CKPT, default_boxes
 
-        model = BAAPModel(args.ckpt or DEFAULT_CKPT, args.boxes or default_boxes("gold"), device)
+        cls = AnatomyPrior if args.model == "anatomy" else BAAPModel
+        model = cls(args.ckpt or DEFAULT_CKPT, args.boxes or default_boxes("gold"), device)
 
     rows = grounding_rows(args.parquet, args.limit)
     name = f"{args.name}_{args.method}"
@@ -579,7 +603,9 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("maps")
-    a.add_argument("--model", required=True, choices=["biovilt", "supervised", "vljepa", "baap"])
+    a.add_argument("--model", required=True,
+                   choices=["biovilt", "supervised", "vljepa", "baap", "anatomy"],
+                   help="anatomy: control, a flat map over the anatomy cells BAAP pools")
     a.add_argument("--name", required=True)
     a.add_argument("--ckpt")
     a.add_argument("--shift-json", help="VL-JEPA class shift, if the checkpoint has none")
