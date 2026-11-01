@@ -37,6 +37,13 @@ Two kinds of map (--method):
            BioViL-T way. Maps are min-max scaled per film. Prior film unscored.
   text_contrast  same, against the gold sentence minus the mean of the other
            four: where the progression word, not just the finding, lands.
+  text_presence  ``There is {finding}.`` minus ``There is no {finding}.``: finding
+           presence only, no progression.
+  text_orth  text_contrast with the presence direction projected out. If a
+           contrast map only works because worsening/new read as "more finding",
+           this falls to chance (pixel AUROC 0.5).
+--text-encoder biovilt swaps in the original BioViL-T text encoder for any
+BioViL-T family model, to test what its image encoder kept.
 
 --model anatomy is a control with no model: a flat map over the patch cells BAAP
 pools for the finding. If BAAP scores no better, its lead comes from being
@@ -85,7 +92,8 @@ FIT = 1024
 GRID = 14
 TEMPERATURE = 0.07
 BAAP_STANDIN = {"new": "worsening", "resolved": "improving"}
-METHODS = ["gradcam", "swap", "text", "text_contrast"]
+METHODS = ["gradcam", "swap", "text", "text_contrast", "text_presence", "text_orth"]
+N_CLS = len(CLS_ORDER)
 METRICS = ["cnr", "pointing_game", "iou_eqarea", "pixel_auroc", "energy_in_box"]
 METRIC_NAMES = {"cnr": "CNR", "pointing_game": "pointing game", "iou_eqarea": "mIoU",
                 "pixel_auroc": "pixel AUROC", "energy_in_box": "energy in box"}
@@ -220,11 +228,20 @@ class Film:
         self.tensor = apply_augmentation(BASE_TRANSFORM(img), None).unsqueeze(0).to(device)
 
 
-def phrase_vector(t5, target: int, contrast: bool):
-    """Gold sentence embedding, or (contrast) gold minus the mean of the other four."""
-    v = t5[target]
-    if contrast:
-        v = v - t5[[c for c in range(len(t5)) if c != target]].mean(0)
+def phrase_vector(t7, target: int, method: str):
+    """Text direction for a map. ``t7``: the five class sentences, then the present
+    and absent sentences (see sentence_bank)."""
+    import torch.nn.functional as F
+
+    cls, presence = t7[:N_CLS], t7[N_CLS] - t7[N_CLS + 1]
+    if method == "text":
+        return cls[target]
+    if method == "text_presence":
+        return presence
+    v = cls[target] - cls[[c for c in range(N_CLS) if c != target]].mean(0)
+    if method == "text_orth":
+        u = F.normalize(presence, dim=-1)
+        v = v - (v @ u) * u
     return v
 
 
@@ -284,7 +301,7 @@ class BioViLFamily:
         return change, change, logits
 
     def text(self, prior: Film, current: Film, finding: str, target: Optional[int],
-             contrast: bool):
+             method: str):
         """Current film only: the pair's patch tokens sit on the current film's grid."""
         import torch
 
@@ -292,7 +309,7 @@ class BioViLFamily:
             g, p = self.enc(current.tensor, prior.tensor)
             logits = self.score(g, p, finding).float()
             t = int(logits.argmax()) if target is None else target
-            v = phrase_vector(self.phrases(finding), t, contrast)
+            v = phrase_vector(self.phrases(finding), t, method)
             sims = self.token_map(g, p, finding, v) if self.token_map else p[0].float() @ v
         return None, minmax(sims.view(GRID, GRID)), logits.cpu().numpy(), t
 
@@ -301,7 +318,8 @@ class BioViLFamily:
 
 
 def sentence_bank(text_encoder):
-    """finding -> [5, 128] unit-norm embeddings of ``{Finding} is {class}.``"""
+    """finding -> [7, 128] unit-norm embeddings: ``{Finding} is {class}.`` for the five
+    classes, then ``There is {finding}.`` and ``There is no {finding}.``"""
     import torch
     import torch.nn.functional as F
 
@@ -311,8 +329,9 @@ def sentence_bank(text_encoder):
 
     def phrases(finding):
         if finding not in bank:
+            texts = class_target_texts(finding) + [f"There is {finding}.", f"There is no {finding}."]
             with torch.no_grad():
-                t, _, _ = text_encoder.forward_contrastive(class_target_texts(finding))
+                t, _, _ = text_encoder.forward_contrastive(texts)
             bank[finding] = F.normalize(t.float(), dim=-1)
         return bank[finding]
 
@@ -386,7 +405,7 @@ def load_vljepa(ckpt, shift_json, device, text_source="predictor"):
                                     return_hidden=True)
         return model.predictor.out_proj(hidden[0, 1:1 + p.shape[1]]).float() @ v
 
-    return BioViLFamily(model.image_encoder, score, device, targets._targets,
+    return BioViLFamily(model.image_encoder, score, device, sentence_bank(model.text_encoder),
                         token_map if text_source == "predictor" else None)
 
 
@@ -546,6 +565,13 @@ def maps(args) -> int:
 
         cls = AnatomyPrior if args.model == "anatomy" else BAAPModel
         model = cls(args.ckpt or DEFAULT_CKPT, args.boxes or default_boxes("gold"), device)
+    if args.text_encoder == "biovilt":
+        if not isinstance(model, BioViLFamily):
+            raise SystemExit("[grounding] --text-encoder biovilt needs a BioViL-T family model")
+        from tempcxr.modules.text_encoder import BioViLTTextEncoder
+
+        te = BioViLTTextEncoder(mode="biovilt").to(device).eval()
+        model.phrases, model.token_map = sentence_bank(te), None
 
     rows = grounding_rows(args.parquet, args.limit)
     name = f"{args.name}_{args.method}"
@@ -565,8 +591,7 @@ def maps(args) -> int:
                 prior, current, r["finding"], None if args.target == "pred" else gt)
         elif args.method.startswith("text"):
             cam_p, cam_c, logits, target = model.text(
-                prior, current, r["finding"], None if args.target == "pred" else gt,
-                args.method == "text_contrast")
+                prior, current, r["finding"], None if args.target == "pred" else gt, args.method)
         else:
             cam_p, cam_c, logits = model.swap(prior, current, r["finding"])
             target = -1
@@ -693,6 +718,10 @@ def main() -> int:
     a.add_argument("--vljepa-text", default="predictor", choices=["predictor", "encoder"],
                    help="text maps for VL-JEPA: per-patch predictor outputs, or its "
                         "image patch embeddings against its LoRA text encoder")
+    a.add_argument("--text-encoder", default="own", choices=["own", "biovilt"],
+                   help="biovilt: score this model's image patch embeddings against the "
+                        "original BioViL-T text encoder (how much grounding the image "
+                        "encoder kept)")
     a.add_argument("--parquet", help="gold box parquet (default CheXTemporal/gold_bboxes.parquet)")
     a.add_argument("--render", type=int, default=0, help="write PNGs for the first N rows")
     a.add_argument("--limit", type=int)
