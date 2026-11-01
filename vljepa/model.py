@@ -535,10 +535,13 @@ class LlamaPredictor(nn.Module):
         vis_tokens: torch.Tensor,
         query_texts: List[str],
         return_aux: bool = False,
+        return_hidden: bool = False,
     ):
         """
         vis_tokens  : (B, Nv, Dv)  BioViL-T pair tokens (global + patches)
         query_texts : list[str]    Llama-tokenized inside this module
+        return_hidden: return ``(hidden, token_mask)`` before pooling instead;
+                       ``out_proj`` of their masked mean is the unnormalized Ŝ.
         """
         bsz, n_vis, _ = vis_tokens.shape
         vis_h = self.vis_proj(vis_tokens.float())
@@ -577,6 +580,8 @@ class LlamaPredictor(nn.Module):
         if self.norm is not None:
             hidden = self.norm(hidden)
         hidden = self.out_norm(hidden)
+        if return_hidden:
+            return hidden, token_mask
 
         mask_f = token_mask.unsqueeze(-1).to(hidden.dtype)
         pooled = (hidden * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)

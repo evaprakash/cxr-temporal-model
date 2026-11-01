@@ -25,6 +25,18 @@ Two kinds of map (--method):
            of biovilt_change_map_pairs.py). Tests the image encoder, not the
            decision. The frozen VL-JEPA encoder is BioViL-T's, so its swap map
            is BioViL-T's.
+  text     where the sentence ``{Finding} is {class}.`` lands on the current film,
+           with the gold class (or the model's call with --target pred).
+           BioViL-T, supervised: cosine of each projected patch embedding with
+           the sentence from the model's own text encoder (BioViL phrase
+           grounding). VL-JEPA (--vljepa-text predictor, default): each patch
+           token's predictor output, out_proj(h_i), dotted with the sentence
+           from its LoRA text encoder; Ŝ is the normalized mean of these, so
+           the map splits the class score across patches. --vljepa-text
+           encoder uses VL-JEPA's patch embeddings and LoRA text encoder the
+           BioViL-T way. Maps are min-max scaled per film. Prior film unscored.
+  text_contrast  same, against the gold sentence minus the mean of the other
+           four: where the progression word, not just the finding, lands.
 
 --model anatomy is a control with no model: a flat map over the patch cells BAAP
 pools for the finding. If BAAP scores no better, its lead comes from being
@@ -73,6 +85,7 @@ FIT = 1024
 GRID = 14
 TEMPERATURE = 0.07
 BAAP_STANDIN = {"new": "worsening", "resolved": "improving"}
+METHODS = ["gradcam", "swap", "text", "text_contrast"]
 METRICS = ["cnr", "pointing_game", "iou_eqarea", "pixel_auroc", "energy_in_box"]
 METRIC_NAMES = {"cnr": "CNR", "pointing_game": "pointing game", "iou_eqarea": "mIoU",
                 "pixel_auroc": "pixel AUROC", "energy_in_box": "energy in box"}
@@ -207,15 +220,35 @@ class Film:
         self.tensor = apply_augmentation(BASE_TRANSFORM(img), None).unsqueeze(0).to(device)
 
 
+def phrase_vector(t5, target: int, contrast: bool):
+    """Gold sentence embedding, or (contrast) gold minus the mean of the other four."""
+    v = t5[target]
+    if contrast:
+        v = v - t5[[c for c in range(len(t5)) if c != target]].mean(0)
+    return v
+
+
+def minmax(x):
+    lo, hi = x.min(), x.max()
+    return (x - lo) / (hi - lo) if hi > lo else x * 0
+
+
 class BioViLFamily:
-    """BioViL-T image encoder + a class scorer. ``score(global, patches, finding)`` -> 5 logits."""
+    """BioViL-T image encoder + a class scorer. ``score(global, patches, finding)`` -> 5 logits.
+
+    ``phrases(finding)`` -> [5, 128] unit-norm sentence embeddings, one per class.
+    ``token_map(g, p, finding, v)`` -> [196] per-patch score against v; default is the
+    cosine of each projected patch embedding with v.
+    """
 
     frame = "biovil"
 
-    def __init__(self, image_encoder, score, device):
+    def __init__(self, image_encoder, score, device, phrases=None, token_map=None):
         self.enc = image_encoder
         self.score = score
         self.device = device
+        self.phrases = phrases
+        self.token_map = token_map
 
     def load(self, path):
         return Film(path, self.device)
@@ -250,8 +283,40 @@ class BioViLFamily:
         change = (1 - (pc[0] * pp[0]).sum(-1)).view(GRID, GRID)
         return change, change, logits
 
+    def text(self, prior: Film, current: Film, finding: str, target: Optional[int],
+             contrast: bool):
+        """Current film only: the pair's patch tokens sit on the current film's grid."""
+        import torch
+
+        with torch.no_grad():
+            g, p = self.enc(current.tensor, prior.tensor)
+            logits = self.score(g, p, finding).float()
+            t = int(logits.argmax()) if target is None else target
+            v = phrase_vector(self.phrases(finding), t, contrast)
+            sims = self.token_map(g, p, finding, v) if self.token_map else p[0].float() @ v
+        return None, minmax(sims.view(GRID, GRID)), logits.cpu().numpy(), t
+
     def to_frame(self, cam, film: Film):
-        return grid_to_frame(cam)
+        return None if cam is None else grid_to_frame(cam)
+
+
+def sentence_bank(text_encoder):
+    """finding -> [5, 128] unit-norm embeddings of ``{Finding} is {class}.``"""
+    import torch
+    import torch.nn.functional as F
+
+    from vljepa.prompts import class_target_texts
+
+    bank = {}
+
+    def phrases(finding):
+        if finding not in bank:
+            with torch.no_grad():
+                t, _, _ = text_encoder.forward_contrastive(class_target_texts(finding))
+            bank[finding] = F.normalize(t.float(), dim=-1)
+        return bank[finding]
+
+    return phrases
 
 
 def load_biovilt(device):
@@ -276,7 +341,7 @@ def load_biovilt(device):
         sims = (F.normalize(g.float(), dim=-1) @ txt.T)[0]
         return torch.stack([sims[i].max() for i in idx]) / TEMPERATURE
 
-    return BioViLFamily(m.image_encoder, score, device)
+    return BioViLFamily(m.image_encoder, score, device, sentence_bank(m.text_encoder))
 
 
 def load_supervised(ckpt, device):
@@ -292,10 +357,10 @@ def load_supervised(ckpt, device):
             txt = s._text(finding)
         return s.head(torch.cat([F.normalize(g.float(), dim=-1), txt], dim=-1))[0]
 
-    return BioViLFamily(s.image_encoder, score, device)
+    return BioViLFamily(s.image_encoder, score, device, sentence_bank(s.text_encoder))
 
 
-def load_vljepa(ckpt, shift_json, device):
+def load_vljepa(ckpt, shift_json, device, text_source="predictor"):
     import torch
     import torch.nn.functional as F
 
@@ -316,7 +381,13 @@ def load_vljepa(ckpt, shift_json, device):
         cos = (pred @ tgt.T)[0]
         return (cos + shift if shift is not None else cos) / TEMPERATURE
 
-    return BioViLFamily(model.image_encoder, score, device)
+    def token_map(g, p, finding, v):
+        hidden, _ = model.predictor(torch.cat([g.unsqueeze(1), p], dim=1), [query_text(finding)],
+                                    return_hidden=True)
+        return model.predictor.out_proj(hidden[0, 1:1 + p.shape[1]]).float() @ v
+
+    return BioViLFamily(model.image_encoder, score, device, targets._targets,
+                        token_map if text_source == "predictor" else None)
 
 
 class BAAPModel:
@@ -422,7 +493,7 @@ class AnatomyPrior(BAAPModel):
 def side_metrics(heat: np.ndarray, mask: np.ndarray) -> Dict:
     from jepa_heatmap_progression_pairs import compute_change_map_side_metrics
 
-    if not mask.any():
+    if heat is None or not mask.any():
         return {k: None for k in METRICS} | {"empty_map": None}
     if not np.isfinite(heat).all() or heat.max() <= 0:
         return dict(EMPTY_MAP) | {"empty_map": 1}
@@ -439,6 +510,7 @@ def render(path, prior: Film, current: Film, heats, masks, title):
     panels = []
     for film, heat, mask in zip((prior, current), heats, masks):
         base = np.asarray(BASE_TRANSFORM(Image.open(film.path).convert("L")), dtype=np.float32) / 255
+        heat = np.zeros_like(base) if heat is None else heat
         h = heat / heat.max() if heat.max() > 0 else heat
         rgb = 0.55 * np.repeat(base[..., None], 3, -1) + 0.45 * cm.jet(h)[..., :3]
         im = Image.fromarray((rgb * 255).astype(np.uint8))
@@ -460,13 +532,15 @@ def maps(args) -> int:
 
     if args.model in ("supervised", "vljepa") and not args.ckpt:
         raise SystemExit(f"[grounding] --model {args.model} needs --ckpt")
+    if args.method.startswith("text") and args.model in ("baap", "anatomy"):
+        raise SystemExit(f"[grounding] --model {args.model} has no text side for --method {args.method}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.model == "biovilt":
         model = load_biovilt(device)
     elif args.model == "supervised":
         model = load_supervised(args.ckpt, device)
     elif args.model == "vljepa":
-        model = load_vljepa(args.ckpt, args.shift_json, device)
+        model = load_vljepa(args.ckpt, args.shift_json, device, args.vljepa_text)
     else:
         from baap_eval.eval_baap import DEFAULT_CKPT, default_boxes
 
@@ -489,6 +563,10 @@ def maps(args) -> int:
         if args.method == "gradcam":
             cam_p, cam_c, logits, target = model.gradcam(
                 prior, current, r["finding"], None if args.target == "pred" else gt)
+        elif args.method.startswith("text"):
+            cam_p, cam_c, logits, target = model.text(
+                prior, current, r["finding"], None if args.target == "pred" else gt,
+                args.method == "text_contrast")
         else:
             cam_p, cam_c, logits = model.swap(prior, current, r["finding"])
             target = -1
@@ -610,8 +688,11 @@ def main() -> int:
     a.add_argument("--ckpt")
     a.add_argument("--shift-json", help="VL-JEPA class shift, if the checkpoint has none")
     a.add_argument("--boxes", help="BAAP CXAS boxes (default baap_eval/boxes/cxas_gold.json)")
-    a.add_argument("--method", default="gradcam", choices=["gradcam", "swap"])
+    a.add_argument("--method", default="gradcam", choices=METHODS)
     a.add_argument("--target", default="gt", choices=["gt", "pred"])
+    a.add_argument("--vljepa-text", default="predictor", choices=["predictor", "encoder"],
+                   help="text maps for VL-JEPA: per-patch predictor outputs, or its "
+                        "image patch embeddings against its LoRA text encoder")
     a.add_argument("--parquet", help="gold box parquet (default CheXTemporal/gold_bboxes.parquet)")
     a.add_argument("--render", type=int, default=0, help="write PNGs for the first N rows")
     a.add_argument("--limit", type=int)
@@ -620,7 +701,7 @@ def main() -> int:
     a = sub.add_parser("compare")
     a.add_argument("--names", nargs="+", required=True,
                    help="model names given to maps (or paths to their CSVs)")
-    a.add_argument("--method", default="gradcam", choices=["gradcam", "swap"])
+    a.add_argument("--method", default="gradcam", choices=METHODS)
     a.add_argument("--ref", default="supervised")
     a.add_argument("--boot", type=int, default=2000)
     a.add_argument("--seed", type=int, default=0)
