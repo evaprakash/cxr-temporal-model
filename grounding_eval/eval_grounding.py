@@ -325,26 +325,37 @@ class BioViLFamily:
         return None if cam is None else grid_to_frame(cam)
 
 
-def sentence_bank(text_encoder, presence: str = "there_is"):
-    """finding -> unit-norm embeddings: ``{Finding} is {class}.`` for the five classes,
-    then a present and an absent sentence per wording in PRESENCE (all of them for
-    ``presence="all"``)."""
+def sentence_bank(text_encoder, presence: str = "there_is", class_wordings: str = "first"):
+    """finding -> unit-norm embeddings: one per class, then a present and an absent
+    sentence per wording in PRESENCE (all of them for ``presence="all"``).
+
+    class_wordings "first": ``{Finding} is {class}.``; "all": the mean of the four
+    wordings per class the text LoRA was trained on (TEMPLATES), renormalized."""
     import torch
     import torch.nn.functional as F
 
+    from vljepa.probe_text_encoder_clusters import TEMPLATES, realize
     from vljepa.prompts import cap_finding, class_target_texts
 
     bank = {}
     wordings = list(PRESENCE) if presence == "all" else [presence]
 
+    def encode(texts):
+        with torch.no_grad():
+            t, _, _ = text_encoder.forward_contrastive(texts)
+        return F.normalize(t.float(), dim=-1)
+
     def phrases(finding):
         if finding not in bank:
-            texts = class_target_texts(finding)
-            for w in wordings:
-                texts += [s.format(f=finding, F=cap_finding(finding)) for s in PRESENCE[w]]
-            with torch.no_grad():
-                t, _, _ = text_encoder.forward_contrastive(texts)
-            bank[finding] = F.normalize(t.float(), dim=-1)
+            if class_wordings == "all":
+                k = len(TEMPLATES[CLS_ORDER[0]])
+                cls = encode([realize(t, finding) for c in CLS_ORDER for t in TEMPLATES[c]])
+                cls = F.normalize(cls.view(N_CLS, k, -1).mean(1), dim=-1)
+            else:
+                cls = encode(class_target_texts(finding))
+            pres = encode([s.format(f=finding, F=cap_finding(finding))
+                           for w in wordings for s in PRESENCE[w]])
+            bank[finding] = torch.cat([cls, pres])
         return bank[finding]
 
     return phrases
@@ -585,7 +596,7 @@ def maps(args) -> int:
         model.text_encoder = BioViLTTextEncoder(mode="biovilt").to(device).eval()
         model.token_map = None
     if isinstance(model, BioViLFamily):
-        model.phrases = sentence_bank(model.text_encoder, args.presence)
+        model.phrases = sentence_bank(model.text_encoder, args.presence, args.class_wordings)
 
     rows = grounding_rows(args.parquet, args.limit)
     name = f"{args.name}_{args.method}"
@@ -740,6 +751,9 @@ def main() -> int:
                    help="present/absent wording for text_presence and text_orth: there_is "
                         "('There is X.' / 'There is no X.'), bare ('X.' / 'No X.'), present "
                         "('X is present.' / 'X is absent.'), all (text_orth removes all three)")
+    a.add_argument("--class-wordings", default="first", choices=["first", "all"],
+                   help="class sentences for the text maps: first ('{Finding} is {class}.') or "
+                        "all (mean of the four wordings per class the text LoRA was trained on)")
     a.add_argument("--parquet", help="gold box parquet (default CheXTemporal/gold_bboxes.parquet)")
     a.add_argument("--render", type=int, default=0, help="write PNGs for the first N rows")
     a.add_argument("--limit", type=int)
