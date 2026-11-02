@@ -204,6 +204,11 @@ def load_classify_fn(
             make_classify_fn,
         )
         alta_ckpt = ckpt or DEFAULT_CHECKPOINT_PATH
+        if not os.path.isfile(alta_ckpt):
+            raise FileNotFoundError(
+                f"ALTA checkpoint not found at {alta_ckpt}; infer_alta would fall back to "
+                "random weights. Download ALTA.pth and pass --ckpt."
+            )
         model = load_model(device, checkpoint_path=alta_ckpt)
         classify = make_classify_fn(model, device)
         note = f", ckpt={alta_ckpt}"
