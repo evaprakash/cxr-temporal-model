@@ -627,9 +627,15 @@ def split_mimic_by_imagenome(datasets, keys, split_dir):
 
 def compare_gold(args) -> int:
     runs = {}
-    b = np.load(args.baap, allow_pickle=True)
-    runs["baap"] = (b["gold_scores"].astype(np.float64), b["gold_gts"], b["gold_findings"])
+    b = None
+    if args.baap != "none":
+        b = np.load(args.baap, allow_pickle=True)
+        runs["baap"] = (b["gold_scores"].astype(np.float64), b["gold_gts"], b["gold_findings"])
     for spec in args.model:
+        if b is None:
+            d = np.load(spec.split("=", 1)[1].split(":", 1)[0], allow_pickle=True)
+            if "gold_datasets" in d:
+                b = d
         name, s, g, f = load_gold_npz(spec)
         runs[name] = (s, g, f)
     ref = args.ref
@@ -671,6 +677,12 @@ def compare_gold(args) -> int:
             print(f"  {k:<18} {diff:>+8.4f}   [{lo:>+7.4f}, {hi:>+7.4f}]   P {p:.2f}")
             report["diff_vs_" + ref][name][k] = {"diff": diff, "lo": float(lo), "hi": float(hi), "p": p}
 
+    if b is None:
+        print("\n[compare] no score file has gold_datasets; skipping the per-dataset tables")
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump(report, f, indent=2)
+        return 0
     datasets = b["gold_datasets"].copy()
     if args.imagenome_splits:
         datasets = split_mimic_by_imagenome(datasets, b["gold_keys"], args.imagenome_splits)
@@ -789,7 +801,8 @@ def main() -> int:
     a.add_argument("--limit", type=int)
 
     a = sub.add_parser("compare-gold")
-    a.add_argument("--baap", default=os.path.join(SCORE_DIR, "gold_baap.npz"))
+    a.add_argument("--baap", default=os.path.join(SCORE_DIR, "gold_baap.npz"),
+                   help="BAAP score file, or 'none' to leave BAAP out")
     a.add_argument("--model", action="append", default=[], metavar="NAME=NPZ[:SHIFT_JSON]",
                    help="gold score file (class_signal_*.npz); add :<epoch>.shift.json for a VL-JEPA shift")
     a.add_argument("--ref", default="supervised")
