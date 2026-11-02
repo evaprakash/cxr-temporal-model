@@ -105,9 +105,12 @@ def prepare(args) -> int:
     df["label"] = df["comparison"].str.strip().str.lower().map(LABEL_MAP)
     df = df[df["label"].notna()]
     n_labeled = len(df)
-    df = df.drop_duplicates(subset=DEDUP).reset_index(drop=True)
-    print(f"[mscxrt] {args.csv}: {n_raw} rows, {n_labeled} with a 3-way label, "
-          f"{len(df)} after removing repeated prior frames")
+    df["disease_name"] = df["disease_name"].str.strip().str.lower()
+    n_labels = df.groupby(DEDUP)["label"].transform("nunique")
+    n_conflict = df[n_labels > 1].drop_duplicates(subset=DEDUP).shape[0]
+    df = df[n_labels == 1].drop_duplicates(subset=DEDUP).reset_index(drop=True)
+    print(f"[mscxrt] {args.csv}: {n_raw} rows, {n_labeled} with a 3-way label; "
+          f"dropped {n_conflict} pair-findings with conflicting labels; {len(df)} pair-findings left")
 
     silver_path = args.silver or silver_findings_parquet()
     sil = pd.read_parquet(silver_path)
