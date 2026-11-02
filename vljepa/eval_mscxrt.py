@@ -50,6 +50,19 @@ LABEL_MAP = {
     "stable": "stable", "no change": "stable", "no-change": "stable", "unchanged": "stable",
     "worsening": "worsening", "worsened": "worsening",
 }
+# Chest ImaGenome names that mean one of our training findings; any other
+# name is dropped by --findings ours.
+CIG_FINDINGS = {
+    "enlarged cardiac silhouette": "cardiomegaly",
+    "pulmonary edema/hazy opacity": "edema",
+    "linear/patchy atelectasis": "atelectasis",
+    "lobar/segmental collapse": "atelectasis",
+    "airspace opacity": "lung opacity",
+    "opacity": "lung opacity",
+    "mass/nodule (not otherwise specified)": "lung lesion",
+    "lung cancer": "lung lesion",
+    "mediastinal widening": "enlarged cardiomediastinum",
+}
 # A prior study with several frames is listed once per frame.
 DEDUP = ["patient_id", "study_id_prev", "study_id_curr", "disease_name"]
 DEFAULT_CSV = os.environ.get("MSCXRT_CSV", os.path.join(REPO_ROOT, "mscxrt_labels_new.csv"))
@@ -106,6 +119,16 @@ def prepare(args) -> int:
     df = df[df["label"].notna()]
     n_labeled = len(df)
     df["disease_name"] = df["disease_name"].str.strip().str.lower()
+    if args.findings == "ours":
+        from vljepa.probe_text_encoder_clusters import FINDINGS
+
+        df["disease_name"] = df["disease_name"].replace(CIG_FINDINGS)
+        keep = df["disease_name"].isin(FINDINGS)
+        dropped = df.loc[~keep].drop_duplicates(subset=DEDUP)["disease_name"].value_counts()
+        print(f"[mscxrt] --findings ours: dropped {int(dropped.sum())} pair-findings outside our "
+              f"{len(FINDINGS)} training findings ({len(dropped)} names, e.g. "
+              + ", ".join(f"{k} {v}" for k, v in dropped.head(5).items()) + ")")
+        df = df[keep]
     n_labels = df.groupby(DEDUP)["label"].transform("nunique")
     n_conflict = df[n_labels > 1].drop_duplicates(subset=DEDUP).shape[0]
     df = df[n_labels == 1].drop_duplicates(subset=DEDUP).reset_index(drop=True)
@@ -281,7 +304,7 @@ def metrics(scores, labels):
 
 def print_metrics(runs):
     labels = next(iter(runs.values()))[1]
-    print(f"\n=== MS-CXR-T clean pairs (n={len(labels)}; "
+    print(f"\n=== Clean pairs (n={len(labels)}; "
           + ", ".join(f"{c} {int((labels == CLS_ORDER.index(c)).sum())}" for c in VALID) + ")")
     print(f"  {'model':<16} {'acc':>6} {'macroAcc':>8} {'macroF1':>8}"
           + "".join(f"{c[:4] + ' F1':>9}" for c in VALID)
@@ -372,6 +395,8 @@ def main() -> int:
                    default=[os.path.join(os.environ.get("JEPA_IMAGE_ROOTS_DIR", "/nvme/data/temporal/all_data"), "mimic")],
                    help="other folders to look in when an image is missing under --mimic-root")
     a.add_argument("--allow-missing", action="store_true")
+    a.add_argument("--findings", choices=["all", "ours"], default="all",
+                   help="ours: rename Chest ImaGenome synonyms to our training findings, drop the rest")
     a.add_argument("--out", default=DEFAULT_CLEAN)
 
     a = sub.add_parser("score")
