@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MS-CXR-T 3-way progression (improving / stable / worsening) for BioViL-T,
-the supervised baseline, and VL-JEPA, on pairs that share no image and no
-study with silver.
+the supervised baseline, and VL-JEPA, on pairs that share no image, study or
+patient with silver. Also used for the Chest ImaGenome gold set (--csv).
 
   prepare  dedupe, rewrite image paths onto the local MIMIC-CXR-JPG copy,
            drop pairs overlapping silver, write the clean CSV
@@ -124,14 +124,20 @@ def prepare(args) -> int:
     studies.discard("")
     if not studies:
         raise SystemExit("[mscxrt] silver has no study_id_curr / study_id_prev; cannot check study overlap")
+    if "patient_id" not in mimic:
+        raise SystemExit("[mscxrt] silver has no patient_id; cannot check patient overlap")
+    patients = {study_digits(p) for p in mimic["patient_id"].dropna()} - {""}
 
     img_hit = (df["img_path_prev"].map(os.path.basename).isin(names)
                | df["img_path_curr"].map(os.path.basename).isin(names))
     study_hit = (df["study_id_prev"].map(study_digits).isin(studies)
                  | df["study_id_curr"].map(study_digits).isin(studies))
+    patient_hit = df["patient_id"].map(study_digits).isin(patients)
+    hit = img_hit | study_hit | patient_hit
     print(f"[mscxrt] overlap with silver: image {int(img_hit.sum())}, study {int(study_hit.sum())}, "
-          f"either {int((img_hit | study_hit).sum())} of {len(df)}")
-    df = df[~(img_hit | study_hit)].reset_index(drop=True)
+          f"patient {int(patient_hit.sum())}, any {int(hit.sum())} of {len(df)} "
+          f"({df.loc[hit, 'patient_id'].nunique()} of {df['patient_id'].nunique()} patients)")
+    df = df[~hit].reset_index(drop=True)
 
     roots = [args.mimic_root] + [r for r in args.alt_root if os.path.isdir(r)]
     print(f"[mscxrt] image roots, in order: {roots}")
