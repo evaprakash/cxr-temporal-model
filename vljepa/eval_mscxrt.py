@@ -22,7 +22,11 @@ The CSV and score files hold PhysioNet labels; keep them out of git.
         --ckpt checkpoints_supervised_progression_unfrozen/epoch_5.pt
     python -m vljepa.eval_mscxrt score --model vljepa \\
         --ckpt checkpoints_vljepa_lora_5way/epoch_5_shifted.pt
+    python -m vljepa.eval_mscxrt score --model tila   # also alta, biovil, biomedclip
     python -m vljepa.eval_mscxrt compare --ref supervised
+
+The zero-shot baselines (tila, alta, biovil, biomedclip) use the same phrase
+bank as BioViL-T and import infer_<model>.py from --baselines-root.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ import pandas as pd
 
 from progression_phrases import CLS_ORDER
 
+BASELINES = ["tila", "alta", "biovil", "biomedclip"]
 VALID = ["improving", "stable", "worsening"]
 VALID_IDX = [CLS_ORDER.index(c) for c in VALID]
 STABLE = CLS_ORDER.index("stable")
@@ -202,7 +207,29 @@ def prepare(args) -> int:
 # score
 # ----------------------------------------------------------------------
 def make_scorer(args, device):
-    """Returns (score kind, fn(prior, current, finding) -> np.ndarray of 5 scores)."""
+    """Returns (score kind, fn(prior path, current path, finding) -> np.ndarray of 5 scores)."""
+    if args.model in BASELINES:
+        from baseline_setmatch import load_classify_fn, phrasebank_class_scores
+
+        classify, note = load_classify_fn(args.model, device, args.baselines_root,
+                                          ckpt=args.ckpt, image_mode=args.image_mode)
+        print(f"[mscxrt] {args.model}{note}")
+        cache = {}
+        return "cosine", lambda p, c, f: np.array(phrasebank_class_scores(classify, p, c, f, cache))
+
+    from progression_classify import load_image_tensor
+
+    kind, fn = make_tensor_scorer(args, device)
+
+    def from_paths(p, c, f):
+        prior = load_image_tensor("mimic", p, {"mimic": "/"}).to(device)
+        current = load_image_tensor("mimic", c, {"mimic": "/"}).to(device)
+        return fn(prior, current, f)
+
+    return kind, from_paths
+
+
+def make_tensor_scorer(args, device):
     if args.model == "vljepa":
         from vljepa.eval_gold import load_vljepa_from_ckpt
 
@@ -235,9 +262,7 @@ def score(args) -> int:
     import torch
     from tqdm import tqdm
 
-    from progression_classify import load_image_tensor
-
-    if args.model != "biovilt" and not args.ckpt:
+    if args.model in ("vljepa", "supervised") and not args.ckpt:
         raise SystemExit(f"[mscxrt] --model {args.model} needs --ckpt")
     name = args.name or args.model
     df = pd.read_csv(args.clean, dtype=str)
@@ -250,9 +275,7 @@ def score(args) -> int:
     scores = []
     with torch.no_grad():
         for _, row in tqdm(df.iterrows(), total=len(df), desc=name, file=sys.stdout):
-            prior = load_image_tensor("mimic", row["prev_path"], {"mimic": "/"}).to(device)
-            current = load_image_tensor("mimic", row["curr_path"], {"mimic": "/"}).to(device)
-            scores.append(fn(prior, current, row["finding"]))
+            scores.append(fn(row["prev_path"], row["curr_path"], row["finding"]))
     scores = np.stack(scores).astype(np.float64)
     labels = np.array([CLS_ORDER.index(c) for c in df["label"]], dtype=np.int64)
 
@@ -400,8 +423,12 @@ def main() -> int:
     a.add_argument("--out", default=DEFAULT_CLEAN)
 
     a = sub.add_parser("score")
-    a.add_argument("--model", required=True, choices=["vljepa", "supervised", "biovilt"])
-    a.add_argument("--ckpt")
+    a.add_argument("--model", required=True, choices=["vljepa", "supervised", "biovilt"] + BASELINES)
+    a.add_argument("--ckpt", help="required for vljepa / supervised; optional weights override for baselines")
+    a.add_argument("--image-mode", default="diff", choices=["diff", "curr"],
+                   help="biovil / biomedclip: current minus prior, or current only")
+    a.add_argument("--baselines-root", default=os.environ.get(
+        "BASELINES_ROOT", os.path.join(REPO_ROOT, "baselines_ext")))
     a.add_argument("--name", help="score file name (default: the model type)")
     a.add_argument("--clean", default=DEFAULT_CLEAN)
     a.add_argument("--out-dir", default=DEFAULT_SCORES)

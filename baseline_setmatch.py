@@ -106,6 +106,22 @@ def make_phrasebank_score_fn(
     return score_fn
 
 
+def phrasebank_class_scores(
+    classify_fn: Callable,
+    prev_path: str,
+    curr_path: str,
+    finding: str,
+    text_cache: Dict[str, Tuple],
+    template: str = PROMPT_TEMPLATE,
+) -> List[float]:
+    """Five class scores (CLS_ORDER) for one pair given absolute image paths."""
+    key = f"{finding}||{template}"
+    if key not in text_cache:
+        text_cache[key] = build_phrase_bank(finding, template)
+    prompts, phrase_to_class = text_cache[key]
+    return phrase_sims_to_class_scores(classify_fn(prev_path, curr_path, prompts), phrase_to_class)
+
+
 def load_path_backend(
     backend: str,
     device: torch.device,
@@ -118,7 +134,27 @@ def load_path_backend(
 
     ``score_fn_factory(image_roots)`` → ``score_fn(row, text_cache)``.
     """
-    root = add_baselines_root(baselines_root)
+    classify, note = load_classify_fn(backend, device, baselines_root, ckpt, image_mode, dtype_arg)
+    wrapped = make_phrasebank_score_fn(classify, device)
+
+    def score_fn(row, text_cache, image_roots=None):
+        if image_roots is None:
+            raise RuntimeError("image_roots required for path backends")
+        return wrapped(row, text_cache, image_roots)
+
+    return score_fn, note
+
+
+def load_classify_fn(
+    backend: str,
+    device: torch.device,
+    baselines_root: str,
+    ckpt: Optional[str] = None,
+    image_mode: str = "diff",
+    dtype_arg: str = "auto",
+):
+    """Return ``(classify_fn(prev_path, curr_path, prompts) -> sims, note)``."""
+    add_baselines_root(baselines_root)
 
     if backend == "tila":
         from infer_tila import (  # type: ignore
@@ -188,12 +224,4 @@ def load_path_backend(
     else:
         raise ValueError(f"unknown path backend {backend!r}")
 
-    wrapped = make_phrasebank_score_fn(classify, device)
-
-    def score_fn(row, text_cache, image_roots=None):
-        if image_roots is None:
-            raise RuntimeError("image_roots required for path backends")
-        return wrapped(row, text_cache, image_roots)
-
-    _ = root
-    return score_fn, note
+    return classify, note
