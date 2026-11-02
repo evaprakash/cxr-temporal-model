@@ -51,3 +51,5 @@ baap_eval/scores/
 baap_eval/qa/
 grounding_eval/out/
 cig_splits/
+cig_clean*.csv
+cig_gold_labels*.csv
