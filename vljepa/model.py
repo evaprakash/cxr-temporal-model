@@ -619,16 +619,18 @@ class VLJEPA(nn.Module):
         freeze_text_encoder: bool = False,
         gradient_checkpointing: bool = True,
         freeze_image_norm: bool = True,
+        text_lora: bool = True,
     ):
         """``freeze_image_norm`` keeps a trainable image encoder in eval mode,
         so BatchNorm running stats and dropout stay at their pretrained
-        behaviour while gradients still update the weights."""
+        behaviour while gradients still update the weights.
+        ``text_lora=False`` keeps the original BioViL-T text encoder."""
         super().__init__()
         img_mode = "biovilt_no_pretrained" if smoke else image_mode
         self.image_encoder = BioViLTImageEncoderJEPA(mode=img_mode)
         # Y-encoder only (targets). Query does not go through here.
         self.text_encoder = BioViLTTextEncoder(mode="biovilt")
-        if not smoke:
+        if not smoke and text_lora:
             from .text_lora import apply_text_lora
             self.text_lora_path = apply_text_lora(self.text_encoder)
         else:
@@ -747,6 +749,38 @@ class VLJEPA(nn.Module):
         pred_n = F.normalize(pred.float(), dim=-1)
         tgt_n = F.normalize(tgt.float(), dim=-1)
         return (pred_n * tgt_n).sum(dim=-1).squeeze(0)
+
+
+def pair_infonce_loss(
+    pred: torch.Tensor,
+    target_global: torch.Tensor,
+    same_text: torch.Tensor,
+    pos_index: torch.Tensor,
+    temperature: float = 0.07,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batch InfoNCE over free-text targets.
+
+    ``pred``           (B, D) predicted Ŝ
+    ``target_global``  (N, D) target sentence embeddings, N >= B (targets
+                       gathered from every GPU)
+    ``same_text``      (B, N) bool, True where target n has the same
+                       normalized text as row b's own target
+    ``pos_index``      (B,) column of row b's own target
+
+    Targets with the same text as the positive are dropped from that row's
+    negatives, so two reports that both say "No interval change." are not
+    pushed apart. Returned logits keep those duplicates, so a row counts as
+    correct when its top target has the right text.
+    """
+    pred_n = F.normalize(pred.float(), dim=-1)
+    tgt_n = F.normalize(target_global.float(), dim=-1)
+    logits = pred_n @ tgt_n.T / float(temperature)
+    pos_index = pos_index.to(device=logits.device)
+    rows = torch.arange(logits.shape[0], device=logits.device)
+    drop = same_text.to(device=logits.device).clone()
+    drop[rows, pos_index] = False
+    loss = F.cross_entropy(logits.masked_fill(drop, float("-inf")), pos_index)
+    return loss, logits
 
 
 def class_infonce_loss(
