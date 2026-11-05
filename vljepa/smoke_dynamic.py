@@ -15,6 +15,9 @@
   5. Zero-shot scoring: per-finding phrase bank, all-findings combinations
      with the soft maximum, and the fallback above --max-k findings.
   6. Retrieval recall on a toy case where the answer is known.
+  7. Second stage: --init-from restores saved weights; with the image
+     encoder unfrozen it gets gradients at LR * IMAGE_LR_MULT, the text
+     encoder gets none, and BatchNorm stats do not move.
 
     CUDA_VISIBLE_DEVICES="" python -m vljepa.smoke_dynamic
     CUDA_VISIBLE_DEVICES="" python -m vljepa.smoke_dynamic --full
@@ -105,12 +108,20 @@ def load_batch(use_data: bool):
 
 
 class StubImage(nn.Module):
+    """Tiny conv + BatchNorm encoder: 448px -> 14x14 = 196 patches of 128."""
+
     embed_dim = 128
 
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(6, 16, kernel_size=32, stride=32)
+        self.bn = nn.BatchNorm2d(16)
+        self.proj = nn.Linear(16, 128)
+
     def forward(self, current, prior):
-        b = current.shape[0]
-        return (F.normalize(torch.randn(b, 128), dim=-1),
-                F.normalize(torch.randn(b, 196, 128), dim=-1))
+        x = self.bn(self.conv(torch.cat([current, prior], dim=1)))
+        patches = self.proj(x.flatten(2).transpose(1, 2))
+        return F.normalize(patches.mean(dim=1), dim=-1), F.normalize(patches, dim=-1)
 
 
 class StubText(nn.Module):
@@ -151,6 +162,9 @@ def build_model(full: bool):
     from .model import LlamaPredictor
 
     model.image_encoder = StubImage()
+    for p in model.image_encoder.parameters():
+        p.requires_grad = False
+    model.image_encoder.eval()
     model.text_encoder = StubText()
     model.text_lora_path = None
     model.predictor = LlamaPredictor(vis_dim=128, out_dim=128, n_layers=2, smoke=True,
@@ -158,6 +172,60 @@ def build_model(full: bool):
     model.freeze_image_encoder = model.freeze_text_encoder = True
     model.freeze_image_norm = True
     return model, "stub encoders + tiny Llama"
+
+
+def second_stage(model, batch) -> None:
+    import tempfile
+
+    from .model import pair_infonce_loss
+    from .train_dynamic import IMAGE_LR_MULT, LR, build_optimizer, load_init_weights
+
+    _print("\n[7] second stage: --init-from + --unfreeze-image")
+    state = model.predictor.state_dict()
+    keys = list(state)[-2:]
+    saved = {k: state[k].clone() for k in keys}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "epoch_1.pt")
+        torch.save({"epoch": 1, "model": {f"predictor.{k}": v for k, v in saved.items()},
+                    "vljepa_cfg": {"objective": "dynamic", "target_mode": "sentence"}}, path)
+        with torch.no_grad():
+            for k in keys:
+                state[k].add_(1.0)
+        load_init_weights(model, path, "sentence", 0)
+    now = model.predictor.state_dict()
+    check(all(torch.equal(saved[k], now[k]) for k in keys),
+          "--init-from restores the saved predictor weights")
+
+    img_params = list(model.image_encoder.parameters())
+    if not img_params:
+        _print("  stub image encoder has no weights; skipping the unfreeze checks")
+        return
+    model.freeze_image_encoder = False
+    for p in img_params:
+        p.requires_grad = True
+    model.train()
+    check(not any(m.training for m in model.image_encoder.modules()),
+          "image encoder stays in eval mode (BatchNorm stats + dropout frozen)")
+    buffers = {n: b.clone() for n, b in model.image_encoder.named_buffers()}
+    opt = build_optimizer(model)
+    lrs = [g["lr"] for g in opt.param_groups]
+    n_img = sum(p.numel() for p in opt.param_groups[-1]["params"])
+    _print(f"  optimizer groups: lr {lrs}, image params {n_img:,}")
+    check(lrs == [LR, LR * IMAGE_LR_MULT], "image encoder trains at LR * IMAGE_LR_MULT")
+
+    out = model(batch["prior_image"], batch["current_image"], batch["query_text"],
+                target_texts=batch["target_text"])
+    same = same_text_mask(batch["target_text"], batch["target_text"])
+    loss, _ = pair_infonce_loss(out["pred"], out["target_global"], same, torch.arange(B))
+    loss.backward()
+    img_grad = sum(p.grad.abs().sum().item() for p in img_params if p.grad is not None)
+    text_grad = [n for n, p in model.text_encoder.named_parameters() if p.grad is not None]
+    check(img_grad > 0, f"image encoder gets gradients (sum |grad| = {img_grad:.3g})")
+    check(not text_grad, "text encoder still gets no gradients")
+    opt.step()
+    check(all(torch.equal(buffers[n], b) for n, b in model.image_encoder.named_buffers()),
+          "BatchNorm running stats unchanged after a training step")
+    model.zero_grad(set_to_none=True)
 
 
 def main() -> int:
@@ -266,6 +334,8 @@ def main() -> int:
     r = retrieval_recall(toy_tgt, toy_tgt, toy_texts)
     _print(f"  {r}")
     check(r["recall@1"] == 1.0 and r["gallery"] == 4, "exact predictions give R@1 = 1, duplicates counted once")
+
+    second_stage(model, batch)
 
     _print("\n" + "=" * 72)
     if FAILURES:

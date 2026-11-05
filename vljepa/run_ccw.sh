@@ -12,6 +12,7 @@
 #   bash vljepa/run_ccw.sh mscxrt prepare | score --model ... | compare
 #   bash vljepa/run_ccw.sh dyn_smoke [--full]      # dynamic-sentence CPU smoke test
 #   bash vljepa/run_ccw.sh dyn_train [--epochs N]  # dynamic-sentence training
+#   bash vljepa/run_ccw.sh dyn_train_img           # dynamic epoch_9.pt weights, image encoder unfrozen, 5 epochs
 #   bash vljepa/run_ccw.sh dyn_eval gold|csv|retrieval --ckpt ...
 set -euo pipefail
 
@@ -19,6 +20,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 case "${1:-}" in
+    dyn_train_img)
+        export VLJEPA_CHECKPOINT_DIR="${VLJEPA_CHECKPOINT_DIR:-$ROOT/checkpoints_vljepa_dynamic_img}"
+        export VLJEPA_LOG_DIR="${VLJEPA_LOG_DIR:-/nvme/people/eprakash/logs/vljepa_dynamic_img}"
+        VLJEPA_INIT_FROM="${VLJEPA_INIT_FROM:-$ROOT/checkpoints_vljepa_dynamic/epoch_9.pt}"
+        ;;
     dyn_*)
         export VLJEPA_CHECKPOINT_DIR="${VLJEPA_CHECKPOINT_DIR:-$ROOT/checkpoints_vljepa_dynamic}"
         export VLJEPA_LOG_DIR="${VLJEPA_LOG_DIR:-/nvme/people/eprakash/logs/vljepa_dynamic}"
@@ -115,11 +121,17 @@ run() {
         NGPU="${SLURM_GPUS_ON_NODE:-4}"
         echo "[ccw] nproc_per_node=$NGPU"
         "$PY" -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train_dynamic "$@"
+    elif [ "$MODE" = "dyn_train_img" ]; then
+        shift
+        NGPU="${SLURM_GPUS_ON_NODE:-4}"
+        echo "[ccw] nproc_per_node=$NGPU init_from=$VLJEPA_INIT_FROM"
+        "$PY" -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train_dynamic \
+            --init-from "$VLJEPA_INIT_FROM" --unfreeze-image --epochs 5 "$@"
     elif [ "$MODE" = "dyn_eval" ]; then
         shift
         "$PY" -m vljepa.eval_dynamic "$@"
     else
-        echo "usage: bash vljepa/run_ccw.sh smoke|train|train_img|check|shift|gold|worsening|rules|mscxrt|dyn_smoke|dyn_train|dyn_eval ..." >&2
+        echo "usage: bash vljepa/run_ccw.sh smoke|train|train_img|check|shift|gold|worsening|rules|mscxrt|dyn_smoke|dyn_train|dyn_train_img|dyn_eval ..." >&2
         return 1
     fi
 }

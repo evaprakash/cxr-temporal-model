@@ -11,8 +11,13 @@ After every epoch, rank 0 reports silver val retrieval (does Ŝ rank its own
 sentence first among all distinct val sentences?) and zero-shot gold scores
 (phrase-bank cosine per finding).
 
+Second stage: ``--init-from <frozen run's epoch_N.pt> --unfreeze-image`` also
+trains the BioViL-T image encoder at LR * IMAGE_LR_MULT (BatchNorm stats and
+dropout stay frozen), into a new checkpoint dir.
+
     torchrun --nproc_per_node=4 -m vljepa.train_dynamic
     bash vljepa/run_ccw.sh dyn_train
+    bash vljepa/run_ccw.sh dyn_train_img
 """
 
 from __future__ import annotations
@@ -58,6 +63,7 @@ from .model import VLJEPA, llama_hub_cache, pair_infonce_loss, resolve_llama_loc
 # HYPERPARAMETERS (same as the 5-way run unless noted)
 # ============================================================
 LR = 2e-5
+IMAGE_LR_MULT = 0.1
 WEIGHT_DECAY = 0.01
 BATCH_SIZE = 8
 EPOCHS = 50
@@ -194,6 +200,28 @@ def run_val(raw_model, loader, device, world_size, epoch, rank):
     return total / max(n, 1), correct / max(n, 1), retrieval
 
 
+def build_optimizer(model):
+    groups = [{"params": [p for p in model.predictor.parameters() if p.requires_grad],
+               "lr": LR}]
+    image_params = [p for p in model.image_encoder.parameters() if p.requires_grad]
+    if image_params:
+        groups.append({"params": image_params, "lr": LR * IMAGE_LR_MULT})
+    return AdamW(groups, weight_decay=WEIGHT_DECAY)
+
+
+def load_init_weights(raw_model, path, target_mode, rank):
+    ckpt = torch.load(path, map_location="cpu")
+    old = ckpt.get("vljepa_cfg", {})
+    if old.get("objective") != "dynamic" or old.get("target_mode") != target_mode:
+        raise SystemExit(f"[dynamic] refusing --init-from {path}: objective "
+                         f"{old.get('objective')}, target {old.get('target_mode')}")
+    missing, unexpected = raw_model.load_state_dict(ckpt["model"], strict=False)
+    if rank == 0:
+        print(f"[dynamic] initialised weights from {path} (epoch {ckpt.get('epoch')}); "
+              f"fresh optimizer and schedule; missing={len(missing)} "
+              f"unexpected={len(unexpected)}")
+
+
 def gold_eval(raw_model, groups, roots, device, epoch):
     from baap_eval.eval_baap import print_gold_metrics
 
@@ -208,6 +236,12 @@ def gold_eval(raw_model, groups, roots, device, epoch):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--resume", default=None)
+    p.add_argument("--init-from", default=None,
+                   help="start from this dynamic checkpoint's weights only (fresh optimizer "
+                        "and schedule); must be outside the checkpoint dir")
+    p.add_argument("--unfreeze-image", action="store_true",
+                   help="train the BioViL-T image encoder at LR * IMAGE_LR_MULT; "
+                        "its BatchNorm stats and dropout stay frozen")
     p.add_argument("--target-mode", default="sentence", choices=TARGET_MODES,
                    help="sentence: one dynamic sentence per pair, resampled each epoch; "
                         "report: all of them joined (truncated at 112 tokens)")
@@ -224,6 +258,12 @@ def main():
     rank = dist.get_rank() if world_size > 1 else 0
     epochs = args.epochs or EPOCHS
     batch_size = args.batch_size or BATCH_SIZE
+    freeze_image = not args.unfreeze_image
+    if args.init_from and (os.path.dirname(os.path.abspath(args.init_from))
+                           == os.path.abspath(CHECKPOINT_DIR)):
+        raise SystemExit(f"[dynamic] --init-from {args.init_from} is inside {CHECKPOINT_DIR}; "
+                         "set VLJEPA_CHECKPOINT_DIR to a new folder so the source run "
+                         "stays intact")
 
     if rank == 0:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -234,7 +274,14 @@ def main():
               "original BioViL-T text encoder, frozen, no LoRA")
         print(f"[dynamic]   loss   = InfoNCE over {batch_size * world_size} sentences per "
               f"global batch, τ={TEMPERATURE}, same-text negatives masked")
-        print(f"[dynamic]   image  = BioViL-T pair, frozen; pred = Llama last {N_LLAMA_LAYERS}")
+        if freeze_image:
+            print(f"[dynamic]   image  = BioViL-T pair, frozen; "
+                  f"pred = Llama last {N_LLAMA_LAYERS}")
+        else:
+            print(f"[dynamic]   image  = BioViL-T pair, TRAINED at lr {LR * IMAGE_LR_MULT:g} "
+                  f"(BatchNorm stats + dropout frozen); pred = Llama last {N_LLAMA_LAYERS}")
+        if args.init_from:
+            print(f"[dynamic]   init from = {args.init_from} (weights only)")
         print(f"[dynamic]   ckpt   = {CHECKPOINT_DIR}")
         print(f"[dynamic]   logs   = {LOG_DIR}")
         print(f"[dynamic]   images = {IMAGE_ROOTS}")
@@ -259,7 +306,7 @@ def main():
         n_llama_layers=N_LLAMA_LAYERS,
         llama_name=LLAMA_NAME,
         llama_local=LLAMA_LOCAL,
-        freeze_image_encoder=True,
+        freeze_image_encoder=freeze_image,
         freeze_text_encoder=True,
         gradient_checkpointing=True,
         text_lora=False,
@@ -276,8 +323,7 @@ def main():
     else:
         raw_model = model
 
-    optimizer = AdamW([p for p in raw_model.predictor.parameters() if p.requires_grad],
-                      lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = build_optimizer(raw_model)
     total_steps = max(len(train_loader), 1) * epochs
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=int(total_steps * WARMUP_RATIO),
@@ -291,7 +337,9 @@ def main():
         "n_llama_layers": N_LLAMA_LAYERS,
         "llama_name": LLAMA_NAME,
         "llama_local": LLAMA_LOCAL,
-        "freeze_image_encoder": True,
+        "freeze_image_encoder": freeze_image,
+        "image_lr_mult": IMAGE_LR_MULT,
+        "init_from": args.init_from,
         "freeze_text_encoder": True,
         "text_lora": False,
         "temperature": TEMPERATURE,
@@ -306,6 +354,10 @@ def main():
             raise SystemExit(f"[dynamic] refusing {resume_path}: objective "
                              f"{old.get('objective')}, target {old.get('target_mode')}. "
                              f"Use an empty {CHECKPOINT_DIR}.")
+        if bool(old.get("freeze_image_encoder", True)) != freeze_image:
+            raise SystemExit(f"[dynamic] refusing {resume_path}: it was trained with "
+                             f"freeze_image_encoder={old.get('freeze_image_encoder', True)}, "
+                             f"this run has {freeze_image}. Use a new checkpoint dir.")
         raw_model.load_state_dict(ckpt["model"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
@@ -313,7 +365,12 @@ def main():
         best_val = float(ckpt.get("best_val_loss", best_val))
         if rank == 0:
             print(f"[dynamic] resumed {resume_path} -> next epoch {start_epoch}")
+            if args.init_from:
+                print(f"[dynamic] {CHECKPOINT_DIR} already has epochs; "
+                      f"ignoring --init-from {args.init_from}")
         del ckpt
+    elif args.init_from:
+        load_init_weights(raw_model, args.init_from, args.target_mode, rank)
 
     gold_groups = gold_roots = None
     if rank == 0 and not args.skip_gold:
