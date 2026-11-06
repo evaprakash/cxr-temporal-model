@@ -15,7 +15,8 @@
 #   bash vljepa/run_ccw.sh dyn_train_img           # dynamic epoch_9.pt weights, image encoder unfrozen, 5 epochs
 #   bash vljepa/run_ccw.sh dyn_eval gold|csv|retrieval --ckpt ...
 #   bash vljepa/run_ccw.sh lat_smoke [--full]      # laterality 5-way CPU smoke test
-#   bash vljepa/run_ccw.sh lat_train [--epochs N]  # laterality 5-way training
+#   bash vljepa/run_ccw.sh lat_train [--epochs N]  # laterality 5-way training, text LoRA
+#       (--text-encoder original: set VLJEPA_CHECKPOINT_DIR to a new folder)
 #   bash vljepa/run_ccw.sh lat_eval gold --ckpt ...
 set -euo pipefail
 
@@ -33,8 +34,8 @@ case "${1:-}" in
         export VLJEPA_LOG_DIR="${VLJEPA_LOG_DIR:-/nvme/people/eprakash/logs/vljepa_dynamic}"
         ;;
     lat_*)
-        export VLJEPA_CHECKPOINT_DIR="${VLJEPA_CHECKPOINT_DIR:-$ROOT/checkpoints_vljepa_laterality}"
-        export VLJEPA_LOG_DIR="${VLJEPA_LOG_DIR:-/nvme/people/eprakash/logs/vljepa_laterality}"
+        export VLJEPA_CHECKPOINT_DIR="${VLJEPA_CHECKPOINT_DIR:-$ROOT/checkpoints_vljepa_lora_laterality}"
+        export VLJEPA_LOG_DIR="${VLJEPA_LOG_DIR:-/nvme/people/eprakash/logs/vljepa_lora_laterality}"
         ;;
 esac
 

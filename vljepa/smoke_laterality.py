@@ -5,9 +5,10 @@
      (skipped if silver_laterality.parquet is missing).
   2. Data: 4 silver val finding-examples, sided and unsided mixed. Falls
      back to random images and made-up sides if silver data is missing.
-  3. Model: original BioViL-T text encoder (no LoRA) and a tiny 2-layer
-     Llama (``--full``: the real 8 Llama-3.2-1B layers and pretrained image
-     weights). Falls back to stub encoders if BioViL-T cannot load.
+  3. Model: BioViL-T text encoder with the 5-way text LoRA (``--text-encoder
+     original``: without) and a tiny 2-layer Llama (``--full``: the real 8
+     Llama-3.2-1B layers and pretrained image weights). Falls back to stub
+     encoders if BioViL-T cannot load.
   4. One training step through train_laterality.batch_step: loss equals the
      class-weighted cross-entropy over each row's own 5 or 15 candidates;
      only the predictor gets gradients.
@@ -17,7 +18,7 @@
      plain and sided sentences; cardiomegaly uses the plain sentences only.
   7. Target cache: a sentence is encoded once.
   8. Text encoder probe (real BioViL-T only): how far apart left and right
-     sentences are, compared with different classes.
+     sentences are, compared with different classes, with and without LoRA.
 
     CUDA_VISIBLE_DEVICES="" python -m vljepa.smoke_laterality
     bash vljepa/run_ccw.sh lat_smoke [--full]
@@ -162,14 +163,19 @@ class StubText(nn.Module):
         return g, g[:, None, :], torch.ones(len(texts), 1, dtype=torch.bool)
 
 
-def build_model(full: bool):
+def build_model(full: bool, text_lora: bool):
     try:
         model = LateralityVLJEPA(
             image_mode="biovilt", smoke=not full, n_llama_layers=8 if full else 2,
             freeze_image_encoder=True, freeze_text_encoder=True,
-            gradient_checkpointing=False, text_lora=False,
+            gradient_checkpointing=False, text_lora=text_lora,
         )
-        return model, "real BioViL-T text" + (" + full model" if full else " + tiny Llama"), True
+        if text_lora and model.text_lora_path is None:
+            from .text_lora import apply_text_lora
+
+            model.text_lora_path = apply_text_lora(model.text_encoder)
+        text = "real BioViL-T text" + (" + LoRA" if text_lora else "")
+        return model, text + (" + full model" if full else " + tiny Llama"), True
     except Exception as exc:
         _print(f"  real encoders failed ({type(exc).__name__}: {exc})")
         traceback.print_exc()
@@ -189,19 +195,28 @@ def build_model(full: bool):
     return model, "stub encoders + tiny Llama", False
 
 
-def text_probe(model) -> None:
-    _print("\n[8] text encoder: left vs right, compared with class")
-    bank = TargetBank(model)
-    for finding in ("pleural effusion", "pneumothorax", "lung opacity"):
-        e = bank(candidate_texts(finding, "left"), torch.device("cpu")).view(len(SIDES), N_CLS, -1)
-        lr = float((e[0] * e[1]).sum(-1).mean())
-        lb = float((e[0] * e[2]).sum(-1).mean())
-        cls = e[0] @ e[0].T
-        off = float((cls.sum() - cls.diagonal().sum()) / (N_CLS * (N_CLS - 1)))
-        _print(f"  {finding:17s} cos(left, right) {lr:.3f}  cos(left, bilateral) {lb:.3f}  "
-               f"cos(class a, class b | left) {off:.3f}")
-    _print("  (closer to 1 = harder to tell apart; the original encoder put improving and "
-           "stable at about 0.90)")
+@torch.no_grad()
+def text_probe() -> None:
+    from tempcxr.modules.text_encoder import BioViLTTextEncoder
+
+    from .text_lora import apply_text_lora
+
+    _print("\n[8] text encoder: left vs right, compared with class (closer to 1 = harder "
+           "to tell apart)")
+    encoder = BioViLTTextEncoder(mode="biovilt").eval()
+    for name in ("original", "LoRA"):
+        if name == "LoRA":
+            apply_text_lora(encoder)
+        _print(f"  {name}:")
+        for finding in ("pleural effusion", "pneumothorax", "lung opacity"):
+            g, _, _ = encoder.forward_contrastive(candidate_texts(finding, "left"))
+            e = F.normalize(g.float(), dim=-1).view(len(SIDES), N_CLS, -1)
+            lr = float((e[0] * e[1]).sum(-1).mean())
+            lb = float((e[0] * e[2]).sum(-1).mean())
+            cls = e[0] @ e[0].T
+            off = float((cls.sum() - cls.diagonal().sum()) / (N_CLS * (N_CLS - 1)))
+            _print(f"    {finding:17s} cos(left, right) {lr:.3f}  cos(left, bilateral) {lb:.3f}  "
+                   f"cos(class a, class b | same side) {off:.3f}")
 
 
 def main() -> int:
@@ -209,7 +224,9 @@ def main() -> int:
     p.add_argument("--full", action="store_true",
                    help="real Llama-3.2-1B layers and pretrained BioViL-T image weights")
     p.add_argument("--no-data", action="store_true", help="skip building the silver dataset")
+    p.add_argument("--text-encoder", default="lora", choices=["lora", "original"])
     args = p.parse_args()
+    text_lora = args.text_encoder == "lora"
     torch.manual_seed(0)
     from .train_laterality import batch_step
 
@@ -226,10 +243,16 @@ def main() -> int:
                f"{len(t):2d} candidates, positive {t[label_index(int(c), s)]!r}")
 
     _print("\n[3] model")
-    model, backend, real = build_model(args.full)
+    model, backend, real = build_model(args.full, text_lora)
     _print(f"  backend: {backend}")
-    lora = [n for n, _ in model.text_encoder.named_parameters() if "lora" in n.lower()]
-    check(model.text_lora_path is None and not lora, "text encoder is the original BioViL-T (no LoRA)")
+    lora = [n for n, _ in model.text_encoder.named_parameters() if "lora_" in n]
+    if not real:
+        _print("  stub text encoder: LoRA check skipped")
+    elif text_lora:
+        _print(f"  text LoRA: {model.text_lora_path}")
+        check(len(lora) == 48, f"text LoRA installed on 24 query/value layers ({len(lora)} tensors)")
+    else:
+        check(model.text_lora_path is None and not lora, "text encoder is the original BioViL-T (no LoRA)")
     check(not any(p.requires_grad for p in model.text_encoder.parameters()), "text encoder frozen")
     check(not any(p.requires_grad for p in model.image_encoder.parameters()), "image encoder frozen")
 
@@ -298,7 +321,7 @@ def main() -> int:
         _print("  real text encoder: call counting only with the stub; skipped")
 
     if real:
-        text_probe(model)
+        text_probe()
 
     _print("\n" + "=" * 72)
     if FAILURES:

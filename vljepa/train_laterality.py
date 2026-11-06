@@ -3,8 +3,9 @@
 Query ``What is the progression of {finding}?`` as in the 5-way run. Sided
 findings are scored against the 15 ``{Side} {finding} is {class}.``
 sentences, unsided ones against the five ``{Finding} is {class}.``; targets
-come from the original BioViL-T text encoder (frozen, no LoRA). Loss is
-class-weighted InfoNCE over each row's own candidates (see laterality.py).
+come from the frozen BioViL-T text encoder with the 5-way run's LoRA
+(``--text-encoder original``: without it). Loss is class-weighted InfoNCE
+over each row's own candidates (see laterality.py).
 
 After every epoch rank 0 reports silver val progression accuracy (side
 summed out), side accuracy on sided findings (class summed out), and gold
@@ -181,6 +182,9 @@ def latest_ckpt(ckpt_dir: str):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--resume", default=None)
+    p.add_argument("--text-encoder", default="lora", choices=["lora", "original"],
+                   help="lora: BioViL-T with the 5-way run's frozen text LoRA; "
+                        "original: BioViL-T as released")
     p.add_argument("--skip-gold", action="store_true")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
@@ -194,6 +198,7 @@ def main():
     rank = dist.get_rank() if world_size > 1 else 0
     epochs = args.epochs or EPOCHS
     batch_size = args.batch_size or BATCH_SIZE
+    text_lora = args.text_encoder == "lora"
 
     if rank == 0:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -202,7 +207,8 @@ def main():
         print(f"[laterality]   query  = {QUERY_TEMPLATE} (Llama tok+embed)")
         print("[laterality]   target = '{Side} {finding} is {class}.' x 15 for sided findings, "
               "'{Finding} is {class}.' x 5 otherwise")
-        print("[laterality]   text   = original BioViL-T, frozen, no LoRA")
+        print("[laterality]   text   = BioViL-T, frozen, "
+              + ("with the 5-way text LoRA" if text_lora else "original (no LoRA)"))
         print(f"[laterality]   sides  = {LATERALITY_PATH}")
         print(f"[laterality]   loss   = class-weighted InfoNCE τ={TEMPERATURE}, CBW β={CBW_BETA}")
         print(f"[laterality]   image  = BioViL-T pair, frozen; pred = Llama last {N_LLAMA_LAYERS}")
@@ -240,7 +246,7 @@ def main():
         freeze_image_encoder=True,
         freeze_text_encoder=True,
         gradient_checkpointing=True,
-        text_lora=False,
+        text_lora=text_lora,
     ).to(device)
     if rank == 0:
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -273,7 +279,8 @@ def main():
         "llama_local": LLAMA_LOCAL,
         "freeze_image_encoder": True,
         "freeze_text_encoder": True,
-        "text_lora": False,
+        "text_lora": text_lora,
+        "text_lora_path": raw_model.text_lora_path,
         "temperature": TEMPERATURE,
         "cbw_beta": CBW_BETA,
     }
@@ -281,9 +288,14 @@ def main():
     resume_path = args.resume or latest_ckpt(CHECKPOINT_DIR)
     if resume_path and os.path.isfile(resume_path):
         ckpt = torch.load(resume_path, map_location="cpu")
-        if ckpt.get("vljepa_cfg", {}).get("objective") != "laterality":
+        old = ckpt.get("vljepa_cfg", {})
+        if old.get("objective") != "laterality":
             raise SystemExit(f"[laterality] refusing {resume_path}: not a laterality checkpoint. "
                              f"Use an empty {CHECKPOINT_DIR}.")
+        if bool(old.get("text_lora")) != text_lora:
+            raise SystemExit(f"[laterality] refusing {resume_path}: trained with "
+                             f"text_lora={old.get('text_lora')}, this run has {text_lora}. "
+                             "Use a new checkpoint dir.")
         raw_model.load_state_dict(ckpt["model"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])

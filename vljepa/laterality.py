@@ -3,7 +3,8 @@
 Same as the 5-way run (query ``What is the progression of {finding}?``,
 class-weighted InfoNCE over target sentences), except:
 
-  * targets come from the original BioViL-T text encoder (frozen, no LoRA);
+  * targets come from the frozen BioViL-T text encoder, with the 5-way run's
+    text LoRA by default or as released (``--text-encoder original``);
   * a finding with an agreed silver side (MedGemma and Qwen3-32B-AWQ, see
     build_laterality.py) is scored against all 15 sentences
     ``{Side} {finding} is {class}.`` for left / right / bilateral x the five
@@ -224,7 +225,7 @@ def load_laterality_from_ckpt(ckpt_path: str, device: torch.device,
         freeze_image_encoder=True,
         freeze_text_encoder=True,
         gradient_checkpointing=False,
-        text_lora=False,
+        text_lora=bool(cfg.get("text_lora")),
     )
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     if missing or unexpected:
