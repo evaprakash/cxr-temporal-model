@@ -17,6 +17,7 @@
 #   bash vljepa/run_ccw.sh lat_smoke [--full]      # laterality 5-way CPU smoke test
 #   bash vljepa/run_ccw.sh lat_train [--epochs N]  # laterality 5-way training, text LoRA
 #       (--text-encoder original: set VLJEPA_CHECKPOINT_DIR to a new folder)
+#   bash vljepa/run_ccw.sh lat_train_img           # laterality epoch_5.pt weights, image encoder unfrozen, 5 epochs
 #   bash vljepa/run_ccw.sh lat_eval gold --ckpt ...
 set -euo pipefail
 
@@ -32,6 +33,11 @@ case "${1:-}" in
     dyn_*)
         export VLJEPA_CHECKPOINT_DIR="${VLJEPA_CHECKPOINT_DIR:-$ROOT/checkpoints_vljepa_dynamic}"
         export VLJEPA_LOG_DIR="${VLJEPA_LOG_DIR:-/nvme/people/eprakash/logs/vljepa_dynamic}"
+        ;;
+    lat_train_img)
+        export VLJEPA_CHECKPOINT_DIR="${VLJEPA_CHECKPOINT_DIR:-$ROOT/checkpoints_vljepa_lora_laterality_imgft}"
+        export VLJEPA_LOG_DIR="${VLJEPA_LOG_DIR:-/nvme/people/eprakash/logs/vljepa_lora_laterality_imgft}"
+        VLJEPA_INIT_FROM="${VLJEPA_INIT_FROM:-$ROOT/checkpoints_vljepa_lora_laterality/epoch_5.pt}"
         ;;
     lat_*)
         export VLJEPA_CHECKPOINT_DIR="${VLJEPA_CHECKPOINT_DIR:-$ROOT/checkpoints_vljepa_lora_laterality}"
@@ -147,11 +153,17 @@ run() {
         NGPU="${SLURM_GPUS_ON_NODE:-4}"
         echo "[ccw] nproc_per_node=$NGPU"
         "$PY" -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train_laterality "$@"
+    elif [ "$MODE" = "lat_train_img" ]; then
+        shift
+        NGPU="${SLURM_GPUS_ON_NODE:-4}"
+        echo "[ccw] nproc_per_node=$NGPU init_from=$VLJEPA_INIT_FROM"
+        "$PY" -m torch.distributed.run --nproc_per_node="$NGPU" -m vljepa.train_laterality \
+            --init-from "$VLJEPA_INIT_FROM" --unfreeze-image --epochs 5 "$@"
     elif [ "$MODE" = "lat_eval" ]; then
         shift
         "$PY" -m vljepa.laterality "$@"
     else
-        echo "usage: bash vljepa/run_ccw.sh smoke|train|train_img|check|shift|gold|worsening|rules|mscxrt|dyn_smoke|dyn_train|dyn_train_img|dyn_eval|lat_smoke|lat_train|lat_eval ..." >&2
+        echo "usage: bash vljepa/run_ccw.sh smoke|train|train_img|check|shift|gold|worsening|rules|mscxrt|dyn_smoke|dyn_train|dyn_train_img|dyn_eval|lat_smoke|lat_train|lat_train_img|lat_eval ..." >&2
         return 1
     fi
 }

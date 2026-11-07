@@ -11,8 +11,13 @@ After every epoch rank 0 reports silver val progression accuracy (side
 summed out), side accuracy on sided findings (class summed out), and gold
 set-match with the side summed out.
 
+Second stage: ``--init-from <frozen run's epoch_N.pt> --unfreeze-image`` also
+trains the BioViL-T image encoder at LR * IMAGE_LR_MULT (BatchNorm stats and
+dropout stay frozen), with a fresh optimizer and schedule, in a new folder.
+
     torchrun --nproc_per_node=4 -m vljepa.train_laterality
     bash vljepa/run_ccw.sh lat_train
+    bash vljepa/run_ccw.sh lat_train_img
 """
 
 from __future__ import annotations
@@ -58,6 +63,7 @@ from .prompts import QUERY_TEMPLATE
 # HYPERPARAMETERS (same as the 5-way run)
 # ============================================================
 LR = 2e-5
+IMAGE_LR_MULT = 0.1
 WEIGHT_DECAY = 0.01
 BATCH_SIZE = 8
 EPOCHS = 50
@@ -182,6 +188,12 @@ def latest_ckpt(ckpt_dir: str):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--resume", default=None)
+    p.add_argument("--init-from", default=None,
+                   help="start from this laterality checkpoint's weights only (fresh "
+                        "optimizer and schedule); needs a new checkpoint dir")
+    p.add_argument("--unfreeze-image", action="store_true",
+                   help="train the BioViL-T image encoder at LR * IMAGE_LR_MULT; "
+                        "its BatchNorm stats and dropout stay frozen")
     p.add_argument("--text-encoder", default="lora", choices=["lora", "original"],
                    help="lora: BioViL-T with the 5-way run's frozen text LoRA; "
                         "original: BioViL-T as released")
@@ -199,6 +211,11 @@ def main():
     epochs = args.epochs or EPOCHS
     batch_size = args.batch_size or BATCH_SIZE
     text_lora = args.text_encoder == "lora"
+    freeze_image = not args.unfreeze_image
+    if args.init_from and (os.path.dirname(os.path.abspath(args.init_from))
+                           == os.path.abspath(CHECKPOINT_DIR)):
+        raise SystemExit(f"[laterality] --init-from {args.init_from} is inside {CHECKPOINT_DIR}; "
+                         "set VLJEPA_CHECKPOINT_DIR to a new folder so the source run stays intact")
 
     if rank == 0:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -211,7 +228,13 @@ def main():
               + ("with the 5-way text LoRA" if text_lora else "original (no LoRA)"))
         print(f"[laterality]   sides  = {LATERALITY_PATH}")
         print(f"[laterality]   loss   = class-weighted InfoNCE τ={TEMPERATURE}, CBW β={CBW_BETA}")
-        print(f"[laterality]   image  = BioViL-T pair, frozen; pred = Llama last {N_LLAMA_LAYERS}")
+        if freeze_image:
+            print(f"[laterality]   image  = BioViL-T pair, frozen; pred = Llama last {N_LLAMA_LAYERS}")
+        else:
+            print(f"[laterality]   image  = BioViL-T pair, TRAINED at lr {LR * IMAGE_LR_MULT:g} "
+                  f"(BatchNorm stats + dropout frozen); pred = Llama last {N_LLAMA_LAYERS}")
+        if args.init_from:
+            print(f"[laterality]   init from = {args.init_from} (weights only)")
         print(f"[laterality]   ckpt   = {CHECKPOINT_DIR}")
         print(f"[laterality]   logs   = {LOG_DIR}")
         print(f"[laterality]   images = {IMAGE_ROOTS}")
@@ -243,7 +266,7 @@ def main():
         n_llama_layers=N_LLAMA_LAYERS,
         llama_name=LLAMA_NAME,
         llama_local=LLAMA_LOCAL,
-        freeze_image_encoder=True,
+        freeze_image_encoder=freeze_image,
         freeze_text_encoder=True,
         gradient_checkpointing=True,
         text_lora=text_lora,
@@ -261,8 +284,12 @@ def main():
     else:
         raw_model = model
 
-    optimizer = AdamW([p for p in raw_model.predictor.parameters() if p.requires_grad],
-                      lr=LR, weight_decay=WEIGHT_DECAY)
+    groups = [{"params": [p for p in raw_model.predictor.parameters() if p.requires_grad],
+               "lr": LR}]
+    image_params = [p for p in raw_model.image_encoder.parameters() if p.requires_grad]
+    if image_params:
+        groups.append({"params": image_params, "lr": LR * IMAGE_LR_MULT})
+    optimizer = AdamW(groups, weight_decay=WEIGHT_DECAY)
     total_steps = max(len(train_loader), 1) * epochs
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=int(total_steps * WARMUP_RATIO),
@@ -277,7 +304,10 @@ def main():
         "n_llama_layers": N_LLAMA_LAYERS,
         "llama_name": LLAMA_NAME,
         "llama_local": LLAMA_LOCAL,
-        "freeze_image_encoder": True,
+        "freeze_image_encoder": freeze_image,
+        "freeze_image_norm": True,
+        "image_lr": None if freeze_image else LR * IMAGE_LR_MULT,
+        "init_from": args.init_from,
         "freeze_text_encoder": True,
         "text_lora": text_lora,
         "text_lora_path": raw_model.text_lora_path,
@@ -296,6 +326,10 @@ def main():
             raise SystemExit(f"[laterality] refusing {resume_path}: trained with "
                              f"text_lora={old.get('text_lora')}, this run has {text_lora}. "
                              "Use a new checkpoint dir.")
+        if bool(old.get("freeze_image_encoder", True)) != freeze_image:
+            raise SystemExit(f"[laterality] refusing {resume_path}: trained with "
+                             f"freeze_image_encoder={old.get('freeze_image_encoder', True)}, "
+                             f"this run has {freeze_image}. Use a new checkpoint dir.")
         raw_model.load_state_dict(ckpt["model"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
@@ -303,6 +337,22 @@ def main():
         best_val = float(ckpt.get("best_val_loss", best_val))
         if rank == 0:
             print(f"[laterality] resumed {resume_path} -> next epoch {start_epoch}")
+            if args.init_from:
+                print(f"[laterality] {CHECKPOINT_DIR} already has epochs; "
+                      f"ignoring --init-from {args.init_from}")
+        del ckpt
+    elif args.init_from:
+        ckpt = torch.load(args.init_from, map_location="cpu")
+        old = ckpt.get("vljepa_cfg", {})
+        if old.get("objective") != "laterality" or bool(old.get("text_lora")) != text_lora:
+            raise SystemExit(f"[laterality] refusing --init-from {args.init_from}: objective "
+                             f"{old.get('objective')}, text_lora={old.get('text_lora')}; "
+                             f"this run is laterality with text_lora={text_lora}")
+        missing, unexpected = raw_model.load_state_dict(ckpt["model"], strict=False)
+        if rank == 0:
+            print(f"[laterality] initialised weights from {args.init_from} "
+                  f"(epoch {ckpt.get('epoch')}); fresh optimizer and schedule; "
+                  f"missing={len(missing)} unexpected={len(unexpected)}")
         del ckpt
 
     gold_groups = gold_roots = None
