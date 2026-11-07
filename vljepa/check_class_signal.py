@@ -84,6 +84,8 @@ class VLJEPAScorer:
         import torch
         import torch.nn.functional as F
 
+        if hasattr(self.model, "score_batch"):
+            return self.model.score_batch(prior, current, findings, text_cache=self.text_cache)
         img_g, img_p = self.model.encode_images(prior, current)
         pred = F.normalize(self.model.predict(img_g, img_p, queries).float(), dim=-1)
         tgt = torch.stack([self._targets(f) for f in findings])

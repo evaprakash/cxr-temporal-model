@@ -208,10 +208,28 @@ class LateralityVLJEPA(VLJEPA):
         cos = self.variant_cosines(prior, current, finding, text_cache)
         return self.temperature * torch.logsumexp(cos / self.temperature, dim=0)
 
+    @torch.no_grad()
+    def score_batch(self, prior, current, findings, text_cache=None) -> torch.Tensor:
+        """``(B, 5)`` scores, the same soft maximum as ``score_classes``."""
+        cache = text_cache if text_cache is not None else {}
+        img_g, img_p = self.encode_images(prior, current)
+        pred = F.normalize(
+            self.predict(img_g, img_p, [query_text(f) for f in findings]).float(), dim=-1)
+        out = []
+        for p, f in zip(pred, findings):
+            variants = scoring_variants(f)
+            tgt = self._texts([t for v in variants for t in v], cache)
+            cos = (tgt @ p).view(len(variants), N_CLS)
+            out.append(self.temperature * torch.logsumexp(cos / self.temperature, dim=0))
+        return torch.stack(out)
+
 
 def load_laterality_from_ckpt(ckpt_path: str, device: torch.device,
-                              shift_json: Optional[str] = None) -> LateralityVLJEPA:
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+                              shift_json: Optional[str] = None,
+                              use_shift: bool = True) -> LateralityVLJEPA:
+    """Like eval_gold.load_vljepa_from_ckpt: the class shift comes from a
+    *_shifted.pt checkpoint or ``shift_json``."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt.get("vljepa_cfg", {})
     if cfg.get("objective") != "laterality":
         raise SystemExit(f"[laterality] {ckpt_path} is not a laterality checkpoint "
@@ -231,15 +249,19 @@ def load_laterality_from_ckpt(ckpt_path: str, device: torch.device,
     if missing or unexpected:
         print(f"[laterality] missing {len(missing)} / unexpected {len(unexpected)} keys")
     model.class_shift = None
-    if shift_json:
-        import json
+    if use_shift:
+        shift, source = ckpt.get("class_shift"), ckpt_path
+        if shift_json:
+            import json
 
-        with open(shift_json) as f:
-            info = json.load(f)
-        if info.get("class_order") != list(CLS_ORDER):
-            raise ValueError(f"{shift_json}: class order {info.get('class_order')}")
-        model.class_shift = torch.tensor(info["class_shift"], dtype=torch.float32)
-        print(f"[laterality] class shift {info['class_shift']} from {shift_json}")
+            with open(shift_json) as f:
+                info = json.load(f)
+            if info.get("class_order") != list(CLS_ORDER):
+                raise ValueError(f"{shift_json}: class order {info.get('class_order')}")
+            shift, source = info["class_shift"], shift_json
+        if shift is not None:
+            model.class_shift = torch.tensor(shift, dtype=torch.float32)
+            print(f"[laterality] class shift {shift} from {source}")
     print(f"[laterality] loaded {ckpt_path} (epoch {ckpt.get('epoch')})")
     return model.to(device).eval()
 

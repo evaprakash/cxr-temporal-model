@@ -138,6 +138,11 @@ def load_vljepa_from_ckpt(
     kept off the state dict; only eval_gold_setmatch adds it before argmax."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = ckpt.get("vljepa_cfg", {})
+    if cfg.get("objective") == "laterality":
+        from .laterality import load_laterality_from_ckpt
+
+        del ckpt
+        return load_laterality_from_ckpt(ckpt_path, device, shift_json, use_shift)
     model = VLJEPA(
         image_mode="biovilt_no_pretrained",
         smoke=False,
