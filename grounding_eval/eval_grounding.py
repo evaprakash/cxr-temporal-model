@@ -45,6 +45,9 @@ Two kinds of map (--method):
 --text-encoder biovilt swaps in the original BioViL-T text encoder for any
 BioViL-T family model, to test what its image encoder kept.
 
+--model tila, biovil, biomedclip, alta: zero-shot baselines, text maps only, each
+from its own patch embeddings and text encoder (see grounding_eval/baselines.py).
+
 --model anatomy is a control with no model: a flat map over the patch cells BAAP
 pools for the finding. If BAAP scores no better, its lead comes from being
 restricted to those regions, not from where inside them it looks.
@@ -576,8 +579,14 @@ def maps(args) -> int:
         raise SystemExit(f"[grounding] --model {args.model} needs --ckpt")
     if args.method.startswith("text") and args.model in ("baap", "anatomy"):
         raise SystemExit(f"[grounding] --model {args.model} has no text side for --method {args.method}")
+    from grounding_eval.baselines import BASELINES, BaselineGrounder, load_baseline
+
+    if args.model in BASELINES and not args.method.startswith("text"):
+        raise SystemExit(f"[grounding] --model {args.model} only has the text maps")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.model == "biovilt":
+    if args.model in BASELINES:
+        model = load_baseline(args.model, device, args.ckpt)
+    elif args.model == "biovilt":
         model = load_biovilt(device)
     elif args.model == "supervised":
         model = load_supervised(args.ckpt, device)
@@ -595,7 +604,7 @@ def maps(args) -> int:
 
         model.text_encoder = BioViLTTextEncoder(mode="biovilt").to(device).eval()
         model.token_map = None
-    if isinstance(model, BioViLFamily):
+    if isinstance(model, (BioViLFamily, BaselineGrounder)):
         model.phrases = sentence_bank(model.text_encoder, args.presence, args.class_wordings)
 
     rows = grounding_rows(args.parquet, args.limit)
@@ -732,10 +741,12 @@ def main() -> int:
 
     a = sub.add_parser("maps")
     a.add_argument("--model", required=True,
-                   choices=["biovilt", "supervised", "vljepa", "baap", "anatomy"],
-                   help="anatomy: control, a flat map over the anatomy cells BAAP pools")
+                   choices=["biovilt", "supervised", "vljepa", "baap", "anatomy",
+                            "tila", "biovil", "biomedclip", "alta"],
+                   help="anatomy: control, a flat map over the anatomy cells BAAP pools; "
+                        "tila, biovil, biomedclip, alta: zero-shot baselines, text maps only")
     a.add_argument("--name", required=True)
-    a.add_argument("--ckpt")
+    a.add_argument("--ckpt", help="also ALTA.pth for --model alta, or a TILA / BiomedCLIP model id")
     a.add_argument("--shift-json", help="VL-JEPA class shift, if the checkpoint has none")
     a.add_argument("--boxes", help="BAAP CXAS boxes (default baap_eval/boxes/cxas_gold.json)")
     a.add_argument("--method", default="gradcam", choices=METHODS)
