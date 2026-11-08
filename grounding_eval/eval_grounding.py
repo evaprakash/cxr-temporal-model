@@ -685,7 +685,10 @@ def compare(args) -> int:
     for n in args.names:
         path = n if n.endswith(".csv") else os.path.join(OUT_DIR, f"{n}_{args.method}.csv")
         name = os.path.splitext(os.path.basename(path))[0] if n.endswith(".csv") else n
-        frames[name] = pd.read_csv(path).dropna(subset=["cnr"]).set_index(["row_id", "side"])
+        df = pd.read_csv(path).dropna(subset=["cnr"])
+        if args.label:
+            df = df[df["label"] == args.label]
+        frames[name] = df.set_index(["row_id", "side"])
     names = list(frames)
     if args.ref not in frames:
         raise SystemExit(f"[compare] --ref {args.ref} is not among {names}")
@@ -705,10 +708,11 @@ def compare(args) -> int:
     def sums(k, m):
         return np.bincount(pid, weights=frames[k].loc[common, m].to_numpy(float), minlength=n_pairs)
 
-    print(f"\n=== Grounding ({args.method}) on {len(common)} films from {n_pairs} pairs")
+    subset = f", label {args.label}" if args.label else ""
+    print(f"\n=== Grounding ({args.method}{subset}) on {len(common)} films from {n_pairs} pairs")
     print("  " + f"{'metric':16}" + "".join(f"{k:>14}" for k in names))
-    result = {"method": args.method, "films": len(common), "pairs": int(n_pairs), "means": {},
-              "vs_ref": {}}
+    result = {"method": args.method, "label": args.label, "films": len(common),
+              "pairs": int(n_pairs), "means": {}, "vs_ref": {}}
     for m in METRICS:
         means = {k: float(sums(k, m).sum() / cnt.sum()) for k in names}
         result["means"][m] = means
@@ -775,6 +779,7 @@ def main() -> int:
                    help="model names given to maps (or paths to their CSVs)")
     a.add_argument("--method", default="gradcam", choices=METHODS)
     a.add_argument("--ref", default="supervised")
+    a.add_argument("--label", choices=CLS_ORDER, help="only rows with this gold progression label")
     a.add_argument("--boot", type=int, default=2000)
     a.add_argument("--seed", type=int, default=0)
     a.add_argument("--json", help="also write the aggregate numbers here")
